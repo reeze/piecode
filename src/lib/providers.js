@@ -1,0 +1,561 @@
+import { readFileSync } from "node:fs";
+import { promises as fsp } from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import { spawnSync } from "node:child_process";
+import { promisify } from "node:util";
+import { execFile as execFileCb } from "node:child_process";
+
+const DEFAULT_ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-latest";
+const DEFAULT_OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+const DEFAULT_CODEX_MODEL = process.env.CODEX_MODEL || "gpt-5-codex";
+const DEFAULT_SEED_MODEL = process.env.SEED_MODEL || "doubao-seed-code-preview-latest";
+const DEFAULT_SEED_BASE_URL =
+  process.env.SEED_BASE_URL || "https://ark.cn-beijing.volces.com/api/coding";
+const execFile = promisify(execFileCb);
+
+function requireEnv(name) {
+  const value = process.env[name];
+  if (!value) {
+    throw new Error(`Missing required env var: ${name}`);
+  }
+  return value;
+}
+
+async function postJson(url, headers, body) {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      ...headers,
+    },
+    body: JSON.stringify(body),
+  });
+
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const err = new Error(`Model API error (${res.status}): ${JSON.stringify(data)}`);
+    err.status = res.status;
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+function readJsonFile(filePath) {
+  try {
+    return JSON.parse(readFileSync(filePath, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function readTextFile(filePath) {
+  try {
+    return readFileSync(filePath, "utf8");
+  } catch {
+    return "";
+  }
+}
+
+function parseCodexConfigModel(configToml) {
+  const match = String(configToml).match(/^\s*model\s*=\s*"([^"]+)"/m);
+  return match?.[1] || null;
+}
+
+function getCodexHome() {
+  return process.env.CODEX_HOME || path.join(os.homedir(), ".codex");
+}
+
+function getSupportedCodexApiModels(codexHome) {
+  const modelsCachePath = path.join(codexHome, "models_cache.json");
+  const modelsCache = readJsonFile(modelsCachePath);
+  if (!Array.isArray(modelsCache?.models)) return new Set();
+  return new Set(
+    modelsCache.models.filter((m) => m?.supported_in_api).map((m) => m?.slug).filter(Boolean)
+  );
+}
+
+function resolveCodexModel(codexHome, preferredModel) {
+  const supported = getSupportedCodexApiModels(codexHome);
+  if (preferredModel && supported.has(preferredModel)) return preferredModel;
+  if (supported.has(DEFAULT_CODEX_MODEL)) return DEFAULT_CODEX_MODEL;
+  if (supported.has("gpt-5-codex")) return "gpt-5-codex";
+  return preferredModel || DEFAULT_CODEX_MODEL;
+}
+
+function loadCodexAuth() {
+  const codexHome = getCodexHome();
+  const authPath = path.join(codexHome, "auth.json");
+  const configPath = path.join(codexHome, "config.toml");
+  const auth = readJsonFile(authPath);
+  if (!auth || typeof auth !== "object") return null;
+
+  const configModel = parseCodexConfigModel(readTextFile(configPath));
+  const resolvedModel = resolveCodexModel(
+    codexHome,
+    process.env.CODEX_MODEL || configModel || DEFAULT_CODEX_MODEL
+  );
+  const openaiApiKey = typeof auth.OPENAI_API_KEY === "string" ? auth.OPENAI_API_KEY : "";
+  const accessToken =
+    typeof auth?.tokens?.access_token === "string" ? auth.tokens.access_token : "";
+
+  return {
+    openaiApiKey,
+    accessToken,
+    model: resolvedModel,
+    codexHome,
+  };
+}
+
+function extractResponsesText(data) {
+  if (typeof data?.output_text === "string" && data.output_text.trim()) {
+    return data.output_text;
+  }
+
+  const outputs = Array.isArray(data?.output) ? data.output : [];
+  const textParts = [];
+  for (const item of outputs) {
+    const content = Array.isArray(item?.content) ? item.content : [];
+    for (const block of content) {
+      if (block?.type === "output_text" && typeof block?.text === "string") {
+        textParts.push(block.text);
+      }
+    }
+  }
+  return textParts.join("\n").trim();
+}
+
+function createOpenAICompatibleProvider({ kind, model, apiKey, baseUrl }) {
+  const normalizedBase = (baseUrl || "https://api.openai.com/v1").replace(/\/$/, "");
+  const chatUrl = normalizedBase.endsWith("/chat/completions")
+    ? normalizedBase
+    : `${normalizedBase}/chat/completions`;
+
+  return {
+    kind,
+    model,
+    async complete({ systemPrompt, prompt }) {
+      const data = await postJson(
+        chatUrl,
+        { Authorization: `Bearer ${apiKey}` },
+        {
+          model,
+          temperature: 0.2,
+          messages: [
+            { role: "system", content: systemPrompt },
+            { role: "user", content: prompt },
+          ],
+        }
+      );
+      const text = data?.choices?.[0]?.message?.content;
+      if (!text) throw new Error("OpenAI-compatible response did not contain message content.");
+      return text;
+    },
+  };
+}
+
+function buildSeedChatUrls(baseUrl) {
+  const base = (baseUrl || DEFAULT_SEED_BASE_URL).replace(/\/$/, "");
+  const urls = [];
+  if (base.endsWith("/chat/completions")) {
+    urls.push(base);
+  } else {
+    urls.push(`${base}/chat/completions`);
+    urls.push(`${base}/v1/chat/completions`);
+  }
+
+  if (base.includes("/api/coding")) {
+    try {
+      const u = new URL(base);
+      urls.push(`${u.origin}/api/v3/chat/completions`);
+    } catch {}
+  }
+
+  return [...new Set(urls)];
+}
+
+function extractAnthropicText(data) {
+  const blocks = Array.isArray(data?.content) ? data.content : [];
+  const text = blocks.find((b) => b?.type === "text" && typeof b?.text === "string")?.text;
+  return text || "";
+}
+
+function createSeedProvider({ model, apiKey, baseUrl }) {
+  const resolvedModel = model || DEFAULT_SEED_MODEL;
+  const resolvedBase = baseUrl || DEFAULT_SEED_BASE_URL;
+
+  return {
+    kind: "seed-openai-compatible",
+    model: resolvedModel,
+    async complete({ systemPrompt, prompt }) {
+      const chatUrls = buildSeedChatUrls(resolvedBase);
+      const openaiBody = {
+        model: resolvedModel,
+        temperature: 0.2,
+        messages: [
+          { role: "system", content: systemPrompt },
+          { role: "user", content: prompt },
+        ],
+      };
+
+      let lastErr = null;
+      for (const url of chatUrls) {
+        try {
+          const data = await postJson(url, { Authorization: `Bearer ${apiKey}` }, openaiBody);
+          const text = data?.choices?.[0]?.message?.content;
+          if (text) return text;
+        } catch (err) {
+          lastErr = err;
+          if (err?.status !== 404) {
+            break;
+          }
+        }
+      }
+
+      // Claude-compatible fallback for /api/coding deployments.
+      const anthropicUrl = `${resolvedBase.replace(/\/$/, "")}/v1/messages`;
+      const anthropicBody = {
+        model: resolvedModel,
+        max_tokens: 1600,
+        system: systemPrompt,
+        messages: [{ role: "user", content: prompt }],
+      };
+      const anthHeaders = [
+        { "x-api-key": apiKey, "anthropic-version": "2023-06-01" },
+        { Authorization: `Bearer ${apiKey}`, "anthropic-version": "2023-06-01" },
+      ];
+
+      for (const headers of anthHeaders) {
+        try {
+          const data = await postJson(anthropicUrl, headers, anthropicBody);
+          const text = extractAnthropicText(data);
+          if (text) return text;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+
+      throw new Error(
+        `Seed provider failed. Tried: ${chatUrls.join(", ")}, ${anthropicUrl}. Last error: ${lastErr?.message || "unknown"}`
+      );
+    },
+  };
+}
+
+function hasMissingScope(err, scope) {
+  const body = JSON.stringify(err?.data || {});
+  return body.includes("Missing scopes:") && body.includes(scope);
+}
+
+function hasCodexCliSession() {
+  if (process.env.PIECODE_DISABLE_CODEX_CLI === "1") return false;
+  try {
+    const out = spawnSync("codex", ["login", "status"], {
+      encoding: "utf8",
+      timeout: 8_000,
+    });
+    if (out.status !== 0) return false;
+    const combined = `${String(out.stdout || "")}\n${String(out.stderr || "")}`;
+    return /Logged in/i.test(combined);
+  } catch {
+    return false;
+  }
+}
+
+function createCodexCliProvider(customModel = null) {
+  const codexHome = getCodexHome();
+  const model = resolveCodexModel(codexHome, customModel || process.env.CODEX_MODEL || null);
+  return {
+    kind: "codex-cli-session",
+    model,
+    async complete({ systemPrompt, prompt }) {
+      const tmpFile = path.join(
+        os.tmpdir(),
+        `piecode-last-message-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`
+      );
+
+      const composedPrompt = `${systemPrompt}\n\n${prompt}`;
+      const args = [
+        "exec",
+        "--skip-git-repo-check",
+        "--output-last-message",
+        tmpFile,
+        "--color",
+        "never",
+        "-m",
+        model,
+        composedPrompt,
+      ];
+
+      try {
+        const { stdout } = await execFile("codex", args, {
+          maxBuffer: 1024 * 1024 * 8,
+          timeout: 120_000,
+        });
+
+        let text = "";
+        try {
+          text = (await fsp.readFile(tmpFile, "utf8")).trim();
+        } catch {
+          text = String(stdout || "").trim();
+        }
+
+        if (!text) {
+          throw new Error("Codex CLI provider produced empty output.");
+        }
+        return text;
+      } catch (err) {
+        throw new Error(`Codex CLI session provider failed: ${err.message}`);
+      } finally {
+        try {
+          await fsp.unlink(tmpFile);
+        } catch {}
+      }
+    },
+  };
+}
+
+export function getProvider(options = {}) {
+  const configuredModel = options.model || null;
+  const configuredBaseUrl = options.baseUrl || options.endpoint || null;
+  const configuredApiKey = options.apiKey || null;
+
+  // Command line arguments take highest priority
+  if (options.provider) {
+    const provider = options.provider.toLowerCase();
+
+    if (provider === "anthropic" && options.apiKey) {
+      return {
+        kind: "anthropic",
+        model: options.model || process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_MODEL,
+        async complete({ systemPrompt, prompt }) {
+          const data = await postJson(
+            "https://api.anthropic.com/v1/messages",
+            {
+              "x-api-key": options.apiKey,
+              "anthropic-version": "2023-06-01",
+            },
+            {
+              model: options.model || process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_MODEL,
+              max_tokens: 1600,
+              system: systemPrompt,
+              messages: [{ role: "user", content: prompt }],
+            }
+          );
+
+          const text = data?.content?.find((c) => c?.type === "text")?.text;
+          if (!text) throw new Error("Anthropic response did not contain text content.");
+          return text;
+        },
+      };
+    }
+
+    if (provider === "openai" && configuredApiKey) {
+      return createOpenAICompatibleProvider({
+        kind: "openai-compatible",
+        model: configuredModel || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
+        apiKey: configuredApiKey,
+        baseUrl: configuredBaseUrl || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
+      });
+    }
+
+    if (provider === "seed") {
+      const seedApiKey = configuredApiKey || process.env.SEED_API_KEY || process.env.ARK_API_KEY;
+      if (!seedApiKey) {
+        throw new Error("Missing API key for seed provider. Set SEED_API_KEY or pass --api-key.");
+      }
+      return createSeedProvider({
+        model: configuredModel || DEFAULT_SEED_MODEL,
+        apiKey: seedApiKey,
+        baseUrl: configuredBaseUrl || DEFAULT_SEED_BASE_URL,
+      });
+    }
+
+    if (provider === "codex") {
+      if (hasCodexCliSession()) {
+        return createCodexCliProvider(options.model);
+      }
+      const codexAuth = loadCodexAuth();
+      if (codexAuth?.openaiApiKey) {
+        return createOpenAICompatibleProvider({
+          kind: "codex-auth-key",
+          model: configuredModel || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
+          apiKey: codexAuth.openaiApiKey,
+          baseUrl: configuredBaseUrl || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
+        });
+      }
+      if (codexAuth?.accessToken) {
+        // Codex auth token handling
+        return {
+          kind: "codex-auth-token",
+          model: configuredModel || codexAuth.model,
+          async complete({ systemPrompt, prompt }) {
+            const base = (configuredBaseUrl || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
+            try {
+              const data = await postJson(
+                `${base}/responses`,
+                { Authorization: `Bearer ${codexAuth.accessToken}` },
+                {
+                  model: configuredModel || codexAuth.model,
+                  input: [
+                    { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
+                    { role: "user", content: [{ type: "input_text", text: prompt }] },
+                  ],
+                }
+              );
+
+              const text = extractResponsesText(data);
+              if (!text) throw new Error("Codex auth response did not contain text output.");
+              return text;
+            } catch (err) {
+              if (!hasMissingScope(err, "api.responses.write")) {
+                throw err;
+              }
+
+              const chatModel = configuredModel || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL;
+              try {
+                const data = await postJson(
+                  `${base}/chat/completions`,
+                  { Authorization: `Bearer ${codexAuth.accessToken}` },
+                  {
+                    model: chatModel,
+                    temperature: 0.2,
+                    messages: [
+                      { role: "system", content: systemPrompt },
+                      { role: "user", content: prompt },
+                    ],
+                  }
+                );
+                const text = data?.choices?.[0]?.message?.content;
+                if (!text) throw new Error("Codex token fallback did not return chat message content.");
+                return text;
+              } catch (fallbackErr) {
+                throw new Error(
+                  "Codex login token lacks required API scopes. Re-login with an API key (`printenv OPENAI_API_KEY | codex login --with-api-key`), or set OPENAI_API_KEY in your shell."
+                );
+              }
+            }
+          },
+        };
+      }
+    }
+  }
+
+  // Environment variables (original behavior)
+  if (process.env.ANTHROPIC_API_KEY) {
+    return {
+      kind: "anthropic",
+      model: configuredModel || DEFAULT_ANTHROPIC_MODEL,
+      async complete({ systemPrompt, prompt }) {
+        const apiKey = requireEnv("ANTHROPIC_API_KEY");
+        const data = await postJson(
+          "https://api.anthropic.com/v1/messages",
+          {
+            "x-api-key": apiKey,
+            "anthropic-version": "2023-06-01",
+          },
+          {
+            model: configuredModel || process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_MODEL,
+            max_tokens: 1600,
+            system: systemPrompt,
+            messages: [{ role: "user", content: prompt }],
+          }
+        );
+
+        const text = data?.content?.find((c) => c?.type === "text")?.text;
+        if (!text) throw new Error("Anthropic response did not contain text content.");
+        return text;
+      },
+    };
+  }
+
+  if (process.env.OPENAI_API_KEY) {
+    return createOpenAICompatibleProvider({
+      kind: "openai-compatible",
+      model: configuredModel || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
+      apiKey: requireEnv("OPENAI_API_KEY"),
+      baseUrl: configuredBaseUrl || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
+    });
+  }
+
+  if (process.env.SEED_API_KEY || process.env.ARK_API_KEY) {
+    return createSeedProvider({
+      model: configuredModel || DEFAULT_SEED_MODEL,
+      apiKey: process.env.SEED_API_KEY || process.env.ARK_API_KEY,
+      baseUrl: configuredBaseUrl || DEFAULT_SEED_BASE_URL,
+    });
+  }
+
+  const codexAuth = loadCodexAuth();
+  if (hasCodexCliSession()) {
+    return createCodexCliProvider(configuredModel);
+  }
+
+  if (codexAuth?.openaiApiKey) {
+    return createOpenAICompatibleProvider({
+      kind: "codex-auth-key",
+      model: configuredModel || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
+      apiKey: codexAuth.openaiApiKey,
+      baseUrl: configuredBaseUrl || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
+    });
+  }
+
+  if (codexAuth?.accessToken) {
+    return {
+      kind: "codex-auth-token",
+      model: configuredModel || codexAuth.model,
+      async complete({ systemPrompt, prompt }) {
+        const base = (configuredBaseUrl || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
+        try {
+          const data = await postJson(
+            `${base}/responses`,
+            { Authorization: `Bearer ${codexAuth.accessToken}` },
+            {
+              model: configuredModel || codexAuth.model,
+              input: [
+                { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
+                { role: "user", content: [{ type: "input_text", text: prompt }] },
+              ],
+            }
+          );
+
+          const text = extractResponsesText(data);
+          if (!text) throw new Error("Codex auth response did not contain text output.");
+          return text;
+        } catch (err) {
+          if (!hasMissingScope(err, "api.responses.write")) {
+            throw err;
+          }
+
+          const chatModel = configuredModel || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL;
+          try {
+            const data = await postJson(
+              `${base}/chat/completions`,
+              { Authorization: `Bearer ${codexAuth.accessToken}` },
+              {
+                model: chatModel,
+                temperature: 0.2,
+                messages: [
+                  { role: "system", content: systemPrompt },
+                  { role: "user", content: prompt },
+                ],
+              }
+            );
+            const text = data?.choices?.[0]?.message?.content;
+            if (!text) throw new Error("Codex token fallback did not return chat message content.");
+            return text;
+          } catch (fallbackErr) {
+            throw new Error(
+              "Codex login token lacks required API scopes. Re-login with an API key (`printenv OPENAI_API_KEY | codex login --with-api-key`), or set OPENAI_API_KEY in your shell."
+            );
+          }
+        }
+      },
+    };
+  }
+
+  throw new Error(
+    "No model provider configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or run `codex login`."
+  );
+}
