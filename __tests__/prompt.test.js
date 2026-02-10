@@ -34,6 +34,24 @@ describe('Prompt functions', () => {
       expect(prompt).toContain('Thought Process');
       expect(prompt).toContain('"type":"thought"');
     });
+
+    test('should include active skills instructions', () => {
+      const prompt = buildSystemPrompt({
+        workspaceDir: '/test/workspace',
+        autoApprove: false,
+        activeSkills: [
+          {
+            name: 'demo-skill',
+            path: '/skills/demo/SKILL.md',
+            content: '# Demo\\nUse strict typing.',
+          },
+        ],
+      });
+
+      expect(prompt).toContain('ACTIVE SKILLS');
+      expect(prompt).toContain('demo-skill');
+      expect(prompt).toContain('Use strict typing.');
+    });
   });
 
   describe('parseModelAction', () => {
@@ -64,6 +82,20 @@ describe('Prompt functions', () => {
       const result = parseModelAction('{"type":"thought","content":"Let me think about this task carefully"}');
       expect(result.type).toBe('thought');
       expect(result.content).toBe('Let me think about this task carefully');
+    });
+
+    test('should parse shorthand tool type', () => {
+      const result = parseModelAction('{"type":"read_file","input":{"path":"test.txt"},"reason":"Read file"}');
+      expect(result.type).toBe('tool_use');
+      expect(result.tool).toBe('read_file');
+      expect(result.input).toEqual({ path: 'test.txt' });
+    });
+
+    test('should parse plain text tool block', () => {
+      const result = parseModelAction('Tool Use: read_file (Read file)\\nInput: {\"path\":\"test.txt\"}');
+      expect(result.type).toBe('tool_use');
+      expect(result.tool).toBe('read_file');
+      expect(result.input).toEqual({ path: 'test.txt' });
     });
 
     test('should handle invalid JSON', () => {

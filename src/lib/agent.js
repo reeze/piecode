@@ -3,28 +3,178 @@ import { buildSystemPrompt, formatHistory, parseModelAction } from "./prompt.js"
 import { TaskPlanner, TaskExecutor } from "./taskPlanner.js";
 
 export class Agent {
-  constructor({ provider, workspaceDir, autoApproveRef, askApproval, onEvent }) {
+  constructor({
+    provider,
+    workspaceDir,
+    autoApproveRef,
+    askApproval,
+    onEvent,
+    activeSkillsRef,
+    onTodoWrite,
+    projectInstructionsRef,
+  }) {
     this.provider = provider;
     this.workspaceDir = workspaceDir;
     this.autoApproveRef = autoApproveRef;
     this.askApproval = askApproval;
     this.onEvent = onEvent;
+    this.activeSkillsRef = activeSkillsRef || { value: [] };
+    this.projectInstructionsRef = projectInstructionsRef || { value: null };
     this.history = [];
     this.tools = createToolset({
       workspaceDir,
       autoApproveRef,
       askApproval,
       onToolStart: (tool, input) => this.onEvent?.({ type: "tool_start", tool, input }),
+      onTodoWrite,
     });
-    this.taskPlanner = new TaskPlanner(this);
+    this.enablePlanner = process.env.PIECODE_ENABLE_PLANNER === "1";
+    this.taskPlanner = this.enablePlanner ? new TaskPlanner(this) : null;
+    this.planFirstEnabled = process.env.PIECODE_PLAN_FIRST !== "0";
+    this.defaultToolBudget = Math.max(
+      1,
+      Math.min(12, Number.parseInt(process.env.PIECODE_TOOL_BUDGET || "6", 10) || 6)
+    );
+    this.iterationCheckpoint = Math.max(
+      5,
+      Number.parseInt(process.env.PIECODE_ITERATION_CHECKPOINT || "20", 10) || 20
+    );
   }
 
   clearHistory() {
     this.history = [];
   }
 
+  getActiveSkills() {
+    return Array.isArray(this.activeSkillsRef?.value) ? this.activeSkillsRef.value : [];
+  }
+
+  extractFirstJsonObject(text) {
+    const source = String(text || "");
+    const start = source.indexOf("{");
+    if (start < 0) return null;
+    let depth = 0;
+    let inString = false;
+    let escaped = false;
+    for (let i = start; i < source.length; i += 1) {
+      const ch = source[i];
+      if (inString) {
+        if (escaped) escaped = false;
+        else if (ch === "\\") escaped = true;
+        else if (ch === "\"") inString = false;
+        continue;
+      }
+      if (ch === "\"") {
+        inString = true;
+        continue;
+      }
+      if (ch === "{") depth += 1;
+      if (ch === "}") depth -= 1;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+    return null;
+  }
+
+  parsePlan(raw) {
+    const source = String(raw || "").trim();
+    const candidates = [source, this.extractFirstJsonObject(source)];
+    for (const candidate of candidates) {
+      if (!candidate) continue;
+      try {
+        const parsed = JSON.parse(candidate);
+        const steps = Array.isArray(parsed?.steps)
+          ? parsed.steps.map((s) => String(s || "").trim()).filter(Boolean).slice(0, 8)
+          : [];
+        const summary = String(parsed?.summary || "").trim();
+        const toolBudgetRaw = Number(parsed?.toolBudget);
+        const toolBudget = Number.isFinite(toolBudgetRaw)
+          ? Math.max(1, Math.min(12, Math.round(toolBudgetRaw)))
+          : this.defaultToolBudget;
+        if (!summary && steps.length === 0) continue;
+        return { summary: summary || "Execution plan", steps, toolBudget };
+      } catch {
+        // continue
+      }
+    }
+    return null;
+  }
+
+  async planTurn(userMessage) {
+    const planSystemPrompt = [
+      "You are a planning assistant for a coding agent.",
+      "Create a short plan before tool usage.",
+      "Output strict JSON only:",
+      '{"summary":"...","steps":["..."],"toolBudget":4}',
+      "Constraints:",
+      "- steps must be concise",
+      "- choose minimal toolBudget (1-6 normally)",
+      "- avoid shell unless essential",
+    ].join("\n");
+
+    const planPrompt = `User request:\n${userMessage}`;
+    try {
+      this.onEvent?.({ type: "planning_call", provider: this.provider.kind, model: this.provider.model });
+      this.onEvent?.({
+        type: "llm_request",
+        stage: "planning",
+        payload: `SYSTEM:\n${planSystemPrompt}\n\nUSER:\n${planPrompt}`,
+      });
+      const raw = await this.provider.complete({ systemPrompt: planSystemPrompt, prompt: planPrompt });
+      this.onEvent?.({ type: "llm_response", stage: "planning", payload: String(raw || "") });
+      const plan = this.parsePlan(raw);
+      if (!plan) return null;
+      this.onEvent?.({ type: "plan", plan });
+      return plan;
+    } catch {
+      return null;
+    }
+  }
+
+  async replanTurn({ userMessage, previousPlan, toolCalls }) {
+    const replanSystemPrompt = [
+      "You are replanning a coding task after partial execution.",
+      "Output strict JSON only:",
+      '{"summary":"...","steps":["..."],"toolBudget":6}',
+      "Requirements:",
+      "- Keep plan concise and practical",
+      "- Avoid redundant steps already likely completed",
+      "- Increase toolBudget only as needed",
+    ].join("\n");
+
+    const previousSteps = Array.isArray(previousPlan?.steps) ? previousPlan.steps : [];
+    const replanPrompt = [
+      `User request:\n${userMessage}`,
+      `Previous summary: ${previousPlan?.summary || "-"}`,
+      `Previous steps:\n${previousSteps.map((s, i) => `${i + 1}. ${s}`).join("\n") || "-"}`,
+      `Tools already used in this turn: ${toolCalls}`,
+      "Create an updated plan for the remaining work.",
+    ].join("\n\n");
+
+    try {
+      this.onEvent?.({ type: "replanning_call", provider: this.provider.kind, model: this.provider.model });
+      this.onEvent?.({
+        type: "llm_request",
+        stage: "replanning",
+        payload: `SYSTEM:\n${replanSystemPrompt}\n\nUSER:\n${replanPrompt}`,
+      });
+      const raw = await this.provider.complete({ systemPrompt: replanSystemPrompt, prompt: replanPrompt });
+      this.onEvent?.({ type: "llm_response", stage: "replanning", payload: String(raw || "") });
+      const plan = this.parsePlan(raw);
+      if (!plan) return null;
+      this.onEvent?.({ type: "replan", plan });
+      return plan;
+    } catch {
+      return null;
+    }
+  }
+
   async runTurn(userMessage) {
     this.history.push({ role: "user", content: userMessage });
+    let activePlan = null;
+
+    if (this.planFirstEnabled && !this.enablePlanner) {
+      activePlan = await this.planTurn(userMessage);
+    }
 
     // 首先检查是否需要任务规划
     const shouldPlan = this.shouldPlanTask(userMessage);
@@ -32,25 +182,54 @@ export class Agent {
       return await this.runPlannedTask(userMessage);
     }
 
+    const toolBudget = activePlan?.toolBudget ?? this.defaultToolBudget;
+    let toolCalls = 0;
+    let budget = toolBudget;
+    let didReplan = false;
+
     // 对于简单任务，使用原有的循环方式
-    for (let i = 0; i < 12; i += 1) {
+    let i = 0;
+    while (true) {
+      i += 1;
+      if (i % this.iterationCheckpoint === 0) {
+        const shouldContinue = await this.askApproval(
+          `The agent has run ${i} model iterations in this turn. Continue? [Y/n]: `
+        );
+        if (!shouldContinue) {
+          const msg = `Stopped after ${i} iterations by user choice.`;
+          this.history.push({ role: "assistant", content: msg });
+          return msg;
+        }
+      }
+
       const systemPrompt = buildSystemPrompt({
         workspaceDir: this.workspaceDir,
         autoApprove: this.autoApproveRef.value,
+        activeSkills: this.getActiveSkills(),
+        activePlan,
+        projectInstructions: this.projectInstructionsRef?.value || null,
       });
 
       const prompt = formatHistory(this.history);
       this.onEvent?.({ type: "model_call", provider: this.provider.kind, model: this.provider.model });
+      this.onEvent?.({
+        type: "llm_request",
+        stage: "turn",
+        payload: `SYSTEM:\n${systemPrompt}\n\nUSER:\n${prompt}`,
+      });
       const raw = await this.provider.complete({ systemPrompt, prompt });
+      this.onEvent?.({ type: "llm_response", stage: "turn", payload: String(raw || "") });
       const action = parseModelAction(raw);
 
       if (action.type === "final") {
+        this.onEvent?.({ type: "thinking_done" });
         this.history.push({ role: "assistant", content: action.message });
         return action.message;
       }
 
       if (action.type === "thought") {
-        console.log(`[Thinking] ${action.content}`);
+        this.onEvent?.({ type: "thinking_done" });
+        this.onEvent?.({ type: "thought", content: action.content });
         this.history.push({
           role: "assistant",
           content: JSON.stringify({ type: "thought", content: action.content })
@@ -65,6 +244,8 @@ export class Agent {
         return msg;
       }
 
+      toolCalls += 1;
+
       const toolCallMessage = {
         type: "tool_use",
         tool: action.tool,
@@ -72,6 +253,7 @@ export class Agent {
         reason: action.reason || "",
       };
 
+      this.onEvent?.({ type: "thinking_done" });
       this.onEvent?.({
         type: "tool_use",
         tool: action.tool,
@@ -85,11 +267,20 @@ export class Agent {
       });
 
       let result;
+      let toolError = null;
       try {
         result = await toolFn(action.input || {});
       } catch (err) {
         result = `Tool error: ${err.message}`;
+        toolError = err.message;
       }
+
+      this.onEvent?.({
+        type: "tool_end",
+        tool: action.tool,
+        result: String(result || ""),
+        error: toolError,
+      });
 
       const toolResultMessage = {
         type: "tool_result",
@@ -101,6 +292,23 @@ export class Agent {
         role: "user",
         content: JSON.stringify(toolResultMessage)
       });
+
+      if (activePlan && toolCalls >= budget && !didReplan) {
+        const newPlan = await this.replanTurn({
+          userMessage,
+          previousPlan: activePlan,
+          toolCalls,
+        });
+        if (newPlan) {
+          activePlan = newPlan;
+          budget = Math.max(newPlan.toolBudget || budget, budget + 1);
+          didReplan = true;
+          this.onEvent?.({
+            type: "plan_progress",
+            message: `Replanned after ${toolCalls} tools. New budget: ${budget}`,
+          });
+        }
+      }
     }
 
     const fallback = "Stopped after max tool iterations for this turn.";
@@ -109,6 +317,8 @@ export class Agent {
   }
 
   shouldPlanTask(message) {
+    if (!this.enablePlanner) return false;
+
     const messageLower = message.toLowerCase();
 
     // 如果消息包含以下特征，可能需要任务规划
@@ -129,6 +339,9 @@ export class Agent {
   }
 
   async runPlannedTask(userMessage) {
+    if (!this.taskPlanner) {
+      throw new Error("Task planner is not enabled.");
+    }
     console.log('[Planning] Analyzing task requirements...');
     const analysis = await this.taskPlanner.analyzeTask(userMessage);
 

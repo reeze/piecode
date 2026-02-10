@@ -14,14 +14,31 @@ function resolveInsideRoot(root, candidatePath) {
   return resolved;
 }
 
-export function createToolset({ workspaceDir, autoApproveRef, askApproval, onToolStart }) {
-  const runShell = async ({ command }) => {
+function normalizeTodoItems(items) {
+  const allowed = new Set(["pending", "in_progress", "completed"]);
+  if (!Array.isArray(items)) return [];
+  const out = [];
+  for (let i = 0; i < items.length; i += 1) {
+    const raw = items[i];
+    if (!raw || typeof raw !== "object") continue;
+    const content = String(raw.content || "").trim();
+    if (!content) continue;
+    const statusRaw = String(raw.status || "pending").toLowerCase();
+    const status = allowed.has(statusRaw) ? statusRaw : "pending";
+    const id = String(raw.id || `todo-${i + 1}`);
+    out.push({ id, content, status });
+  }
+  return out;
+}
+
+export function createToolset({ workspaceDir, autoApproveRef, askApproval, onToolStart, onTodoWrite }) {
+  const runShell = async ({ command, timeout = 300000, maxBuffer = 10 * 1024 * 1024 }) => {
     if (!command || typeof command !== "string") {
       throw new Error("shell tool requires { command: string }");
     }
 
-    const approved =
-      autoApproveRef.value ||
+    const approved = 
+      autoApproveRef.value || 
       (await askApproval(`Run shell command?\n$ ${command}\nApprove [y/N]: `));
 
     if (!approved) {
@@ -32,8 +49,8 @@ export function createToolset({ workspaceDir, autoApproveRef, askApproval, onToo
     try {
       const { stdout, stderr } = await exec(command, {
         cwd: workspaceDir,
-        timeout: 60_000,
-        maxBuffer: 1024 * 1024,
+        timeout,
+        maxBuffer,
       });
       return [
         "exit_code: 0",
@@ -97,10 +114,23 @@ export function createToolset({ workspaceDir, autoApproveRef, askApproval, onToo
     return out.join("\n");
   };
 
+  const todoWrite = async ({ todos } = {}) => {
+    onToolStart?.("todo_write", { todos });
+    const normalized = normalizeTodoItems(todos);
+    if (normalized.length === 0) {
+      return "No valid todos were provided. Expected: { todos: [{ id?, content, status: pending|in_progress|completed }] }";
+    }
+    onTodoWrite?.(normalized);
+    const summary = normalized.map((t) => `- [${t.status}] ${t.content}`).join("\n");
+    return `Updated ${normalized.length} todos:\n${summary}`;
+  };
+
   return {
     shell: runShell,
     read_file: readFile,
     write_file: writeFile,
     list_files: listFiles,
+    todo_write: todoWrite,
+    todowrite: todoWrite,
   };
 }

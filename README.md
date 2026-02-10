@@ -46,6 +46,13 @@ Or use persistent settings in `~/.piecode/settings.json`:
   "provider": "seed",
   "model": "doubao-seed-code-preview-latest",
   "endpoint": "https://ark.cn-beijing.volces.com/api/coding",
+  "skills": {
+    "enabled": ["vercel-react-best-practices"],
+    "paths": [
+      "/Users/reeze/.agents/skills",
+      "/Users/reeze/.codex/skills"
+    ]
+  },
   "providers": {
     "seed": {
       "model": "doubao-seed-code-preview-latest",
@@ -65,7 +72,23 @@ Run:
 
 ```bash
 npm run agent
+
+# list available skills
+node src/cli.js --list-skills
+
+# enable skills for one run
+node src/cli.js --skill vercel-react-best-practices --prompt "optimize this React component"
+
+# auto-enable by mention in prompt
+node src/cli.js --prompt "use $vercel-react-best-practices to optimize this React component"
+
+# start simple full-screen TUI mode
+node src/cli.js --tui
 ```
+
+TUI includes live model status (running/idle/error), last turn duration, and last tool used.
+
+The agent now performs a lightweight pre-plan before execution (default on) to reduce unnecessary tool calls. If the first plan underestimates the work, it auto-replans and continues.
 
 One-shot prompt:
 
@@ -80,6 +103,14 @@ node src/cli.js --prompt "inspect this repo and suggest next steps"
 - `/clear` clear conversation memory
 - `/approve on|off` toggle shell auto approval
 - `/model` show active provider/model
+- `/skills` show active skills
+- `/skills list` list discovered skills
+- `/skills use <name>` enable a skill
+- `/skills off <name>` disable a skill
+- `/skills clear` disable all skills
+- `/use <name>` alias for enabling a skill
+
+You can also mention `$skill-name` in a prompt to auto-enable that skill for the current session.
 
 ## Notes
 
@@ -93,3 +124,7 @@ node src/cli.js --prompt "inspect this repo and suggest next steps"
 - Set `PIECODE_HISTORY_FILE` to override the history file location.
 - Set `PIECODE_DISABLE_CODEX_CLI=1` to skip the Codex CLI session backend.
 - Set `PIECODE_SETTINGS_FILE` to override the settings file location.
+- Set `PIECODE_ENABLE_PLANNER=1` to enable the experimental task planner (disabled by default).
+- Set `PIECODE_SKILLS_DIR` to override/extend skill root directories (comma-separated).
+- Set `PIECODE_PLAN_FIRST=0` to disable lightweight pre-plan.
+- Set `PIECODE_TOOL_BUDGET` to set initial planning budget guidance (default `6`, range `1-12`).
