@@ -452,38 +452,42 @@ function printSkillList(skillIndex, logLine) {
 }
 
 function createCompleter(getSkillIndex) {
-  return (line) => {
+  return (line, callback) => {
     const input = String(line || "");
     const trimmed = input.trimStart();
 
     if (!trimmed.startsWith("/")) {
-      return [[], line];
+      callback(null, [[], line]);
+      return;
     }
 
     const skillIndex = typeof getSkillIndex === "function" ? getSkillIndex() : getSkillIndex;
     const skillNames = [...skillIndex.keys()].sort((a, b) => a.localeCompare(b));
     const tryComplete = (candidates, fragment) => {
       const hits = candidates.filter((item) => item.startsWith(fragment));
-      return [hits.length ? hits : candidates, fragment];
+      callback(null, [hits.length ? hits : candidates, fragment]);
     };
 
     if (/^\/skills\s+use(?:\s+.*)?$/i.test(trimmed)) {
       const match = trimmed.match(/^\/skills\s+use(?:\s+(.*))?$/i);
       const fragment = (match?.[1] || "").trim();
-      return tryComplete(skillNames, fragment);
+      tryComplete(skillNames, fragment);
+      return;
     }
     if (/^\/skills\s+off(?:\s+.*)?$/i.test(trimmed)) {
       const match = trimmed.match(/^\/skills\s+off(?:\s+(.*))?$/i);
       const fragment = (match?.[1] || "").trim();
-      return tryComplete(skillNames, fragment);
+      tryComplete(skillNames, fragment);
+      return;
     }
     if (/^\/use(?:\s+.*)?$/i.test(trimmed)) {
       const match = trimmed.match(/^\/use(?:\s+(.*))?$/i);
       const fragment = (match?.[1] || "").trim();
-      return tryComplete(skillNames, fragment);
+      tryComplete(skillNames, fragment);
+      return;
     }
 
-    return tryComplete(SLASH_COMMANDS, trimmed);
+    tryComplete(SLASH_COMMANDS, trimmed);
   };
 }
 
@@ -773,7 +777,7 @@ async function main() {
   const exitArmedRef = { value: false };
   const approvalActiveRef = { value: false };
   let onKeypress = null;
-  if (tui) {
+  if (tui || display) {
     readlineCore.emitKeypressEvents(stdin);
     let lastSuggestionKey = "";
     onKeypress = (_str, key = {}) => {
@@ -785,35 +789,48 @@ async function main() {
         exitArmedRef.value = false;
       }
 
-      if (key.ctrl && key.name === "o") {
-        llmDebugRef.value = !llmDebugRef.value;
-        tui.setLlmDebugEnabled(llmDebugRef.value);
-        return;
+      if (tui) {
+        if (key.ctrl && key.name === "o") {
+          llmDebugRef.value = !llmDebugRef.value;
+          tui.setLlmDebugEnabled(llmDebugRef.value);
+          return;
+        }
+        if (key.ctrl && key.name === "l") {
+          tui.toggleLogPanel();
+          return;
+        }
+        if (key.ctrl && key.name === "t") {
+          tui.toggleTodoPanel();
+          return;
+        }
+        currentInputRef.value = currentLine;
+        tui.renderInput(currentInputRef.value);
       }
-      if (key.ctrl && key.name === "l") {
-        tui.toggleLogPanel();
-        return;
-      }
-      if (key.ctrl && key.name === "t") {
-        tui.toggleTodoPanel();
-        return;
-      }
-      currentInputRef.value = currentLine;
-      tui.renderInput(currentInputRef.value);
-      if (!currentLine.trimStart().startsWith("/")) return;
 
-      const shouldSuggestNow =
-        currentLine.trim() === "/" || key.name === "tab";
-      if (!shouldSuggestNow) return;
+      if (!currentLine.trimStart().startsWith("/")) {
+        if (lastSuggestionKey) {
+          lastSuggestionKey = "";
+          if (display) display.clearSuggestions();
+        }
+        return;
+      }
 
       const suggestions = getSuggestionsForInput(currentLine, () => skillIndex).slice(0, 8);
-      if (suggestions.length === 0) return;
+      if (suggestions.length === 0) {
+        if (lastSuggestionKey) {
+          lastSuggestionKey = "";
+          if (display) display.clearSuggestions();
+        }
+        return;
+      }
       const suggestionKey = `${currentLine}::${suggestions.join(",")}`;
       if (suggestionKey === lastSuggestionKey) return;
       lastSuggestionKey = suggestionKey;
-      logLine(`[suggest] ${suggestions.join("  ")}`);
-      if (key.name !== "tab") {
+      if (tui) {
+        logLine(`[suggest] ${suggestions.join("  ")}`);
         tui.render(currentInputRef.value, "slash command suggestions");
+      } else if (display) {
+        display.showSuggestions(suggestions);
       }
     };
     stdin.on("keypress", onKeypress);
@@ -1017,6 +1034,7 @@ async function main() {
 
     const input = rawInput.trim();
     if (!input) continue;
+    if (display) display.clearSuggestions();
     exitArmedRef.value = false;
     const isSlash = input.startsWith("/");
     if (!isSlash) {
@@ -1039,6 +1057,7 @@ async function main() {
     });
     if (slash.done) break;
     if (slash.handled) {
+      if (display) display.clearSuggestions();
       currentInputRef.value = "";
       continue;
     }

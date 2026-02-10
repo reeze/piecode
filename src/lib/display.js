@@ -305,6 +305,25 @@ export class Display {
   constructor() {
     this.spinner = new Spinner();
     this.currentToolStart = null;
+    this.lastSuggestionLine = "";
+  }
+
+  showSuggestions(suggestions) {
+    if (!process.stdout.isTTY || suggestions.length === 0) return;
+    const line = suggestions.map((s) => c(COLORS.dim, s)).join("  ");
+    // Overwrite previous suggestion line if it exists
+    if (this.lastSuggestionLine) {
+      process.stdout.write(`\r\x1b[2K`);
+    }
+    this.lastSuggestionLine = line;
+    process.stdout.write(`\r\x1b[2K${c(COLORS.dim, "  ")}${line}`);
+  }
+
+  clearSuggestions() {
+    if (this.lastSuggestionLine) {
+      process.stdout.write(`\r\x1b[2K`);
+      this.lastSuggestionLine = "";
+    }
   }
 
   onThinking(stage) {
