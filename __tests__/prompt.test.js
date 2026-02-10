@@ -52,6 +52,32 @@ describe('Prompt functions', () => {
       expect(prompt).toContain('demo-skill');
       expect(prompt).toContain('Use strict typing.');
     });
+
+    test('should include project instructions when provided', () => {
+      const prompt = buildSystemPrompt({
+        workspaceDir: '/test/workspace',
+        autoApprove: false,
+        projectInstructions: {
+          source: 'AGENTS.md',
+          content: 'Do not edit generated files.',
+        },
+      });
+
+      expect(prompt).toContain('PROJECT INSTRUCTIONS');
+      expect(prompt).toContain('AGENTS.md');
+      expect(prompt).toContain('Do not edit generated files.');
+    });
+
+    test('should include todo tracking conventions', () => {
+      const prompt = buildSystemPrompt({
+        workspaceDir: '/test/workspace',
+        autoApprove: false,
+      });
+
+      expect(prompt).toContain('todo_write');
+      expect(prompt).toContain('todo_write/todowrite');
+      expect(prompt).toContain('pending, in_progress, completed');
+    });
   });
 
   describe('parseModelAction', () => {
@@ -89,6 +115,33 @@ describe('Prompt functions', () => {
       expect(result.type).toBe('tool_use');
       expect(result.tool).toBe('read_file');
       expect(result.input).toEqual({ path: 'test.txt' });
+    });
+
+    test('should parse todo_write tool', () => {
+      const result = parseModelAction(
+        '{"type":"tool_use","tool":"todo_write","input":{"todos":[{"content":"step a","status":"pending"}]}}'
+      );
+      expect(result.type).toBe('tool_use');
+      expect(result.tool).toBe('todo_write');
+      expect(result.input).toEqual({ todos: [{ content: 'step a', status: 'pending' }] });
+    });
+
+    test('should parse todowrite alias tool type', () => {
+      const result = parseModelAction(
+        '{"type":"todowrite","input":{"todos":[{"content":"step a","status":"in_progress"}]}}'
+      );
+      expect(result.type).toBe('tool_use');
+      expect(result.tool).toBe('todowrite');
+      expect(result.input).toEqual({ todos: [{ content: 'step a', status: 'in_progress' }] });
+    });
+
+    test('should parse tool_use with todowrite alias as tool field', () => {
+      const result = parseModelAction(
+        '{"type":"tool_use","tool":"todowrite","input":{"todos":[{"content":"step b","status":"completed"}]}}'
+      );
+      expect(result.type).toBe('tool_use');
+      expect(result.tool).toBe('todowrite');
+      expect(result.input).toEqual({ todos: [{ content: 'step b', status: 'completed' }] });
     });
 
     test('should parse plain text tool block', () => {

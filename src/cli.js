@@ -39,6 +39,41 @@ const SLASH_COMMANDS = [
   "/workspace",
 ];
 
+const MODEL_SUGGESTIONS = [
+  "seed:doubao-seed-code-preview-latest",
+  "openrouter:moonshotai/kimi-k2.5",
+  "openrouter:google/gemini-3-flash-preview",
+  "openrouter:anthropic/claude-sonnet-4.5",
+  "openrouter:deepseek/deepseek-v3.2",
+  "openrouter:minimax/minimax-m2.1",
+  "openrouter:anthropic/claude-opus-4.5",
+  "openrouter:anthropic/claude-opus-4.6",
+  "openrouter:z-ai/glm-4.7",
+  "openai/gpt-4.1-mini",
+  "openai/gpt-4.1",
+  "openai/gpt-4o-mini",
+  "openai/gpt-4o",
+  "anthropic/claude-3.5-sonnet",
+  "anthropic/claude-3.7-sonnet",
+  "google/gemini-2.0-flash-001",
+  "meta-llama/llama-3.1-70b-instruct",
+  "qwen/qwen-2.5-coder-32b-instruct",
+  "deepseek/deepseek-chat",
+  "doubao-seed-code-preview-latest",
+  "gpt-5-codex",
+];
+
+const OPENROUTER_ALLOWED_MODELS = [
+  "moonshotai/kimi-k2.5",
+  "google/gemini-3-flash-preview",
+  "anthropic/claude-sonnet-4.5",
+  "deepseek/deepseek-v3.2",
+  "minimax/minimax-m2.1",
+  "anthropic/claude-opus-4.5",
+  "anthropic/claude-opus-4.6",
+  "z-ai/glm-4.7",
+];
+
 function createMutedTtyOutput(baseOut) {
   const muted = new Writable({
     write(_chunk, _enc, cb) {
@@ -76,6 +111,12 @@ async function loadSettings(filePath) {
   }
 }
 
+async function saveSettings(filePath, settings) {
+  const next = settings && typeof settings === "object" ? settings : {};
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, `${JSON.stringify(next, null, 2)}\n`, "utf8");
+}
+
 function resolveProviderOptions(args, settings) {
   const provider = args.provider || settings.provider || null;
   const providerSettings = 
@@ -85,22 +126,22 @@ function resolveProviderOptions(args, settings) {
 
   const model = 
     args.model ||
-    settings.model ||
     providerSettings.model ||
+    settings.model ||
     null;
 
   const endpoint = 
     args.baseUrl ||
-    settings.endpoint ||
-    settings.baseUrl ||
     providerSettings.endpoint ||
     providerSettings.baseUrl ||
+    settings.endpoint ||
+    settings.baseUrl ||
     null;
 
   const apiKey = 
     args.apiKey ||
-    settings.apiKey ||
     providerSettings.apiKey ||
+    settings.apiKey ||
     null;
 
   return {
@@ -119,7 +160,7 @@ function getHistoryFilePath() {
 }
 
 async function loadProjectInstructions(workspaceDir) {
-  const candidates = ["AGENTS.md", "AGENT.md"];
+  const candidates = ["AGENTS.md"];
   for (const name of candidates) {
     const filePath = path.join(workspaceDir, name);
     try {
@@ -187,7 +228,7 @@ Usage:
 Options:
   --prompt, -p         One-shot prompt to run
   --help, -h           Show this help
-  --provider, -P       Model provider: anthropic, openai, codex, seed
+  --provider, -P       Model provider: anthropic, openai, openrouter, codex, seed
   --api-key, -K        API key for the provider
   --model, -M          Model name to use
   --base-url, -B       Base URL for OpenAI-compatible endpoints (default: https://api.openai.com/v1)
@@ -203,6 +244,12 @@ Environment:
   OPENAI_API_KEY       OpenAI-compatible fallback
   OPENAI_BASE_URL      Optional (default https://api.openai.com/v1)
   OPENAI_MODEL         Optional (default gpt-4.1-mini)
+
+  OPENROUTER_API_KEY   OpenRouter API key (OpenAI-compatible)
+  OPENROUTER_BASE_URL  Optional (default https://openrouter.ai/api/v1)
+  OPENROUTER_MODEL     Optional (default openai/gpt-4.1-mini)
+  OPENROUTER_SITE_URL  Optional Referer header for OpenRouter
+  OPENROUTER_APP_NAME  Optional app title header for OpenRouter
 
   SEED_API_KEY         Seed/Volcengine provider API key
   ARK_API_KEY          Alias for SEED_API_KEY
@@ -222,7 +269,7 @@ Environment:
 Auth fallback order:
   1) Command line arguments --provider/--api-key/--model
   2) ~/.piecode/settings.json
-  3) Environment variables (ANTHROPIC_API_KEY, OPENAI_API_KEY)
+  3) Environment variables (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY)
   4) Codex CLI session (codex login)
   5) Codex auth file (~/.codex/auth.json)
   Note: Codex OAuth tokens can be scope-limited.
@@ -246,6 +293,7 @@ Slash commands in interactive mode:
   CTRL+L               Toggle event log panel (TUI mode)
   CTRL+T               Toggle TODO panel (TUI mode)
   CTRL+O               Toggle LLM request/response debug panel (TUI mode)
+  SHIFT+ENTER / CTRL+J Insert newline in prompt (TUI mode)
 
 Skill invocation:
   Mention $skill-name in a prompt to auto-enable that skill.
@@ -416,6 +464,11 @@ function seedTodosFromPlan(plan) {
   }));
 }
 
+function shouldAutoTrackTodosFromPlan(plan) {
+  const steps = Array.isArray(plan?.steps) ? plan.steps.map((s) => String(s || "").trim()).filter(Boolean) : [];
+  return steps.length >= 3;
+}
+
 function advanceTodosOnToolStart(todos) {
   const next = normalizeTodos(todos);
   if (next.length === 0) return next;
@@ -448,6 +501,46 @@ function printSkillList(skillIndex, logLine) {
   }
   for (const skill of skills) {
     logLine(`${skill.name}${skill.description ? ` - ${skill.description}` : ""}`);
+  }
+}
+
+function providerPrefix(kind) {
+  const k = String(kind || "").toLowerCase();
+  if (k.includes("openrouter")) return "openrouter";
+  if (k.includes("seed")) return "seed";
+  if (k.includes("anthropic")) return "anthropic";
+  if (k.includes("openai")) return "openai";
+  if (k.includes("codex")) return "codex";
+  return k || "model";
+}
+
+function formatProviderModel(provider) {
+  const prefix = providerPrefix(provider?.kind);
+  const model = String(provider?.model || "").trim() || "unknown";
+  return `${prefix}/${model}`;
+}
+
+function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
+  const width = Math.max(40, Number(terminalWidth) || 100);
+  const center = (text) => {
+    const raw = String(text || "");
+    const clipped = raw.length > width ? raw.slice(0, Math.max(0, width - 3)) + "..." : raw;
+    const left = Math.max(0, Math.floor((width - clipped.length) / 2));
+    return `${" ".repeat(left)}${clipped}`;
+  };
+  const shortWorkspace = workspaceDir.length > 64 ? `...${workspaceDir.slice(-61)}` : workspaceDir;
+  const logoLines = [
+    `[banner-1] ${center("██████   ██  ███████")}`,
+    `[banner-2] ${center("██   ██  ██  ██")}`,
+    `[banner-3] ${center("██████   ██  █████")}`,
+    `[banner-4] ${center("██       ██  ██")}`,
+    `[banner-5] ${center("██       ██  ███████")}`,
+    `[banner-meta] ${center(`model: ${formatProviderModel(provider)}`)}`,
+    `[banner-meta] ${center(`workspace: ${shortWorkspace}`)}`,
+    `[banner-hint] ${center("keys: CTRL+L logs | CTRL+O llm i/o | CTRL+T todos")}`,
+  ];
+  for (const line of logoLines) {
+    tui.event(line);
   }
 }
 
@@ -491,6 +584,16 @@ function createCompleter(getSkillIndex) {
   };
 }
 
+function isMultilineShortcut(str, key = {}) {
+  const name = String(key?.name || "").toLowerCase();
+  if ((name === "return" || name === "enter") && key.shift) return true;
+  // Common fallback for newline insertion in terminals.
+  if (key.ctrl && name === "j") return true;
+  // xterm/kitty-like modified Enter escape sequences.
+  if (str === "\x1b[13;2u" || str === "\x1b[27;2;13~") return true;
+  return false;
+}
+
 function getSuggestionsForInput(line, getSkillIndex) {
   const input = String(line || "");
   const trimmed = input.trimStart();
@@ -518,6 +621,13 @@ function getSuggestionsForInput(line, getSkillIndex) {
     const match = trimmed.match(/^\/use(?:\s+(.*))?$/i);
     const fragment = (match?.[1] || "").trim();
     return filterByPrefix(skillNames, fragment);
+  }
+
+  if (/^\/model(?:\s+.*)?$/i.test(trimmed)) {
+    const fragment = trimmed.replace(/^\/model\s*/i, "");
+    const candidates = ["/model", "/model list", ...MODEL_SUGGESTIONS];
+    if (!fragment) return candidates;
+    return filterByPrefix(candidates, fragment);
   }
 
   return filterByPrefix(SLASH_COMMANDS, trimmed);
@@ -584,7 +694,7 @@ async function handleSlashCommand(input, ctx) {
   const {
     agent,
     autoApproveRef,
-    provider,
+    providerRef,
     skillIndex,
     activeSkillsRef,
     logLine,
@@ -592,6 +702,9 @@ async function handleSlashCommand(input, ctx) {
     skillRoots,
     refreshSkillIndex,
     tui,
+    setModel,
+    settings,
+    modelCatalogRef,
   } = ctx;
 
   const raw = String(input || "").trim();
@@ -639,7 +752,54 @@ async function handleSlashCommand(input, ctx) {
     return { done: false, handled: true };
   }
   if (lower === "/model") {
-    logLine(`${provider.kind}:${provider.model}`);
+    const p = providerRef.value;
+    logLine(`active model: ${formatProviderModel(p)}`);
+    logLine("usage: /model list | /model <model-id>");
+    return { done: false, handled: true };
+  }
+  if (lower === "/model list") {
+    const p = providerRef.value;
+    logLine(`active model: ${formatProviderModel(p)}`);
+    let listed = false;
+    try {
+      const groups = await fetchOpenRouterModelGroups({ settings });
+      if (groups.popular.length > 0) {
+        listed = true;
+        logLine("popular (openrouter):");
+        for (const id of groups.popular) logLine(`- openrouter:${id}`);
+      }
+      if (groups.latest.length > 0) {
+        listed = true;
+        logLine("latest (openrouter):");
+        for (const id of groups.latest) logLine(`- openrouter:${id}`);
+      }
+      modelCatalogRef.value = mergeModelCatalog(MODEL_SUGGESTIONS, groups.popular, groups.latest);
+    } catch {
+      // keep static fallback catalog
+    }
+    if (!listed) {
+      for (const modelId of modelCatalogRef.value) logLine(`- ${modelId}`);
+    }
+    return { done: false, handled: true };
+  }
+  if (lower.startsWith("/model ")) {
+    const targetModel = normalized.slice("/model ".length).trim();
+    if (!targetModel || targetModel.toLowerCase() === "list") {
+      logLine("usage: /model list | /model <model-id>");
+      return { done: false, handled: true };
+    }
+    try {
+      const nextProvider = await setModel(targetModel);
+      logLine(`model switched: ${formatProviderModel(nextProvider)}`);
+    } catch (err) {
+      logLine(`unable to switch model: ${err.message}`);
+      if (
+        /openrouter/i.test(String(err?.message || "")) &&
+        /api key/i.test(String(err?.message || ""))
+      ) {
+        logLine("hint: set OPENROUTER_API_KEY or add providers.openrouter.apiKey in ~/.piecode/settings.json");
+      }
+    }
     return { done: false, handled: true };
   }
   if (lower === "/skills") {
@@ -698,6 +858,103 @@ async function handleSlashCommand(input, ctx) {
   return { done: false, handled: false };
 }
 
+function getModelQueryFromInput(line) {
+  const raw = String(line || "").trimStart();
+  if (!raw.startsWith("/model")) return null;
+  const rest = raw.slice("/model".length).trim();
+  if (!rest) return "";
+  if (rest.toLowerCase() === "list") return null;
+  return rest;
+}
+
+function getFilteredModelSuggestions(query, catalog = MODEL_SUGGESTIONS) {
+  const source = Array.isArray(catalog) && catalog.length > 0 ? catalog : MODEL_SUGGESTIONS;
+  const q = String(query || "").trim().toLowerCase();
+  if (!q) return [...source];
+  const starts = source.filter((m) => m.toLowerCase().startsWith(q));
+  const contains = source.filter((m) => !starts.includes(m) && m.toLowerCase().includes(q));
+  return [...starts, ...contains];
+}
+
+async function fetchOpenRouterModelGroups({ settings }) {
+  const providerSettings =
+    settings?.providers && typeof settings.providers === "object"
+      ? settings.providers.openrouter || {}
+      : {};
+  const apiKey = providerSettings.apiKey || process.env.OPENROUTER_API_KEY || "";
+  const endpoint =
+    providerSettings.endpoint ||
+    providerSettings.baseUrl ||
+    process.env.OPENROUTER_BASE_URL ||
+    "https://openrouter.ai/api/v1";
+  const base = String(endpoint || "").replace(/\/$/, "");
+  const res = await fetch(`${base}/models`, {
+    method: "GET",
+    headers: {
+      "content-type": "application/json",
+      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
+    },
+  });
+  if (!res.ok) throw new Error(`OpenRouter models request failed (${res.status})`);
+  const data = await res.json().catch(() => ({}));
+  const rows = Array.isArray(data?.data) ? data.data : [];
+  const byId = new Map();
+  for (const row of rows) {
+    const id = String(row?.id || "").trim();
+    if (!id) continue;
+    byId.set(id, { id, created: Number(row?.created) || 0 });
+  }
+  const popular = OPENROUTER_ALLOWED_MODELS.filter((id) => byId.has(id)).slice(0, 10);
+  const latest = [];
+  return { popular, latest };
+}
+
+function mergeModelCatalog(baseCatalog, popular, latest) {
+  const out = [];
+  const seen = new Set();
+  const push = (item) => {
+    const v = String(item || "").trim();
+    if (!v || seen.has(v)) return;
+    seen.add(v);
+    out.push(v);
+  };
+  for (const id of popular || []) push(`openrouter:${id}`);
+  for (const id of latest || []) push(`openrouter:${id}`);
+  for (const id of baseCatalog || []) push(id);
+  return out;
+}
+
+function parseModelTarget(target) {
+  const raw = String(target || "").trim();
+  const m = raw.match(/^(anthropic|openai|openrouter|codex|seed)\s*:\s*(.+)$/i);
+  if (m) {
+    return {
+      provider: m[1].toLowerCase(),
+      model: m[2].trim(),
+    };
+  }
+  return { provider: "", model: raw };
+}
+
+function isAllowedOpenRouterModel(modelId) {
+  const model = String(modelId || "").trim().toLowerCase();
+  return OPENROUTER_ALLOWED_MODELS.some((m) => m.toLowerCase() === model);
+}
+
+function inferEndpointForProvider(providerOptions, provider) {
+  const explicit =
+    providerOptions?.endpoint ||
+    providerOptions?.baseUrl ||
+    null;
+  if (explicit) return String(explicit);
+  const kind = String(provider?.kind || "").toLowerCase();
+  if (kind.includes("openrouter")) return "https://openrouter.ai/api/v1";
+  if (kind.includes("seed")) return "https://ark.cn-beijing.volces.com/api/coding";
+  if (kind.includes("openai") || kind.includes("codex")) return "https://api.openai.com/v1";
+  if (kind.includes("anthropic")) return "https://api.anthropic.com/v1/messages";
+  return "unknown";
+}
+
 async function main() {
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
@@ -712,6 +969,7 @@ async function main() {
 
   const settingsFile = getSettingsFilePath();
   const settings = await loadSettings(settingsFile);
+  const modelCatalogRef = { value: [...MODEL_SUGGESTIONS] };
   const skillRoots = resolveSkillRoots(settings);
   let skillIndex = await discoverSkills(skillRoots);
   const refreshSkillIndex = async () => {
@@ -733,7 +991,8 @@ async function main() {
     return;
   }
 
-  const provider = getProvider(resolveProviderOptions(args, settings));
+  const providerOptionsRef = { value: resolveProviderOptions(args, settings) };
+  const providerRef = { value: getProvider(providerOptionsRef.value) };
   const workspaceDir = process.cwd();
   const projectInstructionsRef = { value: await loadProjectInstructions(workspaceDir) };
   const autoApproveRef = { value: false };
@@ -744,6 +1003,7 @@ async function main() {
   const llmDebugRef = { value: false };
   const currentInputRef = { value: "" };
   const todosRef = { value: [] };
+  const todoAutoTrackRef = { value: false };
   const readlineOutput = useTui ? createMutedTtyOutput(stdout) : stdout;
 
   const createReadline = (history = []) => {
@@ -761,32 +1021,44 @@ async function main() {
   let rl = createReadline(initialHistory);
 
   let tui = null;
+  let onResize = null;
   if (useTui) {
     tui = new SimpleTui({
       out: stdout,
       workspaceDir,
-      providerLabel: () => `${provider.kind}:${provider.model}`,
+      providerLabel: () => formatProviderModel(providerRef.value),
       getSkillsLabel: () => formatSkillLabel(activeSkillsRef),
       getApprovalLabel: () => (autoApproveRef.value ? "on" : "off"),
     });
     tui.setLlmDebugEnabled(llmDebugRef.value);
     tui.setTodos(todosRef.value);
+    onResize = () => {
+      tui.render(currentInputRef.value);
+    };
+    stdout.on("resize", onResize);
+    process.on("SIGWINCH", onResize);
   }
 
   const logLine = createLogger(tui, display, () => currentInputRef.value);
   const exitArmedRef = { value: false };
   const approvalActiveRef = { value: false };
+  const multilineBufferRef = { value: "" };
+  const multilineCommitRef = { value: false };
+  const suppressNextSubmitRef = { value: false };
+  const pendingCommandSubmitRef = { value: "" };
+  const modelPickerRef = { active: false, query: "", options: [], index: 0 };
+  const commandPickerRef = { active: false, options: [], index: 0 };
   let onKeypress = null;
   if (tui || display) {
     readlineCore.emitKeypressEvents(stdin);
-    let lastSuggestionKey = "";
-    onKeypress = (_str, key = {}) => {
+    onKeypress = (str, key = {}) => {
       if (approvalActiveRef.value) return;
       const currentLine = String(rl.line || "");
-      const emptyInput = currentLine.trim().length === 0;
+      const emptyInput = currentLine.trim().length === 0 && !multilineBufferRef.value.trim();
 
       if (exitArmedRef.value && (!emptyInput || (key.name && key.name !== "d"))) {
         exitArmedRef.value = false;
+        if (tui) tui.clearInputHint();
       }
 
       if (tui) {
@@ -803,42 +1075,237 @@ async function main() {
           tui.toggleTodoPanel();
           return;
         }
-        currentInputRef.value = currentLine;
+
+        const pickerQuery = getModelQueryFromInput(currentLine);
+        if (pickerQuery !== null) {
+          const nextOptions = getFilteredModelSuggestions(pickerQuery, modelCatalogRef.value);
+          if (nextOptions.length > 0) {
+            modelPickerRef.active = true;
+            commandPickerRef.active = false;
+            commandPickerRef.options = [];
+            commandPickerRef.index = 0;
+            tui.clearCommandSuggestions();
+            if (modelPickerRef.query !== pickerQuery) {
+              modelPickerRef.query = pickerQuery;
+              modelPickerRef.options = nextOptions;
+              modelPickerRef.index = 0;
+            } else {
+              modelPickerRef.options = nextOptions;
+              if (modelPickerRef.index >= modelPickerRef.options.length) modelPickerRef.index = 0;
+            }
+            tui.setModelSuggestions(modelPickerRef.options, modelPickerRef.index);
+          } else {
+            modelPickerRef.active = false;
+            modelPickerRef.options = [];
+            modelPickerRef.index = 0;
+            tui.clearModelSuggestions();
+          }
+        } else {
+          if (modelPickerRef.active) {
+            modelPickerRef.active = false;
+            modelPickerRef.query = "";
+            modelPickerRef.options = [];
+            modelPickerRef.index = 0;
+            tui.clearModelSuggestions();
+          }
+          const trimmed = currentLine.trimStart();
+          if (trimmed.startsWith("/")) {
+            const commandOptions = getSuggestionsForInput(currentLine, () => skillIndex).slice(0, 8);
+            if (commandOptions.length > 0) {
+              commandPickerRef.active = true;
+              commandPickerRef.options = commandOptions;
+              if (commandPickerRef.index >= commandOptions.length) commandPickerRef.index = 0;
+              tui.setCommandSuggestions(commandPickerRef.options, commandPickerRef.index);
+            } else {
+              commandPickerRef.active = false;
+              commandPickerRef.options = [];
+              commandPickerRef.index = 0;
+              tui.clearCommandSuggestions();
+            }
+          } else if (commandPickerRef.active) {
+            commandPickerRef.active = false;
+            commandPickerRef.options = [];
+            commandPickerRef.index = 0;
+            tui.clearCommandSuggestions();
+          }
+        }
+
+        if (modelPickerRef.active) {
+          if (key.name === "tab") {
+            const delta = key.shift ? -1 : 1;
+            const len = modelPickerRef.options.length;
+            modelPickerRef.index = (modelPickerRef.index + delta + len) % len;
+            const selectedModel = modelPickerRef.options[modelPickerRef.index];
+            const nextLine = `/model ${selectedModel}`;
+            rl.write(null, { ctrl: true, name: "u" });
+            rl.write(nextLine);
+            currentInputRef.value = nextLine;
+            tui.setModelSuggestions(modelPickerRef.options, modelPickerRef.index);
+            tui.renderInput(currentInputRef.value);
+            return;
+          }
+          if (key.name === "up" || key.name === "down") {
+            const delta = key.name === "up" ? -1 : 1;
+            const len = modelPickerRef.options.length;
+            modelPickerRef.index = (modelPickerRef.index + delta + len) % len;
+            tui.setModelSuggestions(modelPickerRef.options, modelPickerRef.index);
+            return;
+          }
+          if (key.name === "return" || key.name === "enter") {
+            const selectedModel = modelPickerRef.options[modelPickerRef.index];
+            suppressNextSubmitRef.value = true;
+            pendingCommandSubmitRef.value = `/model ${selectedModel}`;
+            modelPickerRef.active = false;
+            modelPickerRef.query = "";
+            modelPickerRef.options = [];
+            modelPickerRef.index = 0;
+            tui.clearModelSuggestions();
+            rl.write(null, { ctrl: true, name: "u" });
+            rl.write(`/model ${selectedModel}`);
+            currentInputRef.value = `/model ${selectedModel}`;
+            tui.renderInput(currentInputRef.value);
+            return;
+          }
+        }
+
+        if (commandPickerRef.active) {
+          if (key.name === "tab") {
+            const delta = key.shift ? -1 : 1;
+            const len = commandPickerRef.options.length;
+            commandPickerRef.index = (commandPickerRef.index + delta + len) % len;
+            const selectedCommand = commandPickerRef.options[commandPickerRef.index];
+            rl.write(null, { ctrl: true, name: "u" });
+            rl.write(selectedCommand);
+            currentInputRef.value = selectedCommand;
+            tui.setCommandSuggestions(commandPickerRef.options, commandPickerRef.index);
+            tui.renderInput(currentInputRef.value);
+            return;
+          }
+          if (key.name === "up" || key.name === "down") {
+            const delta = key.name === "up" ? -1 : 1;
+            const len = commandPickerRef.options.length;
+            commandPickerRef.index = (commandPickerRef.index + delta + len) % len;
+            tui.setCommandSuggestions(commandPickerRef.options, commandPickerRef.index);
+            return;
+          }
+          if (key.name === "return" || key.name === "enter") {
+            const selectedCommand = commandPickerRef.options[commandPickerRef.index];
+            suppressNextSubmitRef.value = true;
+            pendingCommandSubmitRef.value = selectedCommand;
+            commandPickerRef.active = false;
+            commandPickerRef.options = [];
+            commandPickerRef.index = 0;
+            tui.clearCommandSuggestions();
+            rl.write(null, { ctrl: true, name: "u" });
+            rl.write(selectedCommand);
+            currentInputRef.value = selectedCommand;
+            tui.renderInput(currentInputRef.value);
+            return;
+          }
+        }
+
+        if (isMultilineShortcut(str, key)) {
+          multilineBufferRef.value = `${multilineBufferRef.value}${currentLine}\n`;
+          multilineCommitRef.value = true;
+          // Clear current readline line so Shift+Enter does not submit content.
+          rl.write(null, { ctrl: true, name: "u" });
+          currentInputRef.value = multilineBufferRef.value;
+          tui.renderInput(currentInputRef.value);
+          return;
+        }
+
+        currentInputRef.value = `${multilineBufferRef.value}${currentLine}`;
         tui.renderInput(currentInputRef.value);
       }
 
+      if (tui) return;
+
       if (!currentLine.trimStart().startsWith("/")) {
-        if (lastSuggestionKey) {
-          lastSuggestionKey = "";
-          if (display) display.clearSuggestions();
-        }
+        if (display) display.clearSuggestions();
         return;
       }
 
       const suggestions = getSuggestionsForInput(currentLine, () => skillIndex).slice(0, 8);
       if (suggestions.length === 0) {
-        if (lastSuggestionKey) {
-          lastSuggestionKey = "";
-          if (display) display.clearSuggestions();
-        }
+        if (display) display.clearSuggestions();
         return;
       }
-      const suggestionKey = `${currentLine}::${suggestions.join(",")}`;
-      if (suggestionKey === lastSuggestionKey) return;
-      lastSuggestionKey = suggestionKey;
-      if (tui) {
-        logLine(`[suggest] ${suggestions.join("  ")}`);
-        tui.render(currentInputRef.value, "slash command suggestions");
-      } else if (display) {
+      if (display) {
         display.showSuggestions(suggestions);
       }
     };
     stdin.on("keypress", onKeypress);
   }
 
+  const switchModel = async (modelId) => {
+    const parsed = parseModelTarget(modelId);
+    const selectedModel = parsed.model;
+    if (!selectedModel) throw new Error("Model id is required");
+    const seedConfigured =
+      Boolean(settings?.providers?.seed?.apiKey) || Boolean(process.env.SEED_API_KEY) || Boolean(process.env.ARK_API_KEY);
+    const seedConfiguredModel = String(settings?.providers?.seed?.model || "").trim();
+    const looksLikeSeedModel =
+      selectedModel.toLowerCase().includes("doubao-seed") ||
+      (seedConfiguredModel && selectedModel === seedConfiguredModel);
+    const openRouterConfigured =
+      Boolean(process.env.OPENROUTER_API_KEY) ||
+      Boolean(settings?.providers?.openrouter?.apiKey) ||
+      Boolean(settings?.apiKey && String(settings?.provider || "").toLowerCase() === "openrouter");
+    const inferredProvider =
+      parsed.provider ||
+      (
+        looksLikeSeedModel &&
+        providerOptionsRef.value.provider !== "seed" &&
+        seedConfigured
+      ? "seed"
+      : ""
+      ) ||
+      (
+        selectedModel.includes("/") &&
+        providerOptionsRef.value.provider !== "openrouter" &&
+        openRouterConfigured
+      ? "openrouter"
+      : "");
+    const nextProviderName = inferredProvider || providerOptionsRef.value.provider || settings.provider || null;
+    if (nextProviderName === "openrouter" && !isAllowedOpenRouterModel(selectedModel)) {
+      throw new Error(
+        `Unsupported OpenRouter model: ${selectedModel}. Allowed: ${OPENROUTER_ALLOWED_MODELS.join(", ")}`
+      );
+    }
+
+    providerOptionsRef.value = {
+      ...providerOptionsRef.value,
+      provider: nextProviderName,
+      model: selectedModel,
+    };
+    if (inferredProvider) {
+      const providerSettings =
+        settings?.providers && typeof settings.providers === "object"
+          ? settings.providers[inferredProvider] || {}
+          : {};
+      providerOptionsRef.value.apiKey =
+        providerSettings.apiKey ||
+        (inferredProvider === "openrouter" ? process.env.OPENROUTER_API_KEY || null : providerOptionsRef.value.apiKey);
+      providerOptionsRef.value.baseUrl = providerSettings.endpoint || providerSettings.baseUrl || providerOptionsRef.value.baseUrl || null;
+      providerOptionsRef.value.endpoint = providerOptionsRef.value.baseUrl;
+    }
+    const nextProvider = getProvider(providerOptionsRef.value);
+    providerRef.value = nextProvider;
+    agent.provider = nextProvider;
+    settings.model = selectedModel;
+    if (nextProviderName) settings.provider = nextProviderName;
+    try {
+      await saveSettings(settingsFile, settings);
+    } catch {
+      // best effort
+    }
+    if (tui) tui.onModelCall(formatProviderModel(nextProvider));
+    return nextProvider;
+  };
+
   const askApproval = async (q) => {
     let ans = "";
-    const defaultYes = /\[Y\/n\]/.test(q);
+    const defaultYes = false;
     if (tui) {
       const compactPrompt = q.replace(/\s+/g, " ").trim();
       approvalActiveRef.value = true;
@@ -858,7 +1325,7 @@ async function main() {
   };
 
   const agent = new Agent({
-    provider,
+    provider: providerRef.value,
     workspaceDir,
     autoApproveRef,
     askApproval,
@@ -866,20 +1333,22 @@ async function main() {
     projectInstructionsRef,
     onTodoWrite: (nextTodos) => {
       todosRef.value = normalizeTodos(nextTodos);
+      todoAutoTrackRef.value = false;
       if (tui) tui.setTodos(todosRef.value);
       logLine(`updated todos: ${todosRef.value.length}`);
     },
     onEvent: (evt) => {
       if (evt.type === "model_call") {
-        if (tui) tui.onModelCall(`${evt.provider}:${evt.model}`);
-        logLine(`[model] ${evt.provider}:${evt.model}`);
+        const label = formatProviderModel({ kind: evt.provider, model: evt.model });
+        if (tui) tui.onModelCall(label);
+        logLine(`[model] ${label}`);
       }
       if (evt.type === "planning_call") {
-        if (tui) tui.onModelCall(`${evt.provider}:${evt.model}`);
+        if (tui) tui.onModelCall(formatProviderModel({ kind: evt.provider, model: evt.model }));
         logLine(`[plan] creating plan`);
       }
       if (evt.type === "replanning_call") {
-        if (tui) tui.onModelCall(`${evt.provider}:${evt.model}`);
+        if (tui) tui.onModelCall(formatProviderModel({ kind: evt.provider, model: evt.model }));
         logLine(`[plan] revising plan`);
       }
       if (evt.type === "plan") {
@@ -887,13 +1356,16 @@ async function main() {
         const budget = evt.plan?.toolBudget ?? "-";
         const summary = evt.plan?.summary ? ` - ${evt.plan.summary}` : "";
         logLine(`[plan] budget=${budget}${summary}`);
-        if (todosRef.value.length === 0) {
+        if (todosRef.value.length === 0 && shouldAutoTrackTodosFromPlan(evt.plan)) {
           const seeded = seedTodosFromPlan(evt.plan);
           if (seeded.length > 0) {
             todosRef.value = seeded;
+            todoAutoTrackRef.value = true;
             if (tui) tui.setTodos(todosRef.value);
             logLine(`seeded todos from plan: ${seeded.length}`);
           }
+        } else {
+          todoAutoTrackRef.value = false;
         }
       }
       if (evt.type === "replan") {
@@ -908,14 +1380,15 @@ async function main() {
       if (evt.type === "llm_request") {
         if (tui) tui.onThinking(evt.stage);
         if (display) display.onThinking(evt.stage);
+        const endpoint = inferEndpointForProvider(providerOptionsRef.value, providerRef.value);
         if (tui) {
           const used = estimateTokenCount(evt.payload);
-          const limit = inferContextWindow(provider.model);
+          const limit = inferContextWindow(providerRef.value.model);
           tui.setContextUsage(used, limit);
         }
-        logLine(`[thinking] request:${evt.stage} ${summarizeForLog(evt.payload)}`);
+        logLine(`[thinking] request:${evt.stage} endpoint:${endpoint} ${summarizeForLog(evt.payload)}`);
         if (tui && llmDebugRef.value) {
-          tui.setLlmRequest(`[${evt.stage}] ${evt.payload}`);
+          tui.setLlmRequest(`[${evt.stage}] endpoint=${endpoint}\n${evt.payload}`);
         }
       }
       if (evt.type === "llm_response") {
@@ -925,11 +1398,12 @@ async function main() {
         }
       }
       if (evt.type === "thinking_done") {
+        if (tui) tui.onThinkingDone();
         if (display) display.onThinkingDone();
       }
       if (evt.type === "thought") {
         if (display) display.onThought(evt.content);
-        logLine(`[thinking] ${evt.content}`);
+        logLine(`[thought] ${evt.content}`);
       }
       if (evt.type === "tool_use") {
         if (tui) tui.onToolUse(evt.tool);
@@ -945,7 +1419,7 @@ async function main() {
           .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
           .join(" ");
         logLine(`[run] ${evt.tool}${details ? ` ${details}` : ""}`);
-        if (evt.tool !== "todo_write") {
+        if (todoAutoTrackRef.value && evt.tool !== "todo_write" && evt.tool !== "todowrite") {
           const advanced = advanceTodosOnToolStart(todosRef.value);
           if (advanced.length > 0) {
             todosRef.value = advanced;
@@ -982,7 +1456,7 @@ async function main() {
 
   if (tui) {
     tui.start();
-    tui.event(`ready in ${path.basename(workspaceDir)}`);
+    emitStartupLogo(tui, providerRef.value, workspaceDir, stdout.columns || 100);
     if (projectInstructionsRef.value?.source) {
       tui.event(`loaded project instructions: ${projectInstructionsRef.value.source}`);
     }
@@ -991,7 +1465,7 @@ async function main() {
     }
     tui.render(currentInputRef.value, "Type /help for commands");
   } else {
-    console.log(`Piecode ready in ${path.basename(workspaceDir)} (${provider.kind}:${provider.model})`);
+    console.log(`Piecode (${formatProviderModel(providerRef.value)})`);
     if (projectInstructionsRef.value?.source) {
       console.log(`loaded project instructions: ${projectInstructionsRef.value.source}`);
     }
@@ -1015,9 +1489,9 @@ async function main() {
       if (!isInputAbort) throw err;
 
       if (tui) {
-        if (!exitArmedRef.value && String(rl.line || "").trim().length === 0) {
+        if (!exitArmedRef.value && String(rl.line || "").trim().length === 0 && !multilineBufferRef.value.trim()) {
           exitArmedRef.value = true;
-          logLine("Press CTRL+D again to exit.");
+          tui.setInputHint("Press CTRL+D again to exit.");
           const prevHistory = Array.isArray(rl.history) ? [...rl.history] : [];
           try {
             rl.close();
@@ -1032,21 +1506,42 @@ async function main() {
       break;
     }
 
-    const input = rawInput.trim();
-    if (!input) continue;
+    if (suppressNextSubmitRef.value) {
+      suppressNextSubmitRef.value = false;
+      if (pendingCommandSubmitRef.value) {
+        rawInput = pendingCommandSubmitRef.value;
+        pendingCommandSubmitRef.value = "";
+      } else {
+        currentInputRef.value = "";
+        continue;
+      }
+    }
+
+    if (multilineCommitRef.value) {
+      multilineCommitRef.value = false;
+      currentInputRef.value = multilineBufferRef.value;
+      if (tui) tui.renderInput(currentInputRef.value);
+      continue;
+    }
+
+    const combinedInput = `${multilineBufferRef.value}${rawInput}`;
+    multilineBufferRef.value = "";
+    const finalInput = combinedInput.trim();
+    if (!finalInput) continue;
     if (display) display.clearSuggestions();
     exitArmedRef.value = false;
-    const isSlash = input.startsWith("/");
+    if (tui) tui.clearInputHint();
+    const isSlash = finalInput.startsWith("/");
     if (!isSlash) {
-      logLine(`[task] ${input}`);
+      logLine(`[task] ${finalInput}`);
     }
     currentInputRef.value = "";
     if (tui) tui.render(currentInputRef.value, isSlash ? "handling command" : "processing task");
 
-    const slash = await handleSlashCommand(input, {
+    const slash = await handleSlashCommand(finalInput, {
       agent,
       autoApproveRef,
-      provider,
+      providerRef,
       skillIndex,
       activeSkillsRef,
       logLine,
@@ -1054,6 +1549,9 @@ async function main() {
       skillRoots,
       refreshSkillIndex,
       tui,
+      setModel: switchModel,
+      settings,
+      modelCatalogRef,
     });
     if (slash.done) break;
     if (slash.handled) {
@@ -1062,12 +1560,14 @@ async function main() {
       continue;
     }
 
-    await maybeAutoEnableSkills(input, activeSkillsRef, skillIndex, logLine);
-    await runAgentTurn(agent, input, tui, logLine, display);
-    const advancedAfterTurn = advanceTodosOnTurnDone(todosRef.value);
-    if (advancedAfterTurn.length > 0) {
-      todosRef.value = advancedAfterTurn;
-      if (tui) tui.setTodos(todosRef.value);
+    await maybeAutoEnableSkills(finalInput, activeSkillsRef, skillIndex, logLine);
+    await runAgentTurn(agent, finalInput, tui, logLine, display);
+    if (todoAutoTrackRef.value) {
+      const advancedAfterTurn = advanceTodosOnTurnDone(todosRef.value);
+      if (advancedAfterTurn.length > 0) {
+        todosRef.value = advancedAfterTurn;
+        if (tui) tui.setTodos(todosRef.value);
+      }
     }
     currentInputRef.value = "";
   }
@@ -1076,6 +1576,10 @@ async function main() {
     await saveHistory(historyFile, rl.history);
   } finally {
     if (onKeypress) stdin.off("keypress", onKeypress);
+    if (onResize) {
+      stdout.off("resize", onResize);
+      process.off("SIGWINCH", onResize);
+    }
     if (tui) tui.stop();
     rl.close();
   }

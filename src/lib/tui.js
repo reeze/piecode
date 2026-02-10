@@ -7,7 +7,7 @@ function truncateLine(line, width) {
 }
 
 function wrapText(text, width) {
-  const source = String(text ?? "");
+  const source = String(text ?? "").replace(/\r/g, "");
   if (width <= 1) return [source];
   const out = [];
   for (const paragraph of source.split("\n")) {
@@ -55,6 +55,103 @@ function wrapText(text, width) {
     if (line) out.push(line);
   }
   return out;
+}
+
+function color(text, code) {
+  return `\x1b[${code}m${text}\x1b[0m`;
+}
+
+function renderInlineMarkdown(line) {
+  let out = String(line || "");
+  out = out.replace(
+    /`([^`]+)`/g,
+    (_m, content) => color(` ${content} `, "46;30")
+  );
+  out = out.replace(
+    /(\*\*|__)(?!\s)(.+?)(?<!\s)\1/g,
+    (_m, _d, content) => color(content, "1")
+  );
+  out = out.replace(
+    /\[([^\]]+)\]\(([^)]+)\)/g,
+    (_m, text, url) => `${color(text, "4;34")}${color(` (${url})`, "2;37")}`
+  );
+  return out;
+}
+
+function renderMarkdownLines(text) {
+  const source = String(text || "");
+  const lines = source.split("\n");
+  const out = [];
+  let inCode = false;
+  for (const line of lines) {
+    const fence = line.match(/^\s*```/);
+    if (fence) {
+      inCode = !inCode;
+      out.push(color("```", "2;37"));
+      continue;
+    }
+    if (inCode) {
+      out.push(color(line, "36"));
+      continue;
+    }
+    const header = line.match(/^(#{1,6})\s+(.+)$/);
+    if (header) {
+      out.push(color(renderInlineMarkdown(header[2]), "1;36"));
+      continue;
+    }
+    const bullet = line.match(/^(\s*)[-*+]\s+(.+)$/);
+    if (bullet) {
+      out.push(`${bullet[1]}${color("•", "2;37")} ${renderInlineMarkdown(bullet[2])}`);
+      continue;
+    }
+    const ordered = line.match(/^(\s*)(\d+)[.)]\s+(.+)$/);
+    if (ordered) {
+      out.push(`${ordered[1]}${color(`${ordered[2]}.`, "2;37")} ${renderInlineMarkdown(ordered[3])}`);
+      continue;
+    }
+    out.push(renderInlineMarkdown(line));
+  }
+  return out;
+}
+
+function charDisplayWidth(ch) {
+  const cp = ch.codePointAt(0);
+  if (cp == null) return 0;
+  // Control chars and combining marks do not advance cursor width.
+  if (cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f)) return 0;
+  if (
+    (cp >= 0x300 && cp <= 0x36f) ||
+    (cp >= 0x1ab0 && cp <= 0x1aff) ||
+    (cp >= 0x1dc0 && cp <= 0x1dff) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) ||
+    (cp >= 0xfe20 && cp <= 0xfe2f)
+  ) {
+    return 0;
+  }
+  // East Asian wide/fullwidth + emoji ranges.
+  if (
+    (cp >= 0x1100 && cp <= 0x115f) ||
+    (cp >= 0x2329 && cp <= 0x232a) ||
+    (cp >= 0x2e80 && cp <= 0xa4cf) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0xfe10 && cp <= 0xfe19) ||
+    (cp >= 0xfe30 && cp <= 0xfe6f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x1f300 && cp <= 0x1faff)
+  ) {
+    return 2;
+  }
+  return 1;
+}
+
+function stringDisplayWidth(value) {
+  let width = 0;
+  for (const ch of String(value || "")) {
+    width += charDisplayWidth(ch);
+  }
+  return width;
 }
 
 function formatCompactNumber(n) {
@@ -107,6 +204,16 @@ export class SimpleTui {
     this.lastInputLine = "";
     this.approvalPrompt = "";
     this.approvalDefaultYes = false;
+    this.inputHint = "";
+    this.currentInput = "";
+    this.thinkingTick = 0;
+    this.thinkingTimer = null;
+    this.modelSuggestionsVisible = false;
+    this.modelSuggestions = [];
+    this.modelSuggestionIndex = 0;
+    this.commandSuggestionsVisible = false;
+    this.commandSuggestions = [];
+    this.commandSuggestionIndex = 0;
   }
 
   start() {
@@ -118,6 +225,7 @@ export class SimpleTui {
   stop() {
     if (!this.active) return;
     this.active = false;
+    this.stopThinkingAnimation();
     this.out.write("\x1b[2J\x1b[H\x1b[?25h");
   }
 
@@ -160,6 +268,7 @@ export class SimpleTui {
     this.modelState = "idle";
     this.thinking = false;
     this.thinkingStage = "";
+    this.stopThinkingAnimation();
     this.lastTurnMs = Number.isFinite(durationMs) ? Math.round(durationMs) : this.lastTurnMs;
     this.lastError = "";
     this.lastStatus = "Turn completed";
@@ -170,6 +279,7 @@ export class SimpleTui {
     this.modelState = "error";
     this.thinking = false;
     this.thinkingStage = "";
+    this.stopThinkingAnimation();
     this.lastError = String(errorMessage || "");
     this.lastTurnMs = Number.isFinite(durationMs) ? Math.round(durationMs) : this.lastTurnMs;
     this.lastStatus = "Turn failed";
@@ -196,7 +306,30 @@ export class SimpleTui {
     this.thinking = true;
     this.thinkingStage = String(stage || "thinking");
     this.lastStatus = `thinking: ${this.thinkingStage}`;
+    this.startThinkingAnimation();
     this.render();
+  }
+
+  onThinkingDone() {
+    this.thinking = false;
+    this.thinkingStage = "";
+    this.stopThinkingAnimation();
+    this.render();
+  }
+
+  startThinkingAnimation() {
+    if (this.thinkingTimer) return;
+    this.thinkingTimer = setInterval(() => {
+      if (!this.active || !this.thinking) return;
+      this.thinkingTick = (this.thinkingTick + 1) % 5;
+      this.render();
+    }, 220);
+  }
+
+  stopThinkingAnimation() {
+    if (!this.thinkingTimer) return;
+    clearInterval(this.thinkingTimer);
+    this.thinkingTimer = null;
   }
 
   setContextUsage(used, limit) {
@@ -249,16 +382,100 @@ export class SimpleTui {
     this.render();
   }
 
+  setInputHint(hint) {
+    this.inputHint = String(hint || "").trim();
+    this.render();
+  }
+
+  clearInputHint() {
+    if (!this.inputHint) return;
+    this.inputHint = "";
+    this.render();
+  }
+
+  setModelSuggestions(options, selectedIndex = 0) {
+    const list = Array.isArray(options) ? options.map((item) => String(item || "")).filter(Boolean) : [];
+    this.modelSuggestions = list.slice(0, 8);
+    this.modelSuggestionsVisible = this.modelSuggestions.length > 0;
+    if (!this.modelSuggestionsVisible) {
+      this.modelSuggestionIndex = 0;
+    } else {
+      const clamped = Math.max(0, Math.min(this.modelSuggestions.length - 1, Number(selectedIndex) || 0));
+      this.modelSuggestionIndex = clamped;
+    }
+    this.render();
+  }
+
+  clearModelSuggestions() {
+    if (!this.modelSuggestionsVisible && this.modelSuggestions.length === 0) return;
+    this.modelSuggestionsVisible = false;
+    this.modelSuggestions = [];
+    this.modelSuggestionIndex = 0;
+    this.render();
+  }
+
+  setCommandSuggestions(options, selectedIndex = 0) {
+    const list = Array.isArray(options) ? options.map((item) => String(item || "")).filter(Boolean) : [];
+    this.commandSuggestions = list.slice(0, 8);
+    this.commandSuggestionsVisible = this.commandSuggestions.length > 0;
+    if (!this.commandSuggestionsVisible) {
+      this.commandSuggestionIndex = 0;
+    } else {
+      const clamped = Math.max(0, Math.min(this.commandSuggestions.length - 1, Number(selectedIndex) || 0));
+      this.commandSuggestionIndex = clamped;
+    }
+    this.render();
+  }
+
+  clearCommandSuggestions() {
+    if (!this.commandSuggestionsVisible && this.commandSuggestions.length === 0) return;
+    this.commandSuggestionsVisible = false;
+    this.commandSuggestions = [];
+    this.commandSuggestionIndex = 0;
+    this.render();
+  }
+
+  formatApprovalLines(width) {
+    const prompt = String(this.approvalPrompt || "");
+    const lines = [];
+    const cmdMatch = prompt.match(/\$\s+([^\n]+)$/);
+    const command = cmdMatch?.[1] ? String(cmdMatch[1]).trim() : "";
+    const question = prompt
+      .replace(/\$\s+[^\n]+$/m, "")
+      .replace(/Approve\s*\[[^\]]+\]\s*:?\s*$/i, "")
+      .trim();
+
+    lines.push(color(" APPROVAL REQUIRED", "1;33"));
+    if (question) {
+      lines.push(truncateLine(` ${color("Question:", "1;36")} ${question}`, width));
+    }
+    if (command) {
+      lines.push(truncateLine(` ${color("Command:", "1;35")} ${color(command, "37")}`, width));
+    } else if (prompt) {
+      lines.push(truncateLine(` ${color("Details:", "1;35")} ${prompt}`, width));
+    }
+    const choiceLine = this.approvalDefaultYes
+      ? `${color("[Y]", "1;32")}es  ${color("[N]", "1;31")}o  ${color("[ENTER]", "1;33")}=${color("Yes", "32")}`
+      : `${color("[Y]", "1;32")}es  ${color("[N]", "1;31")}o  ${color("[ENTER]", "1;33")}=${color("No", "31")}`;
+    lines.push(truncateLine(` ${choiceLine}`, width));
+    return lines;
+  }
+
   formatTimelineLines(line) {
     if (!line) return [];
     if (line.startsWith("[task] ")) {
-      return [`> ${line.slice(7).trim()}`];
+      return [color(`> ${line.slice(7).trim()}`, "1;37")];
     }
     if (line.startsWith("[plan] creating plan")) {
-      return ["Planning..."];
+      return [color("Planning...", "33")];
     }
     if (line.startsWith("[thinking] ")) {
+      // Keep thinking state transient (spinner/status line), do not persist into timeline.
       return [];
+    }
+    if (line.startsWith("[thought] ")) {
+      const details = line.slice(9).trim();
+      return [color(`Thought: ${details || "<empty>"}`, "35")];
     }
     if (line.startsWith("[run] shell")) {
       const m = line.match(/command=("[^"]*"|\\S+)/);
@@ -271,23 +488,50 @@ export class SimpleTui {
         }
       }
       const display = command || "shell command";
-      return [`Bash(${display})`, "L Running..."];
+      return [color(`Bash(${display})`, "36"), color("L Running...", "2;37")];
     }
     if (line.startsWith("[tool] ")) {
-      return [`Tool: ${line.slice(7).trim()}`];
+      return [color(`Tool: ${line.slice(7).trim()}`, "36")];
     }
     if (line.startsWith("[response] ")) {
       const text = line.slice(11).trim();
-      if (!text) return ["Assistant: <empty>"];
-      const chunks = text.split("\n").filter(Boolean);
-      if (chunks.length === 0) return ["Assistant: <empty>"];
-      return [`Assistant: ${chunks[0]}`, ...chunks.slice(1)];
+      if (!text) return [color("Assistant: <empty>", "32")];
+      const chunks = renderMarkdownLines(text).filter((chunk) => chunk !== undefined);
+      if (chunks.length === 0) return [color("Assistant: <empty>", "32")];
+      return [color(`Assistant: ${chunks[0]}`, "32"), ...chunks.slice(1).map((lineItem) => color(lineItem, "32"))];
     }
     if (line.startsWith("[result] ")) {
-      return [`Result: ${line.slice(9).trim()}`];
+      return [color(`Result: ${line.slice(9).trim()}`, "1;32")];
+    }
+    if (line.startsWith("[banner-1] ")) {
+      return [color(line.slice(11), "1;82")];
+    }
+    if (line.startsWith("[banner-2] ")) {
+      return [color(line.slice(11), "1;118")];
+    }
+    if (line.startsWith("[banner-3] ")) {
+      return [color(line.slice(11), "1;154")];
+    }
+    if (line.startsWith("[banner-4] ")) {
+      return [color(line.slice(11), "1;177")];
+    }
+    if (line.startsWith("[banner-5] ")) {
+      return [color(line.slice(11), "1;201")];
+    }
+    if (line.startsWith("[banner-6] ")) {
+      return [color(line.slice(11), "1;213")];
+    }
+    if (line.startsWith("[banner-meta] ")) {
+      return [color(line.slice(14), "2;37")];
+    }
+    if (line.startsWith("[banner-hint] ")) {
+      return [color(line.slice(14), "2;36")];
+    }
+    if (line.startsWith("loaded project instructions:")) {
+      return [color(line, "2;37")];
     }
     if (line.startsWith("error:")) {
-      return [line];
+      return [color(line, "31")];
     }
     if (line.startsWith("[")) {
       // Hide internal event noise in workspace timeline.
@@ -298,9 +542,10 @@ export class SimpleTui {
 
   buildInputState(input, width) {
     const rawInput = String(input || "");
+    const normalizedInput = rawInput.replace(/\r/g, "").replace(/\n/g, " ↩ ");
     const promptGlyph = "❯";
     const maxInputWidth = Math.max(0, width - 3);
-    let shownInput = rawInput;
+    let shownInput = normalizedInput;
     if (shownInput.length > maxInputWidth) {
       shownInput =
         maxInputWidth > 3
@@ -312,12 +557,14 @@ export class SimpleTui {
     const line = shownInput
       ? truncateLine(` ${promptGlyph} ${inputText}`, width)
       : ` ${promptGlyph} \x1b[2m${truncateLine(inputText, maxInputWidth)}\x1b[0m`;
-    const cursorCol = Math.max(1, Math.min(width, 4 + shownInput.length));
+    const promptPrefix = ` ${promptGlyph} `;
+    const cursorCol = Math.max(1, Math.min(width, 1 + stringDisplayWidth(promptPrefix) + stringDisplayWidth(shownInput)));
     return { line, cursorCol };
   }
 
   renderInput(input = "") {
     if (!this.active || !this.lastInputRow || !this.lastFrameLineCount) return;
+    this.currentInput = String(input || "");
     const width = Math.max(40, this.out.columns || 100);
     const { line: inputLine, cursorCol } = this.buildInputState(input, width);
     if (inputLine === this.lastInputLine) {
@@ -354,18 +601,13 @@ export class SimpleTui {
     return truncateLine(text, width);
   }
 
-  render(input = "", status = "") {
+  render(input = this.currentInput, status = "") {
     if (!this.active) return;
+    this.currentInput = String(input || "");
 
     const width = Math.max(40, this.out.columns || 100);
     const height = Math.max(16, this.out.rows || 30);
-    const header = ` Piecode TUI | ${this.providerLabel()} | skills: ${this.getSkillsLabel()} | approve: ${this.getApprovalLabel()} `;
-    const title = truncateLine(header, width);
-    const topBorder = `\x1b[90m${"─".repeat(width)}\x1b[0m`;
     const sep = `\x1b[90m${"─".repeat(width)}\x1b[0m`;
-    const workspaceLine = truncateLine(` workspace: ${this.workspaceDir}`, width);
-    const modelStatusLine = this.formatStatusLine(width);
-    const statusLine = truncateLine(` status: ${status || this.lastStatus || "idle"}`, width);
     const errorLine = this.lastError ? truncateLine(` error: ${this.lastError}`, width) : "";
 
     const llmHeader = truncateLine(" LLM I/O DEBUG (CTRL+O to toggle)", width);
@@ -374,7 +616,7 @@ export class SimpleTui {
     const llmReqLines = this.llmDebugEnabled ? wrapText(this.lastLlmRequest || "<empty>", width).slice(0, 3) : [];
     const llmResLines = this.llmDebugEnabled ? wrapText(this.lastLlmResponse || "<empty>", width).slice(0, 3) : [];
 
-    const headerLines = errorLine ? 5 : 4;
+    const headerLines = errorLine ? 1 : 0;
     const debugBlockLines = this.showRawLogs && this.llmDebugEnabled
       ? 1 + 1 + llmReqLines.length + 1 + llmResLines.length
       : 0;
@@ -385,33 +627,35 @@ export class SimpleTui {
         )
       : 0;
     const todoBlockLines = this.showTodoPanel ? 1 + todoLines : 0; // sep + content
-    const approvalLines = this.approvalPrompt ? 4 : 0;
-    const bottomLines = 4;
-    const logSepLines = 1;
-    const availableLogLines = height - (1 + headerLines + logSepLines + todoBlockLines + debugBlockLines + approvalLines + bottomLines);
-    const logHeight = Math.max(0, availableLogLines);
+    const approvalContentLines = this.approvalPrompt ? this.formatApprovalLines(width) : [];
+    const approvalLines = this.approvalPrompt ? 1 + approvalContentLines.length : 0;
+    const commandSuggestionLines = this.commandSuggestionsVisible ? (1 + this.commandSuggestions.length) : 0;
+    const modelSuggestionLines = this.modelSuggestionsVisible ? (1 + this.modelSuggestions.length) : 0;
+    const hintLines = this.inputHint ? 1 : 0;
+    const thinkingLines = this.thinking ? 1 : 0;
+    const bottomLines = 4 + commandSuggestionLines + modelSuggestionLines + hintLines; // input + pickers + status/hint
+    const reservedLines = headerLines + todoBlockLines + debugBlockLines + approvalLines + thinkingLines + bottomLines;
+    const maxLogLines = Math.max(1, height - reservedLines);
     const wrappedLogs = this.logs.flatMap((line) => wrapText(line, width));
     const wrappedTimeline = this.timeline.flatMap((line) => wrapText(line, width));
     const sourceLines = this.showRawLogs ? wrappedLogs : wrappedTimeline;
-    const visibleLogs = sourceLines.slice(Math.max(0, sourceLines.length - logHeight));
-    while (visibleLogs.length < logHeight) visibleLogs.unshift("");
+    const visibleLogs = sourceLines.slice(Math.max(0, sourceLines.length - maxLogLines));
 
-    const inputState = this.buildInputState(input, width);
-    const footer = truncateLine(
-      ` CTRL+L ${this.showRawLogs ? "timeline" : "raw logs"} | CTRL+O llm i/o`,
-      width
-    );
-    const approvalBlock = this.approvalPrompt
-      ? [
-          sep,
-          truncateLine(" APPROVAL REQUIRED", width),
-          truncateLine(` ${this.approvalPrompt}`, width),
-          truncateLine(
-            ` Press Y to approve, N to deny${this.approvalDefaultYes ? ", ENTER = Yes" : ", ENTER = No"}`,
-            width
-          ),
-        ]
-      : [];
+    const inputState = this.buildInputState(this.currentInput, width);
+    const promptStatusRaw = `status: ${status || this.lastStatus || "idle"} | view: ${this.showRawLogs ? "raw" : "timeline"} | llm:${this.llmDebugEnabled ? "on" : "off"} | todos:${this.showTodoPanel ? "on" : "off"}`;
+    const promptStatus =
+      promptStatusRaw.length >= width
+        ? truncateLine(promptStatusRaw, width)
+        : `${" ".repeat(Math.max(0, width - promptStatusRaw.length))}${promptStatusRaw}`;
+    const approvalBlock = this.approvalPrompt ? [sep, ...approvalContentLines] : [];
+    const thinkingColors = ["82", "118", "154", "190", "201"];
+    const thinkingColor = thinkingColors[this.thinkingTick % thinkingColors.length];
+    const spinFrames = ["|", "/", "-", "\\"];
+    const dotFrames = ["", ".", "..", "..."];
+    const spin = spinFrames[this.thinkingTick % spinFrames.length];
+    const dots = dotFrames[this.thinkingTick % dotFrames.length];
+    const thinkingLine = `${spin} thinking${dots}${this.thinkingStage ? ` (${this.thinkingStage})` : ""}`;
+    const thinkingText = this.thinking ? color(thinkingLine, `1;${thinkingColor}`) : "";
 
     const todoStatus = (status) =>
       status === "completed" ? "[x]" : status === "in_progress" ? "[~]" : "[ ]";
@@ -429,30 +673,52 @@ export class SimpleTui {
         ]
       : [];
 
-    const frameLines = [
-      topBorder,
-      `\x1b[2m${title}\x1b[0m`,
-      workspaceLine,
-      modelStatusLine,
-      statusLine,
+    const commandSuggestionBlock = this.commandSuggestionsVisible
+      ? [
+          color(" commands", "2;37"),
+          ...this.commandSuggestions.map((command, idx) => {
+            const selected = idx === this.commandSuggestionIndex;
+            const text = selected ? color(`> ${command}`, "1;32") : color(`  ${command}`, "2;37");
+            return truncateLine(` ${text}`, width);
+          }),
+        ]
+      : [];
+
+    const modelSuggestionBlock = this.modelSuggestionsVisible
+      ? [
+          color(" models", "2;37"),
+          ...this.modelSuggestions.map((modelId, idx) => {
+            const selected = idx === this.modelSuggestionIndex;
+            const text = selected ? color(`> ${modelId}`, "1;32") : color(`  ${modelId}`, "2;37");
+            return truncateLine(` ${text}`, width);
+          }),
+        ]
+      : [];
+
+    const beforeInputLines = [
       ...(errorLine ? [`\x1b[31m${errorLine}\x1b[0m`] : []),
-      sep,
       ...visibleLogs,
       ...todoLinesBlock,
       ...(this.showRawLogs && this.llmDebugEnabled
         ? [sep, `\x1b[35m${llmHeader}\x1b[0m`, llmReqTitle, ...llmReqLines, llmResTitle, ...llmResLines]
         : []),
       ...approvalBlock,
+      ...(this.thinking ? [thinkingText] : []),
       sep,
+    ];
+    const frameLines = [
+      ...beforeInputLines,
       `\x1b[1m${inputState.line}\x1b[0m`,
+      ...commandSuggestionBlock,
+      ...modelSuggestionBlock,
       sep,
-      `\x1b[2m${truncateLine(`${footer} | CTRL+T todos`, width)}\x1b[0m`,
+      `\x1b[2m${promptStatus}\x1b[0m`,
+      ...(this.inputHint ? [`\x1b[2m${truncateLine(` ${this.inputHint}`, width)}\x1b[0m`] : []),
     ];
 
     const frame = frameLines.join("\n");
     this.lastFrameLineCount = frameLines.length;
-    // Input line is always the second-to-last line in the rendered frame.
-    this.lastInputRow = Math.max(1, this.lastFrameLineCount - 2);
+    this.lastInputRow = Math.max(1, beforeInputLines.length + 1);
     this.lastInputLine = inputState.line;
     this.out.write("\x1b[H\x1b[J" + frame + `\x1b[?25h\x1b[${this.lastInputRow};${inputState.cursorCol}H`);
   }

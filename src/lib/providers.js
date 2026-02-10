@@ -8,6 +8,9 @@ import { execFile as execFileCb } from "node:child_process";
 
 const DEFAULT_ANTHROPIC_MODEL = process.env.ANTHROPIC_MODEL || "claude-3-5-sonnet-latest";
 const DEFAULT_OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
+const DEFAULT_OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "openai/gpt-4.1-mini";
+const DEFAULT_OPENROUTER_BASE_URL =
+  process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
 const DEFAULT_CODEX_MODEL = process.env.CODEX_MODEL || "gpt-5-codex";
 const DEFAULT_SEED_MODEL = process.env.SEED_MODEL || "doubao-seed-code-preview-latest";
 const DEFAULT_SEED_BASE_URL =
@@ -126,7 +129,7 @@ function extractResponsesText(data) {
   return textParts.join("\n").trim();
 }
 
-function createOpenAICompatibleProvider({ kind, model, apiKey, baseUrl }) {
+function createOpenAICompatibleProvider({ kind, model, apiKey, baseUrl, extraHeaders = {} }) {
   const normalizedBase = (baseUrl || "https://api.openai.com/v1").replace(/\/$/, "");
   const chatUrl = normalizedBase.endsWith("/chat/completions")
     ? normalizedBase
@@ -138,7 +141,7 @@ function createOpenAICompatibleProvider({ kind, model, apiKey, baseUrl }) {
     async complete({ systemPrompt, prompt }) {
       const data = await postJson(
         chatUrl,
-        { Authorization: `Bearer ${apiKey}` },
+        { Authorization: `Bearer ${apiKey}`, ...extraHeaders },
         {
           model,
           temperature: 0.2,
@@ -360,6 +363,25 @@ export function getProvider(options = {}) {
       });
     }
 
+    if (provider === "openrouter") {
+      const openRouterApiKey = configuredApiKey || process.env.OPENROUTER_API_KEY;
+      if (!openRouterApiKey) {
+        throw new Error(
+          "Missing API key for openrouter provider. Set OPENROUTER_API_KEY or pass --api-key."
+        );
+      }
+      return createOpenAICompatibleProvider({
+        kind: "openrouter-compatible",
+        model: configuredModel || DEFAULT_OPENROUTER_MODEL,
+        apiKey: openRouterApiKey,
+        baseUrl: configuredBaseUrl || DEFAULT_OPENROUTER_BASE_URL,
+        extraHeaders: {
+          "HTTP-Referer": process.env.OPENROUTER_SITE_URL || "https://piecode.local",
+          "X-Title": process.env.OPENROUTER_APP_NAME || "Piecode",
+        },
+      });
+    }
+
     if (provider === "seed") {
       const seedApiKey = configuredApiKey || process.env.SEED_API_KEY || process.env.ARK_API_KEY;
       if (!seedApiKey) {
@@ -476,6 +498,19 @@ export function getProvider(options = {}) {
       model: configuredModel || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
       apiKey: requireEnv("OPENAI_API_KEY"),
       baseUrl: configuredBaseUrl || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
+    });
+  }
+
+  if (process.env.OPENROUTER_API_KEY) {
+    return createOpenAICompatibleProvider({
+      kind: "openrouter-compatible",
+      model: configuredModel || DEFAULT_OPENROUTER_MODEL,
+      apiKey: process.env.OPENROUTER_API_KEY,
+      baseUrl: configuredBaseUrl || DEFAULT_OPENROUTER_BASE_URL,
+      extraHeaders: {
+        "HTTP-Referer": process.env.OPENROUTER_SITE_URL || "https://piecode.local",
+        "X-Title": process.env.OPENROUTER_APP_NAME || "Piecode",
+      },
     });
   }
 

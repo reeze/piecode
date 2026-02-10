@@ -5,6 +5,96 @@ import { promisify } from "node:util";
 
 const exec = promisify(execCb);
 
+const SAFE_COMMANDS = new Set([
+  "ls",
+  "pwd",
+  "cat",
+  "echo",
+  "head",
+  "tail",
+  "wc",
+  "sort",
+  "uniq",
+  "cut",
+  "rg",
+  "grep",
+  "find",
+  "git",
+  "node",
+  "npm",
+  "pnpm",
+  "bun",
+]);
+
+const DANGEROUS_COMMANDS = new Set([
+  "rm",
+  "rmdir",
+  "mv",
+  "cp",
+  "chmod",
+  "chown",
+  "sudo",
+  "kill",
+  "killall",
+  "dd",
+  "mkfs",
+  "fdisk",
+  "shutdown",
+  "reboot",
+  "launchctl",
+]);
+
+function tokenizeCommandSegments(command) {
+  return String(command || "")
+    .split(/&&|\|\||\||;|\n/g)
+    .map((part) => part.trim())
+    .filter(Boolean);
+}
+
+function extractCommandName(segment) {
+  const cleaned = segment
+    .replace(/^[({\[]+/, "")
+    .replace(/^time\s+/, "")
+    .trim();
+  if (!cleaned) return "";
+  const first = cleaned.split(/\s+/)[0] || "";
+  return first.replace(/^["']|["']$/g, "").toLowerCase();
+}
+
+function classifyShellCommand(command) {
+  const raw = String(command || "");
+  if (!raw.trim()) {
+    return { level: "dangerous", reason: "empty command is invalid" };
+  }
+
+  // Allow benign null-device redirection like `2>/dev/null` or `>/dev/null`.
+  const withoutNullRedirects = raw.replace(/\s*\d?>\s*\/dev\/null\b/g, "");
+  if (
+    /[`]/.test(withoutNullRedirects) ||
+    /\$\(/.test(withoutNullRedirects) ||
+    /(^|[^<])>(?!>)/.test(withoutNullRedirects) ||
+    />>|<</.test(withoutNullRedirects)
+  ) {
+    return { level: "dangerous", reason: "contains shell substitution or redirection" };
+  }
+
+  const segments = tokenizeCommandSegments(raw);
+  const names = segments.map(extractCommandName).filter(Boolean);
+  if (names.length === 0) {
+    return { level: "dangerous", reason: "unable to parse command name" };
+  }
+
+  if (names.some((name) => DANGEROUS_COMMANDS.has(name))) {
+    return { level: "dangerous", reason: "contains potentially destructive command" };
+  }
+
+  if (names.every((name) => SAFE_COMMANDS.has(name))) {
+    return { level: "safe", reason: "all command segments are in safe allowlist" };
+  }
+
+  return { level: "unclassified", reason: "command is neither known safe nor explicitly dangerous" };
+}
+
 function resolveInsideRoot(root, candidatePath) {
   const resolved = path.resolve(root, candidatePath || ".");
   const rel = path.relative(root, resolved);
@@ -36,16 +126,21 @@ export function createToolset({ workspaceDir, autoApproveRef, askApproval, onToo
     if (!command || typeof command !== "string") {
       throw new Error("shell tool requires { command: string }");
     }
-
-    const approved = 
-      autoApproveRef.value || 
-      (await askApproval(`Run shell command?\n$ ${command}\nApprove [y/N]: `));
+    const safety = classifyShellCommand(command);
+    const needsApproval =
+      safety.level === "dangerous" ||
+      (safety.level !== "safe" && !autoApproveRef.value);
+    const approved = needsApproval
+      ? await askApproval(
+          `Run ${safety.level} shell command? (${safety.reason})\n$ ${command}\nApprove [y/N]: `
+        )
+      : true;
 
     if (!approved) {
       return "Command was not approved by the user.";
     }
 
-    onToolStart?.("shell", { command });
+    onToolStart?.("shell", { command, safety: safety.level });
     try {
       const { stdout, stderr } = await exec(command, {
         cwd: workspaceDir,
