@@ -442,6 +442,14 @@ export class SimpleTui {
     this.render();
   }
 
+  resetContextUsage() {
+    this.contextUsed = 0;
+    this.turnTokensSent = 0;
+    this.turnTokensReceived = 0;
+    this.turnStartedAt = 0;
+    this.render();
+  }
+
   toggleLogPanel() {
     this.showRawLogs = !this.showRawLogs;
     this.lastStatus = this.showRawLogs ? "Raw logs view (CTRL+L)" : "Timeline view (CTRL+L)";
@@ -585,6 +593,7 @@ export class SimpleTui {
     if (line.startsWith("[run] shell")) {
       const m = line.match(/command=("[^"]*"|\\S+)/);
       const approvalMatch = line.match(/approval=("[^"]*"|\\S+)/);
+      const shortMatch = line.match(/^\[run\]\s+shell\s+(.+)$/);
       let command = "";
       let approval = "";
       if (m?.[1]) {
@@ -600,6 +609,9 @@ export class SimpleTui {
         } catch {
           approval = approvalMatch[1];
         }
+      }
+      if (!command && shortMatch?.[1]) {
+        command = shortMatch[1].trim();
       }
       const display = command || "shell command";
       const safeDisplay = trimWorkspaceText(display, 320).text.replace(/\n/g, " ");
@@ -622,13 +634,30 @@ export class SimpleTui {
       return [...chunks, ""];
     }
     if (line.startsWith("[result] ")) {
-      return [color(`✓ ${line.slice(9).trim()}`, "1;32"), ""];
+      return [color(`✓ ${line.slice(9).trim()}`, "2;37"), ""];
     }
     if (line.startsWith("[banner-1] ")) {
       return [color(line.slice(11), "1;82")];
     }
     if (line.startsWith("[banner-title] ")) {
-      return [color(line.slice(15), "1;92")];
+      const raw = String(line.slice(15) || "");
+      const title = raw.trim();
+      if (!title) return [color(raw, "1;92")];
+      const leftPad = Math.max(0, raw.indexOf(title));
+      return [`${" ".repeat(leftPad)}${color(` ${title} `, "1;30;42")}`];
+    }
+    if (line.startsWith("[banner-title-box] ")) {
+      return [color(line.slice(19), "1;92")];
+    }
+    if (line.startsWith("[banner-title-mid] ")) {
+      const raw = String(line.slice(19) || "");
+      let rendered = raw.replace(/[│┌┐└┘─]/g, (ch) => color(ch, "1;92"));
+      rendered = rendered.replace("Pie Code", color("Pie Code", "1;92"));
+      rendered = rendered.replace("simple like pie", color("simple like pie", "2;37"));
+      return [rendered];
+    }
+    if (line.startsWith("[banner-slogan] ")) {
+      return [color(line.slice(16), "2;37")];
     }
     if (line.startsWith("[banner-2] ")) {
       return [color(line.slice(11), "1;118")];
@@ -788,9 +817,8 @@ export class SimpleTui {
     const modelSuggestionLines = this.modelSuggestionsVisible ? (1 + this.modelSuggestions.length) : 0;
     const hintLines = this.inputHint ? 1 : 0;
     const thinkingLines = this.thinking ? 1 : 0;
-    const thoughtStreamLines = this.thoughtStreamVisible
-      ? Math.min(3, wrapText(this.thoughtStreamText, width).length)
-      : 0;
+    const thoughtWrapped = this.thoughtStreamVisible ? wrapText(this.thoughtStreamText, width) : [];
+    const thoughtStreamLines = this.thoughtStreamVisible ? Math.min(3, thoughtWrapped.length) : 0;
     const bottomLines = 4 + commandSuggestionLines + modelSuggestionLines + hintLines; // input + pickers + status/hint
     const reservedLines =
       headerLines +
@@ -832,9 +860,10 @@ export class SimpleTui {
     const runningLine = `↳ | ${spin} running | ${this.formatElapsedSinceTurnStart()} | tok ↑${formatCompactNumber(this.turnTokensSent)} ↓${formatCompactNumber(this.turnTokensReceived)}`;
     const thinkingBlock = this.thinking ? [color(runningLine, `1;${thinkingColor}`)] : [];
     const thoughtStreamBlock = this.thoughtStreamVisible
-      ? wrapText(this.thoughtStreamText, width).map((line) =>
-          color(line, "35")
-        )
+      ? (() => {
+          const tail = thoughtWrapped.slice(-3);
+          return tail.map((line) => color(line, "35"));
+        })()
       : [];
 
     const todoStatus = (status) =>

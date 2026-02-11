@@ -3,7 +3,8 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
-import { spawnSync } from "node:child_process";
+import { spawnSync, exec as execCb } from "node:child_process";
+import { promisify } from "node:util";
 import * as readlineCore from "node:readline";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
@@ -12,6 +13,8 @@ import { Agent } from "./lib/agent.js";
 import { getProvider } from "./lib/providers.js";
 import {
   addSkillByName,
+  autoEnableSkills,
+  autoLoadSkillsFromInstructions,
   discoverSkills,
   loadActiveSkills,
   removeSkillByName,
@@ -24,6 +27,8 @@ import { Display } from "./lib/display.js";
 import { consumeMouseWheelDeltas, stripMouseInputNoise } from "./lib/mouse.js";
 
 const HISTORY_MAX = 500;
+const execAsync = promisify(execCb);
+const DIRECT_SHELL_MAX_OUTPUT = 12000;
 const SLASH_COMMANDS = [
   "/help",
   "/exit",
@@ -267,6 +272,7 @@ Environment:
   PIECODE_ENABLE_PLANNER  Optional (set 1 to enable experimental task planner)
   PIECODE_PLAN_FIRST      Optional (default off; set 1 to enable lightweight pre-plan)
   PIECODE_TOOL_BUDGET     Optional (default 6, range 1-12)
+  PIECODE_VERBOSE_TOOL_LOGS Optional (set 1 for full tool input details in logs)
   PIECODE_SETTINGS_FILE Optional (default ~/.piecode/settings.json)
   PIECODE_SKILLS_DIR Optional (comma-separated skill root directories)
   PIECODE_HISTORY_FILE Optional (default ~/.piecode_history)
@@ -360,32 +366,6 @@ function parseArgs(argv) {
   return args;
 }
 
-function extractMentionedSkills(input) {
-  const text = String(input || "");
-  const mentions = [...text.matchAll(/\$([A-Za-z0-9._-]+)/g)]
-    .map((match) => match[1])
-    .filter(Boolean);
-  return [...new Set(mentions)];
-}
-
-async function autoEnableMentionedSkills(input, activeSkillsRef, skillIndex) {
-  const mentioned = extractMentionedSkills(input);
-  const enabled = [];
-  const missing = [];
-
-  for (const name of mentioned) {
-    const result = await addSkillByName(activeSkillsRef.value, skillIndex, name);
-    if (result.added) {
-      activeSkillsRef.value = result.active;
-      enabled.push(name);
-    } else if (result.reason === "not-found") {
-      missing.push(name);
-    }
-  }
-
-  return { enabled, missing };
-}
-
 function createLogger(tui, display, getInput = () => "") {
   return (line) => {
     if (tui) {
@@ -407,11 +387,89 @@ function summarizeForLog(value, maxLen = 220) {
   return text.length > maxLen ? `${text.slice(0, maxLen - 3)}...` : text;
 }
 
+function formatToolInputSummary(tool, input, maxLen = 120) {
+  const safe = input && typeof input === "object" ? input : {};
+  if (tool === "shell") {
+    return summarizeForLog(safe.command || "", maxLen);
+  }
+  if (tool === "read_file" || tool === "write_file") {
+    return summarizeForLog(safe.path || "", maxLen);
+  }
+  if (tool === "list_files") {
+    return summarizeForLog(safe.path || ".", maxLen);
+  }
+  if (tool === "todo_write" || tool === "todowrite") {
+    const count = Array.isArray(safe.todos) ? safe.todos.length : 0;
+    return `${count} todos`;
+  }
+  return summarizeForLog(JSON.stringify(safe), maxLen);
+}
+
 function estimateTokenCount(text) {
   const s = String(text || "");
   if (!s) return 0;
   // Heuristic: average ~4 chars/token for mixed code + English prompts.
   return Math.max(1, Math.round(s.length / 4));
+}
+
+function formatReadableDuration(ms) {
+  const value = Number(ms);
+  if (!Number.isFinite(value) || value <= 0) return "0s";
+  if (value < 1000) return `${Math.round(value)}ms`;
+  const totalSec = Math.round(value / 1000);
+  if (totalSec < 60) return `${totalSec}s`;
+  const min = Math.floor(totalSec / 60);
+  const sec = totalSec % 60;
+  if (min < 60) return sec > 0 ? `${min}m ${sec}s` : `${min}m`;
+  const hour = Math.floor(min / 60);
+  const remMin = min % 60;
+  return remMin > 0 ? `${hour}h ${remMin}m` : `${hour}h`;
+}
+
+function formatDirectShellOutput(stdoutText, stderrText) {
+  const out = String(stdoutText || "").trimEnd();
+  const err = String(stderrText || "").trimEnd();
+  if (!out && !err) return "";
+  const joined = [out, err].filter(Boolean).join("\n");
+  if (joined.length <= DIRECT_SHELL_MAX_OUTPUT) return joined;
+  const trimmed = joined.slice(0, Math.max(0, DIRECT_SHELL_MAX_OUTPUT - 3));
+  return `${trimmed}...`;
+}
+
+async function runDirectShellCommand(command, { workspaceDir, logLine, tui, display } = {}) {
+  const cmd = String(command || "").trim();
+  if (!cmd) {
+    logLine("usage: ! <shell command>");
+    return;
+  }
+
+  const startedAt = Date.now();
+  if (tui) tui.onThinkingDone();
+  logLine(`[run] shell ${cmd}`);
+  if (display) display.onToolStart("shell", { command: cmd });
+  if (tui) tui.onToolUse("shell");
+
+  try {
+    const { stdout, stderr } = await execAsync(cmd, {
+      cwd: workspaceDir,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+    const preview = formatDirectShellOutput(stdout, stderr);
+    if (preview) logLine(`[response] ${preview}`);
+    const durationMs = Date.now() - startedAt;
+    logLine(`[result] shell done | time: ${formatReadableDuration(durationMs)}`);
+    if (tui) tui.onThinkingDone();
+    if (display) display.onToolEnd("shell", preview || "<empty>", null);
+  } catch (err) {
+    const stdout = String(err?.stdout || "");
+    const stderr = String(err?.stderr || "");
+    const preview = formatDirectShellOutput(stdout, stderr);
+    if (preview) logLine(`[response] ${preview}`);
+    const durationMs = Date.now() - startedAt;
+    logLine(`[result] shell failed | time: ${formatReadableDuration(durationMs)}`);
+    if (tui) tui.onThinkingDone();
+    if (display) display.onToolEnd("shell", preview || "<empty>", String(err?.message || "shell command failed"));
+  }
 }
 
 function extractThoughtContentFromPartialJson(raw) {
@@ -470,10 +528,15 @@ function extractReadableThinkingPreview(raw) {
       .trim();
   }
 
+  const toolMatch = compact.match(/"tool"\s*:\s*"([^"\\]+)"/i);
+  if (toolMatch?.[1]) {
+    return `Preparing tool: ${toolMatch[1]}`;
+  }
+
   // If output is raw JSON/tool schema and we cannot extract a readable field yet, avoid noise.
   if (compact.startsWith("{") || compact.startsWith("[")) return "";
 
-  return compact.slice(0, 280);
+  return compact;
 }
 
 function extractJsonObject(raw) {
@@ -780,8 +843,9 @@ function printSkillList(skillIndex, logLine) {
     logLine("no skills discovered");
     return;
   }
+  logLine("## Skills");
   for (const skill of skills) {
-    logLine(`${skill.name}${skill.description ? ` - ${skill.description}` : ""}`);
+    logLine(`- **${skill.name}**${skill.description ? `: ${skill.description}` : ""}`);
   }
 }
 
@@ -809,30 +873,30 @@ function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
     const left = Math.max(0, Math.floor((width - clipped.length) / 2));
     return `${" ".repeat(left)}${clipped}`;
   };
+  const centerInWidth = (text, targetWidth) => {
+    const raw = String(text || "");
+    const w = Math.max(1, Number(targetWidth) || 1);
+    if (raw.length >= w) return raw.slice(0, w);
+    const left = Math.floor((w - raw.length) / 2);
+    const right = w - raw.length - left;
+    return `${" ".repeat(left)}${raw}${" ".repeat(right)}`;
+  };
   const shortWorkspace = workspaceDir.length > 64 ? `...${workspaceDir.slice(-61)}` : workspaceDir;
-  const lineWidth = (s) => String(s || "").length;
-  const maxLineWidth = (lines) => Math.max(0, ...lines.map((l) => lineWidth(l)));
-  const wideLogo = [
-    "██████    ████    ████████",
-    "██   ██    ██     ██",
-    "██████     ██     ██████",
-    "██         ██     ██",
-    "██        ████    ████████",
-  ];
-  const compactLogo = [
-    "██████    ████    ████████",
-    "██   ██    ██     ██",
-    "██████     ██     ██████",
-    "██         ██     ██",
-    "██        ████    ████████",
-  ];
-  const chosenLogo =
-    maxLineWidth(wideLogo) <= Math.max(1, width - 2)
-      ? wideLogo
-      : compactLogo;
+  const titleMain = "Pie Code";
+  const titleSlogan = "simple like pie";
+  const titleText = `${titleMain} ${titleSlogan}`;
+  const preferredInner = Math.max(titleText.length + 8, 34);
+  // Keep extra horizontal safety padding so ANSI color codes and terminal quirks
+  // do not visually clip the right border in some terminals.
+  const maxInner = Math.max(16, width - 12);
+  const innerWidth = Math.min(preferredInner, maxInner);
+  const titleTop = `┌${"─".repeat(innerWidth)}┐`;
+  const titleMid = `│${centerInWidth(`  ${titleMain} ${titleSlogan}  `, innerWidth)}│`;
+  const titleBottom = `└${"─".repeat(innerWidth)}┘`;
   const logoLines = [
-    `[banner-title] ${center("Pie Code")}`,
-    ...chosenLogo.map((line, index) => `[banner-${index + 1}] ${center(line)}`),
+    `[banner-title-box] ${center(titleTop)}`,
+    `[banner-title-mid] ${center(titleMid)}`,
+    `[banner-title-box] ${center(titleBottom)}`,
     `[banner-meta] ${center(`model: ${formatProviderModel(provider)}`)}`,
     `[banner-meta] ${center(`workspace: ${shortWorkspace}`)}`,
     `[banner-hint] ${center("keys: CTRL+L logs | CTRL+O llm i/o | CTRL+T todos")}`,
@@ -951,12 +1015,13 @@ function disableSkillByName(target, activeSkillsRef, logLine) {
 }
 
 async function maybeAutoEnableSkills(input, activeSkillsRef, skillIndex, logLine) {
-  const mentionResult = await autoEnableMentionedSkills(input, activeSkillsRef, skillIndex);
-  if (mentionResult.enabled.length > 0) {
-    logLine(`auto-enabled skills: ${mentionResult.enabled.join(", ")}`);
-  }
-  if (mentionResult.missing.length > 0) {
-    logLine(`mentioned skills not found: ${mentionResult.missing.join(", ")}`);
+  const result = await autoEnableSkills(input, activeSkillsRef, skillIndex);
+  if (result.enabled.length > 0) {
+    const sections = [];
+    if (result.byTrigger.length > 0) sections.push(`trigger: ${result.byTrigger.join(", ")}`);
+    if (result.byMention.length > 0) sections.push(`mention: ${result.byMention.join(", ")}`);
+    const details = sections.length > 0 ? ` (${sections.join(" | ")})` : "";
+    logLine(`auto-enabled skills: ${result.enabled.join(", ")}${details}`);
   }
 }
 
@@ -1003,7 +1068,7 @@ async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef,
       const usage = tui.getTurnTokenUsage();
       logLine(`[response] ${output}`);
       logLine(
-        `[result] done | time: ${durationMs}ms | tokens: sent ${formatCompactNumber(usage.sent)} | recv ${formatCompactNumber(usage.received)}`
+        `[result] done | time: ${formatReadableDuration(durationMs)} | tokens: sent ${formatCompactNumber(usage.sent)} | recv ${formatCompactNumber(usage.received)}`
       );
       tui.clearLiveThought();
       tui.render("", "done");
@@ -1095,6 +1160,10 @@ async function handleSlashCommand(input, ctx) {
       if (ctx.tui) ctx.tui.setTodos([]);
     }
     if (ctx.todoAutoTrackRef) ctx.todoAutoTrackRef.value = false;
+    if (ctx.tui) {
+      ctx.tui.resetContextUsage();
+      ctx.tui.render("", "context cleared");
+    }
     logLine("all context cleared");
     return { done: false, handled: true };
   }
@@ -1182,7 +1251,14 @@ async function handleSlashCommand(input, ctx) {
   }
   if (lower === "/skills") {
     const names = activeSkillsRef.value.map((skill) => skill.name);
-    logLine(names.length > 0 ? `active skills: ${names.join(", ")}` : "active skills: none");
+    if (names.length === 0) {
+      logLine("active skills: none");
+    } else {
+      logLine("## Active Skills");
+      for (const name of names) {
+        logLine(`- **${name}**`);
+      }
+    }
     return { done: false, handled: true };
   }
   if (lower === "/skills list") {
@@ -1373,6 +1449,11 @@ async function main() {
   const providerRef = { value: getProvider(providerOptionsRef.value) };
   const workspaceDir = process.cwd();
   const projectInstructionsRef = { value: await loadProjectInstructions(workspaceDir) };
+  const startupAutoSkills = await autoLoadSkillsFromInstructions(
+    projectInstructionsRef.value,
+    activeSkillsRef,
+    skillIndex
+  );
   const autoApproveRef = { value: false };
   const historyFile = getHistoryFilePath();
   const initialHistory = await loadHistory(historyFile);
@@ -1380,6 +1461,7 @@ async function main() {
   const display = useTui ? null : new Display();
   const llmDebugRef = { value: false };
   const traceRef = { value: process.env.PIECODE_TRACE === "1" };
+  const verboseToolLogs = process.env.PIECODE_VERBOSE_TOOL_LOGS === "1";
   const llmStreamRef = { value: { turn: "", planning: "", replanning: "" } };
   const traceStateRef = { value: { turnId: 0, turnStartedAt: 0, llmStageStart: {}, toolStartByName: {} } };
   const turnSummaryRef = {
@@ -1544,6 +1626,8 @@ async function main() {
         if (key.ctrl && key.name === "o") {
           llmDebugRef.value = !llmDebugRef.value;
           tui.setLlmDebugEnabled(llmDebugRef.value);
+          tui.setRawLogsVisible(llmDebugRef.value);
+          tui.render(currentInputRef.value, llmDebugRef.value ? "LLM I/O panel ON" : "LLM I/O panel OFF");
           return;
         }
         if (key.ctrl && (key.name === "a" || key.name === "e")) {
@@ -1857,7 +1941,10 @@ async function main() {
     } catch {
       // best effort
     }
-    if (tui) tui.onModelCall(formatProviderModel(nextProvider));
+    if (tui) {
+      tui.onModelCall(formatProviderModel(nextProvider));
+      tui.onThinkingDone();
+    }
     return nextProvider;
   };
 
@@ -1966,7 +2053,9 @@ async function main() {
           llmStreamRef.value[evt.stage] += String(evt.delta || "");
         }
         if (tui && evt.stage === "turn") {
-          const preview = extractReadableThinkingPreview(llmStreamRef.value.turn);
+          const preview =
+            extractReadableThinkingPreview(llmStreamRef.value.turn) ||
+            extractReadableThinkingPreview(evt.delta);
           if (preview) {
             tui.setLiveThought(preview);
           }
@@ -2018,10 +2107,19 @@ async function main() {
           tui.setLiveThought(String(evt.reason));
         }
         if (display) display.onToolUse(evt.tool, evt.input, evt.reason);
-        const details = Object.entries(evt.input || {})
-          .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-          .join(" ");
-        logLine(`[tool] ${evt.tool}${evt.reason ? ` - ${evt.reason}` : ""}${details ? ` (${details})` : ""}`);
+        const summary = formatToolInputSummary(evt.tool, evt.input, 100);
+        if (verboseToolLogs) {
+          const details = Object.entries(evt.input || {})
+            .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+            .join(" ");
+          logLine(
+            `[tool] ${evt.tool}${evt.reason ? ` - ${summarizeForLog(evt.reason, 120)}` : ""}${details ? ` (${details})` : ""}`
+          );
+        } else {
+          const reason = evt.reason ? ` - ${summarizeForLog(evt.reason, 120)}` : "";
+          const inputSummary = summary ? ` (${summary})` : "";
+          logLine(`[tool] ${evt.tool}${reason}${inputSummary}`);
+        }
       }
       if (evt.type === "tool_start") {
         if (traceRef.value) {
@@ -2029,10 +2127,15 @@ async function main() {
           logLine(`[trace] tool_start name=${evt.tool}`);
         }
         if (display) display.onToolStart(evt.tool, evt.input);
-        const details = Object.entries(evt.input || {})
-          .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-          .join(" ");
-        logLine(`[run] ${evt.tool}${details ? ` ${details}` : ""}`);
+        if (verboseToolLogs) {
+          const details = Object.entries(evt.input || {})
+            .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
+            .join(" ");
+          logLine(`[run] ${evt.tool}${details ? ` ${details}` : ""}`);
+        } else {
+          const summary = formatToolInputSummary(evt.tool, evt.input, 120);
+          logLine(`[run] ${evt.tool}${summary ? ` ${summary}` : ""}`);
+        }
         if (todoAutoTrackRef.value && evt.tool !== "todo_write" && evt.tool !== "todowrite") {
           const advanced = advanceTodosOnToolStart(todosRef.value);
           if (advanced.length > 0) {
@@ -2054,12 +2157,16 @@ async function main() {
   });
 
   if (args.prompt !== null) {
-    const mentionResult = await autoEnableMentionedSkills(args.prompt, activeSkillsRef, skillIndex);
-    if (mentionResult.enabled.length > 0) {
-      console.log(`auto-enabled skills: ${mentionResult.enabled.join(", ")}`);
+    if (startupAutoSkills.enabled.length > 0) {
+      console.log(`auto-loaded skills: ${startupAutoSkills.enabled.join(", ")}`);
     }
-    if (mentionResult.missing.length > 0) {
-      console.error(`warning: mentioned skills not found: ${mentionResult.missing.join(", ")}`);
+    if (startupAutoSkills.missing.length > 0) {
+      console.error(`warning: auto-load skills missing: ${startupAutoSkills.missing.join(", ")}`);
+    }
+
+    const autoSkillResult = await autoEnableSkills(args.prompt, activeSkillsRef, skillIndex);
+    if (autoSkillResult.enabled.length > 0) {
+      console.log(`auto-enabled skills: ${autoSkillResult.enabled.join(", ")}`);
     }
 
     const result = await agent.runTurn(args.prompt);
@@ -2083,6 +2190,12 @@ async function main() {
     if (activeSkillsRef.value.length > 0) {
       tui.event(`skills: ${activeSkillsRef.value.map((s) => s.name).join(", ")}`);
     }
+    if (startupAutoSkills.enabled.length > 0) {
+      tui.event(`auto-loaded skills: ${startupAutoSkills.enabled.join(", ")}`);
+    }
+    if (startupAutoSkills.missing.length > 0) {
+      tui.event(`warning: auto-load skills missing: ${startupAutoSkills.missing.join(", ")}`);
+    }
     tui.render(currentInputRef.value, "Type /help for commands");
   } else {
     console.log(`Pie Code (${formatProviderModel(providerRef.value)})`);
@@ -2091,6 +2204,12 @@ async function main() {
     }
     if (activeSkillsRef.value.length > 0) {
       console.log(`skills: ${activeSkillsRef.value.map((s) => s.name).join(", ")}`);
+    }
+    if (startupAutoSkills.enabled.length > 0) {
+      console.log(`auto-loaded skills: ${startupAutoSkills.enabled.join(", ")}`);
+    }
+    if (startupAutoSkills.missing.length > 0) {
+      console.error(`warning: auto-load skills missing: ${startupAutoSkills.missing.join(", ")}`);
     }
     console.log("Type /help for commands.");
   }
@@ -2179,6 +2298,17 @@ async function main() {
     if (display) display.clearSuggestions();
     exitArmedRef.value = false;
     if (tui) tui.clearInputHint();
+    if (finalInput.startsWith("!")) {
+      currentInputRef.value = "";
+      if (tui) tui.render(currentInputRef.value, "running shell command");
+      await runDirectShellCommand(finalInput.slice(1), {
+        workspaceDir,
+        logLine,
+        tui,
+        display,
+      });
+      continue;
+    }
     const isSlash = finalInput.startsWith("/");
     if (!isSlash) {
       logLine(`[task] ${finalInput}`);

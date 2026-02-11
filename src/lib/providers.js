@@ -176,6 +176,196 @@ async function postJsonStream(url, headers, body, onChunk, options = {}) {
   }
 }
 
+function extractDeltaContent(delta) {
+  if (!delta) return "";
+  if (typeof delta.content === "string") return delta.content;
+  if (Array.isArray(delta.content)) {
+    return delta.content
+      .map((part) => {
+        if (typeof part?.text === "string") return part.text;
+        if (typeof part?.content === "string") return part.content;
+        return "";
+      })
+      .join("");
+  }
+  return "";
+}
+
+function extractDeltaReasoning(delta) {
+  if (!delta) return "";
+  const fields = [
+    delta.reasoning,
+    delta.reasoning_content,
+    delta.thinking,
+    delta.analysis,
+  ];
+  for (const field of fields) {
+    if (typeof field === "string" && field.length > 0) return field;
+    if (Array.isArray(field)) {
+      const joined = field
+        .map((part) => {
+          if (typeof part === "string") return part;
+          if (typeof part?.text === "string") return part.text;
+          if (typeof part?.content === "string") return part.content;
+          return "";
+        })
+        .join("");
+      if (joined) return joined;
+    }
+  }
+  return "";
+}
+
+async function postJsonStreamOpenAINative(url, headers, body, onChunk, options = {}) {
+  const controller = new AbortController();
+  const externalSignal = options?.signal;
+  let abortListener = null;
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    abortListener = () => controller.abort();
+    externalSignal.addEventListener("abort", abortListener, { once: true });
+  }
+  const timeout = setTimeout(() => controller.abort(), DEFAULT_MODEL_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...headers,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      if (externalSignal?.aborted) {
+        const abortErr = new Error("Model stream aborted.");
+        abortErr.code = "ABORT_ERR";
+        throw abortErr;
+      }
+      throw new Error(`Model stream timed out after ${DEFAULT_MODEL_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  }
+  try {
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      const err = new Error(`Model API error (${res.status}): ${JSON.stringify(data)}`);
+      err.status = res.status;
+      err.data = data;
+      throw err;
+    }
+
+    if (!res.body) {
+      return {
+        message: { role: "assistant", content: "" },
+        finishReason: "",
+      };
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let content = "";
+    let finishReason = "";
+    const toolCallsByIndex = new Map();
+
+    while (true) {
+      let packet;
+      try {
+        packet = await reader.read();
+      } catch (err) {
+        if (err?.name === "AbortError") {
+          if (externalSignal?.aborted) {
+            const abortErr = new Error("Model stream aborted.");
+            abortErr.code = "ABORT_ERR";
+            throw abortErr;
+          }
+          throw new Error(`Model stream timed out after ${DEFAULT_MODEL_TIMEOUT_MS}ms`);
+        }
+        throw err;
+      }
+      const { done, value } = packet;
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (!data || data === "[DONE]") continue;
+
+        try {
+          const parsed = JSON.parse(data);
+          const choice = parsed?.choices?.[0];
+          if (!choice) continue;
+          if (typeof choice.finish_reason === "string" && choice.finish_reason) {
+            finishReason = choice.finish_reason;
+          }
+          const delta = choice?.delta || {};
+
+          const deltaContent = extractDeltaContent(delta);
+          if (deltaContent) {
+            content += deltaContent;
+            onChunk?.(deltaContent);
+          }
+
+          const deltaReasoning = extractDeltaReasoning(delta);
+          if (deltaReasoning) {
+            onChunk?.(deltaReasoning);
+          }
+
+          const deltaToolCalls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+          for (const item of deltaToolCalls) {
+            const idx = Number.isInteger(item?.index) ? item.index : 0;
+            const current = toolCallsByIndex.get(idx) || {
+              id: "",
+              type: "function",
+              function: { name: "", arguments: "" },
+            };
+            if (typeof item?.id === "string" && item.id) current.id = item.id;
+            if (typeof item?.type === "string" && item.type) current.type = item.type;
+            if (item?.function && typeof item.function === "object") {
+              if (typeof item.function.name === "string" && item.function.name) {
+                current.function.name += item.function.name;
+              }
+              if (typeof item.function.arguments === "string" && item.function.arguments) {
+                current.function.arguments += item.function.arguments;
+                onChunk?.(item.function.arguments);
+              }
+            }
+            toolCallsByIndex.set(idx, current);
+          }
+        } catch {
+          // Ignore malformed event chunks and continue.
+        }
+      }
+    }
+
+    const toolCalls = [...toolCallsByIndex.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([, call]) => call);
+
+    const message = {
+      role: "assistant",
+      content: content.trim(),
+      ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+    };
+
+    return { message, finishReason };
+  } finally {
+    clearTimeout(timeout);
+    if (externalSignal && abortListener) {
+      try {
+        externalSignal.removeEventListener("abort", abortListener);
+      } catch {}
+    }
+  }
+}
+
 function readJsonFile(filePath) {
   try {
     return JSON.parse(readFileSync(filePath, "utf8"));
@@ -305,10 +495,26 @@ function createOpenAICompatibleProvider({ kind, model, apiKey, baseUrl, extraHea
       return text;
     },
     async completeStream({ systemPrompt, prompt, messages, tools, onDelta, signal }) {
-      // For native tool calling, fall back to non-streaming complete() since
-      // streaming tool_calls requires accumulating delta fragments.
       if (Array.isArray(messages) && Array.isArray(tools)) {
-        return this.complete({ systemPrompt, prompt, messages, tools, signal });
+        const streamed = await postJsonStreamOpenAINative(
+          chatUrl,
+          { Authorization: `Bearer ${apiKey}`, ...extraHeaders },
+          {
+            model,
+            temperature: 0.2,
+            stream: true,
+            messages: [{ role: "system", content: systemPrompt }, ...messages],
+            tools,
+          },
+          onDelta,
+          { signal }
+        );
+        return {
+          type: "native",
+          format: "openai",
+          message: streamed.message,
+          finishReason: streamed.finishReason,
+        };
       }
       const text = await postJsonStream(
         chatUrl,
@@ -366,9 +572,40 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
     model: resolvedModel,
     supportsNativeTools: true,
     async completeStream({ systemPrompt, prompt, messages, tools, onDelta, signal }) {
-      // For native tool calling, fall back to non-streaming
       if (Array.isArray(messages) && Array.isArray(tools)) {
-        return this.complete({ systemPrompt, prompt, messages, tools, signal });
+        const nativeBody = {
+          model: resolvedModel,
+          temperature: 0.2,
+          stream: true,
+          messages: [{ role: "system", content: systemPrompt }, ...messages],
+          tools,
+        };
+        let lastErr = null;
+        for (const url of buildSeedChatUrls(resolvedBase)) {
+          try {
+            const streamed = await postJsonStreamOpenAINative(
+              url,
+              { Authorization: `Bearer ${apiKey}` },
+              nativeBody,
+              onDelta,
+              { signal }
+            );
+            return {
+              type: "native",
+              format: "openai",
+              message: streamed.message,
+              finishReason: streamed.finishReason,
+            };
+          } catch (err) {
+            lastErr = err;
+            if (err?.status !== 404) break;
+          }
+        }
+        return this.complete({ systemPrompt, prompt, messages, tools, signal }).catch((err) => {
+          throw new Error(
+            `Seed native stream failed. Last stream error: ${lastErr?.message || "unknown"}. Fallback error: ${err?.message || "unknown"}`
+          );
+        });
       }
       const chatUrls = buildSeedChatUrls(resolvedBase);
       const openaiBody = {
