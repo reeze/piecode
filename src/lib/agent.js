@@ -315,7 +315,7 @@ export class Agent {
           autoApprove: this.autoApproveRef.value,
           activeSkills: this.getActiveSkills(),
           activePlan,
-          projectInstructions: this.projectInstructionsRef?.value || null,
+          projectInstructions: this.projectInstructionsRef?.value?.content || null,
           nativeTools: useNativeTools,
         });
 
@@ -323,7 +323,7 @@ export class Agent {
 
         let action;
         if (useNativeTools) {
-          const messages = buildMessages(this.history, { format: nativeFormat });
+          const messages = buildMessages({ history: this.history });
           const tools = buildToolDefinitions(nativeFormat);
           this.onEvent?.({
             type: "llm_request",

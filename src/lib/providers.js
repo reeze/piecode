@@ -681,6 +681,14 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
         }
       }
 
+      // Do not attempt Anthropic-text fallback for native tool calls.
+      // It needs `prompt` text and incompatible schema, causing misleading errors.
+      if (useNative) {
+        throw new Error(
+          `Seed provider native call failed. Tried: ${chatUrls.join(", ")}. Last error: ${lastErr?.message || "unknown"}`
+        );
+      }
+
       // Claude-compatible fallback for /api/coding deployments.
       const anthropicUrl = `${resolvedBase.replace(/\/$/, "")}/v1/messages`;
       const anthropicBody = {

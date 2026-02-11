@@ -132,122 +132,80 @@ function truncatePreview(text, maxChars) {
 async function formatShellResult({
   workspaceDir,
   command,
-  exitCodeLabel,
-  errorMessage = "",
-  stdout = "",
-  stderr = "",
+  stdout,
+  stderr,
+  maxInlineChars = SHELL_INLINE_MAX_CHARS,
+  previewChars = SHELL_PREVIEW_CHARS,
 }) {
-  const payload = [
-    exitCodeLabel,
-    errorMessage ? `error: ${errorMessage}` : null,
-    `stdout:\n${stdout || "<empty>"}`,
-    `stderr:\n${stderr || "<empty>"}`,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  const combined = [stdout, stderr].filter(Boolean).join("\n");
+  const limited = combined.slice(0, maxInlineChars);
+  const truncated = combined.length > maxInlineChars;
+  const hint = truncated
+    ? `\n\n[Output truncated: ${combined.length} chars total; use head/tail/wc to explore]`
+    : "";
 
-  if (payload.length <= SHELL_INLINE_MAX_CHARS) {
-    return payload;
-  }
-
-  const dir = path.join(workspaceDir, ".piecode", "shell");
-  await fs.mkdir(dir, { recursive: true });
-  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-  const relPath = path.join(".piecode", "shell", `result-${stamp}.txt`);
-  const absPath = path.join(workspaceDir, relPath);
-  await fs.writeFile(absPath, payload, "utf8");
-
-  const stdoutPreview = truncatePreview(stdout || "<empty>", SHELL_PREVIEW_CHARS);
-  const stderrPreview = truncatePreview(stderr || "<empty>", Math.floor(SHELL_PREVIEW_CHARS / 2));
-  return [
-    `${exitCodeLabel}`,
-    errorMessage ? `error: ${errorMessage}` : null,
-    `Result too long (chars: ${payload.length}). Full output saved to ${relPath}`,
-    `stdout preview:\n${stdoutPreview || "<empty>"}`,
-    `stderr preview:\n${stderrPreview || "<empty>"}`,
-    "Next step suggestion:",
-    `- use read_file with path \"${relPath}\"`,
-    `- or run targeted grep/rg on that file for specific sections`,
-    `- original command: ${command}`,
-  ]
-    .filter(Boolean)
-    .join("\n\n");
+  const preview = truncatePreview(limited, previewChars);
+  return `Command: ${command}\nOutput:\n${preview}${hint}`;
 }
 
-export function createToolset({ workspaceDir, autoApproveRef, askApproval, onToolStart, onTodoWrite }) {
-  const runShell = async ({ command, timeout = 300000, maxBuffer = 10 * 1024 * 1024 }, ctx = {}) => {
-    if (!command || typeof command !== "string") {
-      throw new Error("shell tool requires { command: string }");
-    }
-    const safety = classifyShellCommand(command);
-    const needsApproval =
-      safety.level === "dangerous" ||
-      (safety.level !== "safe" && !autoApproveRef.value);
-    const approved = needsApproval
-      ? await askApproval(
-          `Run ${safety.level} shell command? (${safety.reason})\n$ ${command}\nApprove [y/N]: `
-        )
-      : true;
+async function hasCommand(cmd) {
+  try {
+    await exec(`which ${cmd}`);
+    return true;
+  } catch {
+    return false;
+  }
+}
 
+export function createToolset({
+  workspaceDir,
+  autoApproveRef,
+  askApproval,
+  onToolStart,
+  onTodoWrite,
+}) {
+  const runShell = async ({ command } = {}) => {
+    onToolStart?.("shell", { command });
+    const cmd = String(command || "").trim();
+    if (!cmd) {
+      throw new Error("Empty command");
+    }
+    const classification = classifyShellCommand(cmd);
+
+    if (classification.level === "dangerous") {
+      throw new Error(
+        `Dangerous command blocked (${classification.reason}): ${cmd}`
+      );
+    }
+
+    let approved = autoApproveRef?.value ?? false;
+    if (!approved && askApproval) {
+      approved = await askApproval("shell", { command: cmd, classification });
+    }
     if (!approved) {
-      return "Command was not approved by the user.";
+      throw new Error("User did not approve command");
     }
 
-    onToolStart?.("shell", {
-      command,
-      safety: safety.level,
-      approval: needsApproval ? "approved" : "auto",
+    const { stdout, stderr } = await exec(cmd, {
+      cwd: workspaceDir,
+      maxBuffer: 10 * 1024 * 1024,
     });
-    try {
-      const { stdout, stderr } = await exec(command, {
-        cwd: workspaceDir,
-        timeout,
-        maxBuffer,
-        signal: ctx?.signal,
-      });
-      return formatShellResult({
-        workspaceDir,
-        command,
-        exitCodeLabel: "exit_code: 0",
-        stdout,
-        stderr,
-      });
-    } catch (err) {
-      if (err?.code === "ABORT_ERR" || err?.name === "AbortError") {
-        throw err;
-      }
-      return formatShellResult({
-        workspaceDir,
-        command,
-        exitCodeLabel: "exit_code: non-zero",
-        errorMessage: err.message,
-        stdout: err.stdout || "",
-        stderr: err.stderr || "",
-      });
-    }
+    return formatShellResult({ workspaceDir, command: cmd, stdout, stderr });
   };
 
-  const readFile = async ({ path: filePath }) => {
-    if (!filePath || typeof filePath !== "string") {
-      throw new Error("read_file tool requires { path: string }");
-    }
-    onToolStart?.("read_file", { path: filePath });
-    const abs = resolveInsideRoot(workspaceDir, filePath);
-    return fs.readFile(abs, "utf8");
+  const readFile = async ({ path: relPath } = {}) => {
+    onToolStart?.("read_file", { path: relPath });
+    const abs = resolveInsideRoot(workspaceDir, relPath);
+    const content = await fs.readFile(abs, "utf8");
+    return content;
   };
 
-  const writeFile = async ({ path: filePath, content }) => {
-    if (!filePath || typeof filePath !== "string") {
-      throw new Error("write_file tool requires { path: string, content: string }");
-    }
-    if (typeof content !== "string") {
-      throw new Error("write_file tool requires string content");
-    }
-    onToolStart?.("write_file", { path: filePath });
-    const abs = resolveInsideRoot(workspaceDir, filePath);
+  const writeFile = async ({ path: relPath, content } = {}) => {
+    onToolStart?.("write_file", { path: relPath });
+    const abs = resolveInsideRoot(workspaceDir, relPath);
     await fs.mkdir(path.dirname(abs), { recursive: true });
     await fs.writeFile(abs, content, "utf8");
-    return `Wrote ${content.length} bytes to ${filePath}`;
+    return `Wrote ${content.length} bytes to ${relPath}`;
   };
 
   const listFiles = async ({ path: relPath = ".", max_entries: maxEntries = 200 } = {}) => {
@@ -285,6 +243,64 @@ export function createToolset({ workspaceDir, autoApproveRef, askApproval, onToo
     return `Updated ${normalized.length} todos:\n${summary}`;
   };
 
+  // Search files using ripgrep, grep, or native implementation
+  const searchFiles = async ({
+    path: searchPath = ".",
+    regex,
+    file_pattern: filePattern,
+    max_results: maxResults = 50,
+    case_sensitive: caseSensitive = false,
+  } = {}) => {
+    onToolStart?.("search_files", {
+      path: searchPath,
+      regex,
+      file_pattern: filePattern,
+      max_results: maxResults,
+      case_sensitive: caseSensitive,
+    });
+
+    if (!regex || typeof regex !== "string") {
+      throw new Error("Missing required parameter: regex (search pattern)");
+    }
+
+    const absPath = resolveInsideRoot(workspaceDir, searchPath);
+    const limit = Math.min(Math.max(Number(maxResults) || 50, 1), 200);
+
+    // Try ripgrep first (fastest)
+    if (await hasCommand("rg")) {
+      return searchWithRipgrep({
+        workspaceDir,
+        absPath,
+        regex,
+        filePattern,
+        limit,
+        caseSensitive,
+      });
+    }
+
+    // Fall back to grep
+    if (await hasCommand("grep")) {
+      return searchWithGrep({
+        workspaceDir,
+        absPath,
+        regex,
+        filePattern,
+        limit,
+        caseSensitive,
+      });
+    }
+
+    // Last resort: native JavaScript implementation
+    return searchNative({
+      workspaceDir,
+      absPath,
+      regex,
+      filePattern,
+      limit,
+      caseSensitive,
+    });
+  };
+
   return {
     shell: runShell,
     read_file: readFile,
@@ -292,5 +308,270 @@ export function createToolset({ workspaceDir, autoApproveRef, askApproval, onToo
     list_files: listFiles,
     todo_write: todoWrite,
     todowrite: todoWrite,
+    search_files: searchFiles,
   };
+}
+
+async function searchWithRipgrep({
+  workspaceDir,
+  absPath,
+  regex,
+  filePattern,
+  limit,
+  caseSensitive,
+}) {
+  const args = [
+    "--line-number",
+    "--column",
+    "--no-heading",
+    "--with-filename",
+    "--max-count", String(Math.min(limit, 1000)),
+    "--max-depth", "20",
+    "-C", "2", // 2 lines of context
+  ];
+
+  if (!caseSensitive) {
+    args.push("-i");
+  }
+
+  if (filePattern) {
+    args.push("-g", filePattern);
+  }
+
+  // Exclude common non-source directories
+  args.push(
+    "-g", "!node_modules",
+    "-g", "!.git",
+    "-g", "!dist",
+    "-g", "!build",
+    "-g", "!.next",
+    "-g", "!coverage",
+    "-g", "!.cache"
+  );
+
+  args.push(regex);
+  args.push(absPath);
+
+  try {
+    const { stdout, stderr } = await exec(`rg ${args.map(a => `"${a}"`).join(" ")}`, {
+      cwd: workspaceDir,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+
+    const results = parseSearchResults(stdout, workspaceDir);
+    return formatSearchResults(results, limit, regex);
+  } catch (error) {
+    if (error.code === 1 && !error.stdout) {
+      // ripgrep returns 1 when no matches found
+      return `No matches found for pattern: ${regex}`;
+    }
+    throw new Error(`Search failed: ${error.message}`);
+  }
+}
+
+async function searchWithGrep({
+  workspaceDir,
+  absPath,
+  regex,
+  filePattern,
+  limit,
+  caseSensitive,
+}) {
+  const grepArgs = [
+    "-r",
+    "-n",
+    "-H",
+    "-C", "2", // 2 lines of context
+  ];
+
+  if (!caseSensitive) {
+    grepArgs.push("-i");
+  }
+
+  if (filePattern) {
+    grepArgs.push("--include", filePattern);
+  }
+
+  // Exclude common non-source directories
+  grepArgs.push(
+    "--exclude-dir=node_modules",
+    "--exclude-dir=.git",
+    "--exclude-dir=dist",
+    "--exclude-dir=build",
+    "--exclude-dir=.next",
+    "--exclude-dir=coverage"
+  );
+
+  // Escape regex for grep
+  const escapedRegex = regex.replace(/"/g, '\\"');
+  grepArgs.push(escapedRegex);
+  grepArgs.push(absPath);
+
+  try {
+    const { stdout, stderr } = await exec(`grep ${grepArgs.map(a => `"${a}"`).join(" ")}`, {
+      cwd: workspaceDir,
+      maxBuffer: 10 * 1024 * 1024,
+    });
+
+    const results = parseSearchResults(stdout, workspaceDir);
+    return formatSearchResults(results, limit, regex);
+  } catch (error) {
+    if (error.code === 1 && !error.stdout) {
+      // grep returns 1 when no matches found
+      return `No matches found for pattern: ${regex}`;
+    }
+    throw new Error(`Search failed: ${error.message}`);
+  }
+}
+
+async function searchNative({
+  workspaceDir,
+  absPath,
+  regex,
+  filePattern,
+  limit,
+  caseSensitive,
+}) {
+  const results = [];
+  const flags = caseSensitive ? "" : "i";
+  const pattern = new RegExp(regex, flags);
+
+  const globPattern = filePattern || "*";
+  const isMatch = (filename) => {
+    if (!filePattern) return true;
+    // Simple glob matching
+    const regexPattern = filePattern
+      .replace(/\./g, "\\.")
+      .replace(/\*/g, ".*")
+      .replace(/\?/g, ".");
+    return new RegExp(regexPattern).test(filename);
+  };
+
+  async function walk(dir) {
+    if (results.length >= limit) return;
+
+    const entries = await fs.readdir(dir, { withFileTypes: true });
+
+    for (const entry of entries) {
+      if (results.length >= limit) return;
+
+      const fullPath = path.join(dir, entry.name);
+      const relPath = path.relative(workspaceDir, fullPath);
+
+      // Skip common non-source directories
+      if (entry.isDirectory()) {
+        const skipDirs = ["node_modules", ".git", "dist", "build", ".next", "coverage", ".cache"];
+        if (skipDirs.includes(entry.name)) continue;
+        await walk(fullPath);
+        continue;
+      }
+
+      if (!entry.isFile()) continue;
+      if (!isMatch(entry.name)) continue;
+
+      try {
+        const content = await fs.readFile(fullPath, "utf8");
+        const lines = content.split("\n");
+
+        lines.forEach((line, index) => {
+          if (results.length >= limit) return;
+
+          if (pattern.test(line)) {
+            const contextBefore = lines.slice(Math.max(0, index - 2), index);
+            const contextAfter = lines.slice(index + 1, Math.min(lines.length, index + 3));
+
+            results.push({
+              file: relPath,
+              line: index + 1,
+              column: line.search(pattern) + 1,
+              match: line.trim(),
+              contextBefore,
+              contextAfter,
+            });
+          }
+        });
+      } catch (error) {
+        // Skip files that can't be read as text (binary files)
+      }
+    }
+  }
+
+  await walk(absPath);
+  return formatSearchResults(results, limit, regex);
+}
+
+function parseSearchResults(stdout, workspaceDir) {
+  const results = [];
+  const lines = stdout.split("\n").filter(Boolean);
+
+  let currentResult = null;
+
+  for (const line of lines) {
+    // Parse ripgrep/grep output format: file:line:column:content
+    // or with context: file-line-content
+    const match = line.match(/^([^:]+):(\d+):(?:(\d+):)?(.*)$/);
+
+    if (match) {
+      const [, file, lineNum, col, content] = match;
+      const isContextLine = line.startsWith("--");
+
+      if (!isContextLine && content) {
+        if (currentResult) {
+          results.push(currentResult);
+        }
+        currentResult = {
+          file: file.replace(workspaceDir + "/", "").replace(workspaceDir, "."),
+          line: parseInt(lineNum, 10),
+          column: col ? parseInt(col, 10) : 1,
+          match: content,
+          contextBefore: [],
+          contextAfter: [],
+        };
+      } else if (currentResult) {
+        // Context line
+        if (parseInt(lineNum, 10) < currentResult.line) {
+          currentResult.contextBefore.push(content);
+        } else {
+          currentResult.contextAfter.push(content);
+        }
+      }
+    }
+  }
+
+  if (currentResult) {
+    results.push(currentResult);
+  }
+
+  return results;
+}
+
+function formatSearchResults(results, limit, regex) {
+  if (results.length === 0) {
+    return `No matches found for pattern: ${regex}`;
+  }
+
+  let output = `Found ${results.length} match${results.length === 1 ? "" : "es"} for "${regex}"`;
+  if (results.length >= limit) {
+    output += " (showing first " + limit + ")";
+  }
+  output += "\n" + "=".repeat(60) + "\n";
+
+  results.forEach((result, index) => {
+    output += `\n${index + 1}. ${result.file}:${result.line}:${result.column}\n`;
+
+    // Print context before
+    result.contextBefore?.forEach((ctx) => {
+      output += `   ${ctx}\n`;
+    });
+
+    // Print match with highlighting
+    output += `>  ${result.match}\n`;
+
+    // Print context after
+    result.contextAfter?.forEach((ctx) => {
+      output += `   ${ctx}\n`;
+    });
+  });
+
+  return output;
 }

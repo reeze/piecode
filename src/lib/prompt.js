@@ -54,6 +54,13 @@ export function buildSystemPrompt({
     "- Avoid repeating the same tool call unless new input changed",
     "- After each tool result, either: (a) proceed with next necessary step, or (b) finalize if enough evidence exists",
     "- When blocked by missing requirements, ask one concise clarifying question",
+
+    "SEARCH BEST PRACTICES:",
+    "- Use search_files to find code patterns, function definitions, or references",
+    "- Use file_pattern to narrow search (e.g., '*.js' for JavaScript files only)",
+    "- Use case_sensitive: true only when exact case matters",
+    "- Keep regex patterns simple for better performance",
+    "- Use search_files before read_file when you don't know the exact file location",
   ];
 
   if (!nativeTools) {
@@ -65,7 +72,7 @@ export function buildSystemPrompt({
       '{"type":"final","message":"Your complete response here"}',
 
       "2. Tool Use (when you need to gather information or perform an action):",
-      '{"type":"tool_use","tool":"shell|read_file|write_file|list_files|todo_write|todowrite","input":{...},"reason":"Brief explanation of why this tool is needed","thought":"Your reasoning for choosing this tool"}',
+      '{"type":"tool_use","tool":"shell|read_file|write_file|list_files|search_files|todo_write|todowrite","input":{...},"reason":"Brief explanation of why this tool is needed","thought":"Your reasoning for choosing this tool"}',
 
       "3. Thought Process (when you need to explain your reasoning):",
       '{"type":"thought","content":"Your reasoning and thought process here"}',
@@ -75,419 +82,435 @@ export function buildSystemPrompt({
       "- read_file: { path: string } - Read the contents of a file",
       "- write_file: { path: string, content: string } - Write content to a file",
       "- list_files: { path?: string, max_entries?: number } - List files in a directory",
-      "- todo_write/todowrite: { todos: [{ id?: string, content: string, status: pending|in_progress|completed }] } - Update task TODO list",
+      "- search_files: { path?: string, regex: string, file_pattern?: string, max_results?: number, case_sensitive?: boolean } - Search for patterns in files using ripgrep/grep",
+      "- todo_write: { todos: Array<{id?: string, content: string, status: 'pending'|'in_progress'|'completed'}> } - Update task tracking",
+      "- todowrite: alias for todo_write",
+
+      "EXAMPLES:",
+      'Find all uses of a function: {"type":"tool_use","tool":"search_files","input":{"regex":"functionName\\(","path":"src","file_pattern":"*.js"},"reason":"Find all calls to functionName in JS files"}',
+      'Search for TODO comments: {"type":"tool_use","tool":"search_files","input":{"regex":"TODO|FIXME|XXX","max_results":20},"reason":"Find all TODO comments in the codebase"}',
+      'Find class definitions: {"type":"tool_use","tool":"search_files","input":{"regex":"class\\s+\\w+","file_pattern":"*.ts"},"reason":"Find all class definitions in TypeScript files"}',
+
+      "CRITICAL:",
+      "- Your entire response must be valid JSON",
+      "- No markdown formatting outside the JSON",
+      "- No explanatory text before or after the JSON"
     );
   }
 
-  sections.push(
-    "CODING PRINCIPLES:",
-    "- Prefer minimal, focused edits",
-    "- Follow existing code style",
-    "- Test changes before providing final answers",
-    "- Be specific and actionable in your responses",
-    "- Break down complex tasks with structured plans",
-  );
-
-  if (Array.isArray(activeSkills) && activeSkills.length > 0) {
-    const skillsText = activeSkills
-      .map((skill, index) => {
-        const header = `SKILL ${index + 1}: ${skill.name}`;
-        const source = skill.path ? `Source: ${skill.path}` : "";
-        return `${header}\n${source}\n${String(skill.content || "").trim()}`.trim();
-      })
-      .join("\n\n");
-
-    sections.push("ACTIVE SKILLS:\nFollow these skill instructions when relevant.\n\n" + skillsText);
-  }
-
-  if (activePlan && typeof activePlan === "object") {
-    const steps = Array.isArray(activePlan.steps) ? activePlan.steps : [];
-    const stepText = steps.length > 0 ? steps.map((step, idx) => `${idx + 1}. ${step}`).join("\n") : "-";
-    const budget = Number.isFinite(activePlan.toolBudget) ? activePlan.toolBudget : 6;
-    const summary = String(activePlan.summary || "").trim() || "No summary";
+  if (activeSkills.length > 0) {
     sections.push(
-      [
-        "ACTIVE PLAN (must follow):",
-        `Summary: ${summary}`,
-        `Tool budget for this turn: ${budget}`,
-        "Planned steps:",
-        stepText,
-        "Use the fewest tools possible. Prefer direct read/list tools over shell when feasible.",
-        "The budget is guidance, not a hard stop. If more tools are needed, revise the plan and continue.",
-      ].join("\n")
+      "",
+      `Active skills: ${activeSkills.join(", ")}`,
+      "These skills are currently enabled and should be applied to relevant tasks."
     );
   }
 
-  if (projectInstructions && typeof projectInstructions === "object") {
-    const source = String(projectInstructions.source || "").trim();
-    const content = String(projectInstructions.content || "").trim();
-    if (content) {
-      sections.push(
-        [
-          "PROJECT INSTRUCTIONS (must follow):",
-          source ? `Source: ${source}` : "",
-          content,
-        ]
-          .filter(Boolean)
-          .join("\n")
-      );
+  if (activePlan) {
+    sections.push(
+      "",
+      "ACTIVE PLAN:",
+      activePlan,
+      "Follow this plan to complete the current task."
+    );
+  }
+
+  if (projectInstructions) {
+    const projectText =
+      typeof projectInstructions === "string"
+        ? projectInstructions
+        : typeof projectInstructions?.content === "string"
+          ? `source: ${projectInstructions.source || "unknown"}\n${projectInstructions.content}`
+          : "";
+    if (projectText.trim()) {
+      sections.push("", "PROJECT INSTRUCTIONS:", projectText);
     }
   }
 
-  return sections.join("\n\n");
+  return sections.join("\n");
 }
 
-function truncateForHistory(text, maxChars = 6000) {
-  const source = String(text ?? "");
-  if (source.length <= maxChars) return source;
-  const head = Math.floor(maxChars * 0.7);
-  const tail = maxChars - head;
-  return (
-    source.slice(0, head) +
-    "\n\n... [truncated for context budget] ...\n\n" +
-    source.slice(Math.max(0, source.length - tail))
-  );
-}
-
-export function formatHistory(history) {
-  return history
-    .map((msg) => {
-      let content = msg.content;
-      // Format tool use and tool result messages nicely
-      if (typeof content === "string" && content.startsWith("{")) {
-        try {
-          const parsed = JSON.parse(content);
-          if (parsed.type === "tool_use") {
-            const toolInfo = `Tool Use: ${parsed.tool}${parsed.reason ? ` (${parsed.reason})` : ""}`;
-            const thoughtInfo = parsed.thought ? `\nThought: ${parsed.thought}` : "";
-            return `${msg.role.toUpperCase()}:\n${toolInfo}${thoughtInfo}\nInput: ${JSON.stringify(parsed.input, null, 2)}`;
-          }
-          if (parsed.type === "tool_result") {
-            const resultText = truncateForHistory(parsed.result, 5000);
-            const len = String(parsed.result ?? "").length;
-            return `${msg.role.toUpperCase()}:\nTool Result: ${parsed.tool}\n(result chars: ${len})\n${resultText}`;
-          }
-          if (parsed.type === "thought") {
-            return `${msg.role.toUpperCase()}:\nThought: ${parsed.content}`;
-          }
-        } catch {
-          // Not valid JSON, just use as string
-        }
-      }
-      return `${msg.role.toUpperCase()}:\n${content}`;
+export function formatHistory(messages) {
+  return messages
+    .map((m) => {
+      const role = m.role || "user";
+      const content = m.content || "";
+      return `${role}: ${content}`;
     })
-    .join("\n\n");
+    .join("\n");
 }
 
-export function parseModelAction(raw) {
-  const text = String(raw || "").trim();
-  const candidate = text.startsWith("{")
-    ? text
-    : (text.match(/```(?:json)?\\s*([\\s\\S]*?)```/i)?.[1] ?? text);
-
-  function extractFirstJsonObject(source) {
-    const start = source.indexOf("{");
-    if (start < 0) return null;
-    let depth = 0;
-    let inString = false;
-    let escaped = false;
-    for (let i = start; i < source.length; i += 1) {
-      const ch = source[i];
-      if (inString) {
-        if (escaped) {
-          escaped = false;
-        } else if (ch === "\\") {
-          escaped = true;
-        } else if (ch === "\"") {
-          inString = false;
-        }
-        continue;
-      }
-      if (ch === "\"") {
-        inString = true;
-        continue;
-      }
-      if (ch === "{") depth += 1;
-      if (ch === "}") depth -= 1;
-      if (depth === 0) {
-        return source.slice(start, i + 1);
-      }
-    }
-    return null;
+export function parseModelAction(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) {
+    return { type: "unknown", raw: text };
   }
 
-  let parsed = null;
-  for (const possible of [candidate, extractFirstJsonObject(candidate), extractFirstJsonObject(text)]) {
-    if (!possible) continue;
-    try {
-      parsed = JSON.parse(possible);
-      break;
-    } catch {
-      // continue trying fallback shapes
+  // Try to parse as JSON first
+  try {
+    const parsed = JSON.parse(trimmed);
+    if (parsed.type === "final" && typeof parsed.message === "string") {
+      return { type: "final", message: parsed.message };
     }
-  }
-
-  const knownTools = new Set(["shell", "read_file", "write_file", "list_files", "todo_write", "todowrite"]);
-  if (parsed) {
-    const normalizedType = typeof parsed?.type === "string" ? parsed.type : "";
-    const normalizedTool =
-      typeof parsed?.tool === "string"
-        ? parsed.tool
-        : (knownTools.has(normalizedType) ? normalizedType : "");
-
-    if (
-      (normalizedType === "tool_use" && typeof normalizedTool === "string" && normalizedTool) ||
-      knownTools.has(normalizedType)
-    ) {
+    if (parsed.type === "tool_use" && parsed.tool) {
       return {
         type: "tool_use",
-        tool: normalizedTool,
-        input: parsed.input && typeof parsed.input === "object" ? parsed.input : {},
-        reason: typeof parsed.reason === "string" ? parsed.reason : "",
-        thought: typeof parsed.thought === "string" ? parsed.thought : "",
+        tool: parsed.tool,
+        input: parsed.input || {},
+        reason: parsed.reason || "",
+        thought: parsed.thought || "",
       };
     }
+    if (parsed.type === "thought" && typeof parsed.content === "string") {
+      return { type: "thought", content: parsed.content };
+    }
+  } catch {
+    // Not valid JSON, fall through to text parsing
+  }
 
-    if (parsed && parsed.type === "thought" && typeof parsed.content === "string") {
-      return {
-        type: "thought",
-        content: parsed.content,
-      };
+  // Check for JSON code block
+  const jsonBlockMatch = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
+  if (jsonBlockMatch) {
+    try {
+      const parsed = JSON.parse(jsonBlockMatch[1].trim());
+      if (parsed.type === "final" && typeof parsed.message === "string") {
+        return { type: "final", message: parsed.message };
+      }
+      if (parsed.type === "tool_use" && parsed.tool) {
+        return {
+          type: "tool_use",
+          tool: parsed.tool,
+          input: parsed.input || {},
+          reason: parsed.reason || "",
+          thought: parsed.thought || "",
+        };
+      }
+    } catch {
+      // Invalid JSON in code block
     }
   }
 
-  // Fallback for plain-text tool blocks:
-  // Tool Use: read_file (reason...)
-  // Input: { ... }
-  const toolLine = text.match(/Tool Use:\s*([a-z_]+)/i);
-  if (toolLine && knownTools.has(toolLine[1])) {
-    const inputBlock = text.match(/Input:\s*([\s\S]*)$/i)?.[1] ?? "{}";
-    let input = {};
-    const maybeJson = extractFirstJsonObject(inputBlock);
-    if (maybeJson) {
-      try {
-        const parsedInput = JSON.parse(maybeJson);
-        if (parsedInput && typeof parsedInput === "object") input = parsedInput;
-      } catch {
-        // keep empty input
+  // Check for explicit tool call pattern
+  const toolPattern =
+    /(?:tool\s*[:=]\s*)?(\w+)\s*[:=]\s*\{([^}]*)\}/i;
+  const match = trimmed.match(toolPattern);
+  if (match) {
+    const toolName = match[1].toLowerCase();
+    const args = match[2];
+    const input = {};
+
+    // Simple key:value parsing
+    args.split(",").forEach((pair) => {
+      const [key, value] = pair.split(":").map((s) => s.trim());
+      if (key && value) {
+        // Remove quotes if present
+        input[key] = value.replace(/^["']|["']$/g, "");
       }
-    }
-    const reason = text.match(/Tool Use:\s*[a-z_]+\s*\(([^)]+)\)/i)?.[1] ?? "";
+    });
+
     return {
       type: "tool_use",
-      tool: toolLine[1],
+      tool: toolName,
       input,
-      reason,
+      reason: "Parsed from text pattern",
       thought: "",
     };
   }
 
-  return {
-    type: "final",
-    message: typeof parsed?.message === "string" ? parsed.message : text,
-  };
+  // Default: treat as final message
+  return { type: "final", message: trimmed };
 }
 
-// ─── Native tool calling support ────────────────────────────────────────────
-
-const TOOL_DEFS = [
-  {
-    name: "shell",
-    description: "Run a shell command in the workspace directory",
-    params: {
-      type: "object",
-      properties: {
-        command: { type: "string", description: "The shell command to run" },
-      },
-      required: ["command"],
-    },
-  },
-  {
-    name: "read_file",
-    description: "Read the contents of a file",
-    params: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Relative path to the file" },
-      },
-      required: ["path"],
-    },
-  },
-  {
-    name: "write_file",
-    description: "Write content to a file",
-    params: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Relative path to the file" },
-        content: { type: "string", description: "Content to write" },
-      },
-      required: ["path", "content"],
-    },
-  },
-  {
-    name: "list_files",
-    description: "List files in a directory",
-    params: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Relative directory path (default: .)" },
-        max_entries: { type: "number", description: "Maximum entries to return (default: 200)" },
+export function buildToolDefinitions(nativeTools = false) {
+  const baseTools = [
+    {
+      name: "shell",
+      description:
+        "Run a shell command in the workspace directory. Returns stdout/stderr. Prefer read/list/search for information gathering. Auto-approved safe commands only.",
+      input_schema: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Shell command to execute" },
+        },
+        required: ["command"],
       },
     },
-  },
-  {
-    name: "todo_write",
-    description: "Update the task TODO list for tracking multi-step progress",
-    params: {
-      type: "object",
-      properties: {
-        todos: {
-          type: "array",
-          items: {
-            type: "object",
-            properties: {
-              id: { type: "string" },
-              content: { type: "string" },
-              status: { type: "string", enum: ["pending", "in_progress", "completed"] },
-            },
-            required: ["content", "status"],
-          },
+    {
+      name: "read_file",
+      description: "Read the contents of a file at the given path (relative to workspace root).",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Relative path to the file" },
+        },
+        required: ["path"],
+      },
+    },
+    {
+      name: "write_file",
+      description:
+        "Write content to a file at the given path (relative to workspace root). Creates parent directories if needed.",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Relative path to the file" },
+          content: { type: "string", description: "Content to write" },
+        },
+        required: ["path", "content"],
+      },
+    },
+    {
+      name: "list_files",
+      description:
+        "List files and directories at the given path. Returns relative paths. Use max_entries to limit results.",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Relative path to directory (default: current)" },
+          max_entries: { type: "integer", description: "Maximum entries to return (default: 200)" },
         },
       },
-      required: ["todos"],
     },
-  },
-];
-
-export function buildToolDefinitions(format = "anthropic") {
-  if (format === "anthropic") {
-    return TOOL_DEFS.map((t) => ({
-      name: t.name,
-      description: t.description,
-      input_schema: t.params,
+    {
+      name: "search_files",
+      description:
+        "Search for patterns in files using ripgrep (preferred) or grep. Fast code search with context. Excludes node_modules, .git, dist, build directories automatically.",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: {
+            type: "string",
+            description: "Relative path to search in (default: workspace root)",
+          },
+          regex: {
+            type: "string",
+            description: "Regular expression pattern to search for (required)",
+          },
+          file_pattern: {
+            type: "string",
+            description: "Glob pattern to filter files (e.g., '*.js', '*.ts')",
+          },
+          max_results: {
+            type: "integer",
+            description: "Maximum results to return (default: 50, max: 200)",
+          },
+          case_sensitive: {
+            type: "boolean",
+            description: "Case-sensitive search (default: false)",
+          },
+        },
+        required: ["regex"],
+      },
+    },
+    {
+      name: "todo_write",
+      description:
+        "Update the task tracking todo list. Use to show progress on multi-step tasks.",
+      input_schema: {
+        type: "object",
+        properties: {
+          todos: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                id: { type: "string" },
+                content: { type: "string" },
+                status: {
+                  type: "string",
+                  enum: ["pending", "in_progress", "completed"],
+                },
+              },
+              required: ["content", "status"],
+            },
+          },
+        },
+        required: ["todos"],
+      },
+    },
+  ];
+  const wantsOpenAI =
+    nativeTools === "openai" || nativeTools === true || nativeTools === "openrouter" || nativeTools === "seed";
+  if (wantsOpenAI) {
+    return baseTools.map((tool) => ({
+      type: "function",
+      function: {
+        name: tool.name,
+        description: tool.description,
+        parameters: tool.input_schema,
+      },
     }));
   }
-  // OpenAI chat completions format
-  return TOOL_DEFS.map((t) => ({
-    type: "function",
-    function: {
-      name: t.name,
-      description: t.description,
-      parameters: t.params,
-    },
-  }));
+  return baseTools;
 }
 
-export function buildMessages(history, { format = "anthropic" } = {}) {
+export function buildMessages(arg1 = {}, arg2 = {}) {
+  // Backward compatible signatures:
+  // 1) buildMessages({ history, systemPrompt, prompt, format })
+  // 2) buildMessages(historyArray, { systemPrompt, prompt, format })
+  let history = [];
+  let systemPrompt = "";
+  let prompt = "";
+  let format = "anthropic";
+  if (Array.isArray(arg1)) {
+    history = arg1;
+    systemPrompt = arg2?.systemPrompt || "";
+    prompt = arg2?.prompt || "";
+    format = arg2?.format || "anthropic";
+  } else {
+    history = arg1?.history || [];
+    systemPrompt = arg1?.systemPrompt || "";
+    prompt = arg1?.prompt || "";
+    format = arg1?.format || "anthropic";
+  }
+
+  const toText = (value) => {
+    if (typeof value === "string") return value;
+    if (value == null) return "";
+    if (typeof value === "object") {
+      try {
+        return JSON.stringify(value);
+      } catch {
+        return String(value);
+      }
+    }
+    return String(value);
+  };
+  const parseMaybeJson = (value) => {
+    const text = toText(value).trim();
+    if (!text || (text[0] !== "{" && text[0] !== "[")) return null;
+    try {
+      return JSON.parse(text);
+    } catch {
+      return null;
+    }
+  };
+  const asObject = (v) => (v && typeof v === "object" ? v : {});
+  const openaiMode = String(format || "").toLowerCase() !== "anthropic";
   const messages = [];
 
-  for (const msg of history) {
-    // Use structured fields if present (native mode history entries)
-    if (msg.toolCall) {
-      if (format === "anthropic") {
-        messages.push({
-          role: "assistant",
-          content: [
-            { type: "tool_use", id: msg.toolCall.id, name: msg.toolCall.name, input: msg.toolCall.input },
-          ],
-        });
-      } else {
-        messages.push({
-          role: "assistant",
-          content: null,
-          tool_calls: [
-            {
-              id: msg.toolCall.id,
-              type: "function",
-              function: {
-                name: msg.toolCall.name,
-                arguments: JSON.stringify(msg.toolCall.input),
-              },
-            },
-          ],
-        });
-      }
-      continue;
-    }
+  if (systemPrompt) {
+    messages.push({ role: "system", content: systemPrompt });
+  }
 
-    if (msg.toolResult) {
-      if (format === "anthropic") {
+  const items = Array.isArray(history) ? history : [];
+  for (const msg of items) {
+    const role = String(msg?.role || "user");
+    const rawContent = msg?.content;
+    const textContent = toText(rawContent);
+    const toolCall = asObject(msg?.toolCall);
+    const toolResult = asObject(msg?.toolResult);
+    const parsed = parseMaybeJson(rawContent);
+
+    const legacyToolUse =
+      parsed && String(parsed?.type || "").toLowerCase() === "tool_use"
+        ? {
+            id: String(parsed?._callId || ""),
+            name: String(parsed?.tool || ""),
+            input: asObject(parsed?.input),
+            reason: String(parsed?.reason || ""),
+          }
+        : null;
+    const legacyToolResult =
+      parsed && String(parsed?.type || "").toLowerCase() === "tool_result"
+        ? {
+            id: String(parsed?._callId || ""),
+            name: String(parsed?.tool || ""),
+            result: parsed?.result ?? "",
+          }
+        : null;
+
+    const isLegacyToolUse = Boolean(legacyToolUse);
+    const effectiveToolCall =
+      toolCall?.name
+        ? {
+            id: String(toolCall.id || ""),
+            name: String(toolCall.name || ""),
+            input: asObject(toolCall.input),
+            reason: "",
+          }
+        : legacyToolUse;
+
+    const effectiveToolResult =
+      toolResult?.toolCallId
+        ? {
+            id: String(toolResult.toolCallId || ""),
+            name: String(toolResult.name || ""),
+            result: toolResult.result ?? "",
+          }
+        : legacyToolResult;
+
+    if (!openaiMode) {
+      if (effectiveToolCall?.name) {
+        const blocks = [];
+        const preface =
+          !isLegacyToolUse && textContent && textContent !== "{}"
+            ? textContent
+            : effectiveToolCall.reason || "";
+        if (preface) blocks.push({ type: "text", text: preface });
+        blocks.push({
+          type: "tool_use",
+          id: effectiveToolCall.id || "",
+          name: effectiveToolCall.name,
+          input: effectiveToolCall.input || {},
+        });
+        messages.push({ role: "assistant", content: blocks });
+        continue;
+      }
+      if (effectiveToolResult?.id) {
         messages.push({
           role: "user",
           content: [
             {
               type: "tool_result",
-              tool_use_id: msg.toolResult.toolCallId,
-              content: truncateForHistory(String(msg.toolResult.result ?? ""), 5000),
+              tool_use_id: effectiveToolResult.id,
+              content: toText(effectiveToolResult.result),
             },
           ],
         });
-      } else {
-        messages.push({
-          role: "tool",
-          tool_call_id: msg.toolResult.toolCallId,
-          content: truncateForHistory(String(msg.toolResult.result ?? ""), 5000),
-        });
+        continue;
       }
+      messages.push({ role, content: textContent });
       continue;
     }
 
-    // Fall back to parsing content for legacy history entries
-    if (typeof msg.content === "string" && msg.content.startsWith("{")) {
-      try {
-        const parsed = JSON.parse(msg.content);
-        if (parsed.type === "tool_use" && parsed.tool) {
-          const callId = parsed._callId || `call_${Date.now()}`;
-          if (format === "anthropic") {
-            messages.push({
-              role: "assistant",
-              content: [
-                { type: "tool_use", id: callId, name: parsed.tool, input: parsed.input || {} },
-              ],
-            });
-          } else {
-            messages.push({
-              role: "assistant",
-              content: null,
-              tool_calls: [
-                {
-                  id: callId,
-                  type: "function",
-                  function: { name: parsed.tool, arguments: JSON.stringify(parsed.input || {}) },
-                },
-              ],
-            });
-          }
-          continue;
-        }
-        if (parsed.type === "tool_result" && parsed.tool) {
-          const callId = parsed._callId || `call_${Date.now()}`;
-          const resultText = truncateForHistory(String(parsed.result ?? ""), 5000);
-          if (format === "anthropic") {
-            messages.push({
-              role: "user",
-              content: [{ type: "tool_result", tool_use_id: callId, content: resultText }],
-            });
-          } else {
-            messages.push({ role: "tool", tool_call_id: callId, content: resultText });
-          }
-          continue;
-        }
-      } catch {
-        // Not valid JSON, fall through to plain text
-      }
+    if (effectiveToolCall?.name) {
+      messages.push({
+        role: "assistant",
+        content: null,
+        tool_calls: [
+          {
+            id: effectiveToolCall.id || "",
+            type: "function",
+            function: {
+              name: effectiveToolCall.name,
+              arguments: JSON.stringify(effectiveToolCall.input || {}),
+            },
+          },
+        ],
+      });
+      continue;
     }
+    if (effectiveToolResult?.id) {
+      messages.push({
+        role: "tool",
+        tool_call_id: effectiveToolResult.id,
+        content: toText(effectiveToolResult.result),
+      });
+      continue;
+    }
+    messages.push({ role, content: textContent });
+  }
 
-    // Plain text message
-    messages.push({ role: msg.role, content: msg.content });
+  if (prompt) {
+    messages.push({ role: "user", content: prompt });
   }
 
   return messages;
 }
 
 export function parseNativeResponse(response, format = "anthropic") {
-  if (!response || typeof response !== "object") {
+  if (!response) {
     return { type: "final", message: String(response || "") };
   }
 

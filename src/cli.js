@@ -169,6 +169,104 @@ function getHistoryFilePath() {
   return path.join(os.homedir(), ".piecode_history");
 }
 
+function makeSessionId() {
+  const now = new Date();
+  const pad = (n, w = 2) => String(n).padStart(w, "0");
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(
+    now.getHours()
+  )}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  return `session-${stamp}`;
+}
+
+function clipText(value, max = 12000) {
+  const text = String(value || "");
+  const cap = Math.max(200, Number(max) || 12000);
+  if (text.length <= cap) return text;
+  return `${text.slice(0, cap)}\n[clipped ${text.length - cap} chars]`;
+}
+
+async function ensureSessionStoreDir(workspaceDir, sessionId) {
+  const root = path.join(workspaceDir, ".piecode", "sessions", sessionId);
+  await fs.mkdir(root, { recursive: true });
+  return root;
+}
+
+function startTaskTrace(taskTraceRef, { input, kind }) {
+  taskTraceRef.seq += 1;
+  const id = `turn-${String(taskTraceRef.seq).padStart(3, "0")}`;
+  const nowIso = new Date().toISOString();
+  taskTraceRef.current = {
+    id,
+    kind: String(kind || "task"),
+    input: String(input || ""),
+    startedAt: nowIso,
+    finishedAt: "",
+    durationMs: 0,
+    status: "running",
+    error: "",
+    logs: [],
+    events: [],
+  };
+  return id;
+}
+
+function recordTaskLog(taskTraceRef, line) {
+  if (!taskTraceRef?.current) return;
+  taskTraceRef.current.logs.push({
+    at: new Date().toISOString(),
+    line: String(line || ""),
+  });
+}
+
+function recordTaskEvent(taskTraceRef, evt) {
+  if (!taskTraceRef?.current || !evt || typeof evt !== "object") return;
+  const e = { ...evt };
+  if (typeof e.payload === "string") e.payload = clipText(e.payload, 16000);
+  if (typeof e.delta === "string") e.delta = clipText(e.delta, 4000);
+  if (typeof e.content === "string") e.content = clipText(e.content, 8000);
+  taskTraceRef.current.events.push({
+    at: new Date().toISOString(),
+    event: e,
+  });
+}
+
+async function finishTaskTrace(taskTraceRef, workspaceDir, { status = "done", error = "" } = {}) {
+  const current = taskTraceRef?.current;
+  if (!current) return null;
+  current.finishedAt = new Date().toISOString();
+  const startedMs = Date.parse(current.startedAt);
+  const finishedMs = Date.parse(current.finishedAt);
+  current.durationMs =
+    Number.isFinite(startedMs) && Number.isFinite(finishedMs) ? Math.max(0, finishedMs - startedMs) : 0;
+  current.status = String(status || "done");
+  current.error = String(error || "");
+
+  try {
+    const sessionDir =
+      taskTraceRef.sessionDir ||
+      (await ensureSessionStoreDir(workspaceDir, taskTraceRef.sessionId));
+    taskTraceRef.sessionDir = sessionDir;
+    const trajectoryPath = path.join(sessionDir, "trajectory.jsonl");
+    const logsPath = path.join(sessionDir, "logs.log");
+    const logsText = current.logs.map((entry) => `[${entry.at}] ${entry.line}`).join("\n");
+    await fs.appendFile(trajectoryPath, `${JSON.stringify(current)}\n`, "utf8");
+    if (logsText) {
+      await fs.appendFile(logsPath, `\n[${current.id}] ${current.input}\n${logsText}\n`, "utf8");
+    }
+    taskTraceRef.current = null;
+    return {
+      id: current.id,
+      sessionId: taskTraceRef.sessionId,
+      dir: sessionDir,
+      trajectoryPath,
+      logsPath,
+    };
+  } catch {
+    taskTraceRef.current = null;
+    return null;
+  }
+}
+
 async function loadProjectInstructions(workspaceDir) {
   const candidates = ["AGENTS.md"];
   for (const name of candidates) {
@@ -366,8 +464,9 @@ function parseArgs(argv) {
   return args;
 }
 
-function createLogger(tui, display, getInput = () => "") {
+function createLogger(tui, display, getInput = () => "", onLogLine = null) {
   return (line) => {
+    if (typeof onLogLine === "function") onLogLine(line);
     if (tui) {
       tui.event(line);
       tui.render(getInput());
@@ -440,7 +539,7 @@ async function runDirectShellCommand(command, { workspaceDir, logLine, tui, disp
   const cmd = String(command || "").trim();
   if (!cmd) {
     logLine("usage: ! <shell command>");
-    return;
+    return { ok: false, error: "missing-command" };
   }
 
   const startedAt = Date.now();
@@ -460,6 +559,7 @@ async function runDirectShellCommand(command, { workspaceDir, logLine, tui, disp
     logLine(`[result] shell done | time: ${formatReadableDuration(durationMs)}`);
     if (tui) tui.onThinkingDone();
     if (display) display.onToolEnd("shell", preview || "<empty>", null);
+    return { ok: true };
   } catch (err) {
     const stdout = String(err?.stdout || "");
     const stderr = String(err?.stderr || "");
@@ -469,7 +569,33 @@ async function runDirectShellCommand(command, { workspaceDir, logLine, tui, disp
     logLine(`[result] shell failed | time: ${formatReadableDuration(durationMs)}`);
     if (tui) tui.onThinkingDone();
     if (display) display.onToolEnd("shell", preview || "<empty>", String(err?.message || "shell command failed"));
+    return { ok: false, error: String(err?.message || "shell command failed") };
   }
+}
+
+function maybeHandleLocalInfoTask(input, { logLine, tui, display } = {}) {
+  const text = String(input || "").trim().toLowerCase();
+  const askTools =
+    /^(what|which)\s+tools?\s+(do\s+you\s+have|are\s+available)/i.test(text) ||
+    /^(list|show)\s+(your\s+)?tools?$/i.test(text) ||
+    /^tools?$/i.test(text);
+  if (!askTools) return { handled: false };
+
+  const lines = [
+    "## Available Tools",
+    "- `shell`: Run a shell command in the workspace",
+    "- `read_file`: Read a file",
+    "- `write_file`: Write a file",
+    "- `list_files`: List files/directories",
+    "- `search_files`: Search file contents (ripgrep/grep/native)",
+    "- `todo_write` / `todowrite`: Update task todo list",
+  ];
+  const message = lines.join("\n");
+  logLine(`[response] ${message}`);
+  logLine("[result] done | time: 0ms | tokens: sent 0 | recv 0");
+  if (tui) tui.render("", "done");
+  if (display) display.onResponse(message);
+  return { handled: true };
 }
 
 function extractThoughtContentFromPartialJson(raw) {
@@ -875,8 +1001,7 @@ function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
   };
   const shortWorkspace = workspaceDir.length > 64 ? `...${workspaceDir.slice(-61)}` : workspaceDir;
   const logoLines = [
-    `[banner-title] ${center(" Pie Code ")}`,
-    `[banner-slogan] ${center("simple like pie")}`,
+    `[banner-title-inline] ${center(" Pie Code  simple like pie")}`,
     `[banner-meta] ${center(`model: ${formatProviderModel(provider)}`)}`,
     `[banner-meta] ${center(`workspace: ${shortWorkspace}`)}`,
     `[banner-hint] ${center("keys: CTRL+L logs | CTRL+O llm i/o | CTRL+T todos")}`,
@@ -1057,6 +1182,7 @@ async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef,
     } else {
       console.log(`\n${output}`);
     }
+    return { ok: true, aborted: false, error: "" };
   } catch (err) {
     const aborted = isTaskAbortError(err);
     if (tui) {
@@ -1077,6 +1203,7 @@ async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef,
     } else {
       console.error(`error: ${aborted ? "Task aborted by user." : err.message}`);
     }
+    return { ok: false, aborted, error: aborted ? "aborted" : String(err?.message || "error") };
   } finally {
     if (turnSummaryRef?.value) {
       turnSummaryRef.value.active = false;
@@ -1447,6 +1574,7 @@ async function main() {
   const turnSummaryRef = {
     value: { active: false, tools: [], filesChanged: new Set(), beforeGitSet: null },
   };
+  const taskTraceRef = { seq: 0, current: null, sessionId: makeSessionId(), sessionDir: "" };
   const currentInputRef = { value: "" };
   const todosRef = { value: [] };
   const todoAutoTrackRef = { value: false };
@@ -1503,7 +1631,9 @@ async function main() {
     process.on("SIGWINCH", onResize);
   }
 
-  const logLine = createLogger(tui, display, () => currentInputRef.value);
+  const logLine = createLogger(tui, display, () => currentInputRef.value, (line) =>
+    recordTaskLog(taskTraceRef, line)
+  );
   const exitArmedRef = { value: false };
   const approvalActiveRef = { value: false };
   const multilineBufferRef = { value: "" };
@@ -1963,19 +2093,23 @@ async function main() {
     },
     onEvent: (evt) => {
       if (evt.type === "model_call") {
+        recordTaskEvent(taskTraceRef, evt);
         const label = formatProviderModel({ kind: evt.provider, model: evt.model });
         if (tui) tui.onModelCall(label);
         logLine(`[model] ${label}`);
       }
       if (evt.type === "planning_call") {
+        recordTaskEvent(taskTraceRef, evt);
         if (tui) tui.onModelCall(formatProviderModel({ kind: evt.provider, model: evt.model }));
         logLine(`[plan] creating plan`);
       }
       if (evt.type === "replanning_call") {
+        recordTaskEvent(taskTraceRef, evt);
         if (tui) tui.onModelCall(formatProviderModel({ kind: evt.provider, model: evt.model }));
         logLine(`[plan] revising plan`);
       }
       if (evt.type === "plan") {
+        recordTaskEvent(taskTraceRef, evt);
         if (display) display.onPlan(evt.plan);
         const budget = evt.plan?.toolBudget ?? "-";
         const summary = evt.plan?.summary ? ` - ${evt.plan.summary}` : "";
@@ -1993,15 +2127,18 @@ async function main() {
         }
       }
       if (evt.type === "replan") {
+        recordTaskEvent(taskTraceRef, evt);
         if (display) display.onPlan(evt.plan);
         const budget = evt.plan?.toolBudget ?? "-";
         const summary = evt.plan?.summary ? ` - ${evt.plan.summary}` : "";
         logLine(`[plan] updated budget=${budget}${summary}`);
       }
       if (evt.type === "plan_progress") {
+        recordTaskEvent(taskTraceRef, evt);
         logLine(`[plan] ${evt.message}`);
       }
       if (evt.type === "llm_request") {
+        recordTaskEvent(taskTraceRef, evt);
         if (traceRef.value) {
           traceStateRef.value.llmStageStart[evt.stage] = Date.now();
           const chars = String(evt.payload || "").length;
@@ -2029,6 +2166,7 @@ async function main() {
         }
       }
       if (evt.type === "llm_response_delta") {
+        recordTaskEvent(taskTraceRef, evt);
         if (llmStreamRef.value && Object.prototype.hasOwnProperty.call(llmStreamRef.value, evt.stage)) {
           llmStreamRef.value[evt.stage] += String(evt.delta || "");
         }
@@ -2042,6 +2180,7 @@ async function main() {
         }
       }
       if (evt.type === "llm_response") {
+        recordTaskEvent(taskTraceRef, evt);
         if (traceRef.value) {
           const startedAt = Number(traceStateRef.value.llmStageStart[evt.stage] || 0);
           const durationMs = startedAt > 0 ? Date.now() - startedAt : 0;
@@ -2067,15 +2206,18 @@ async function main() {
         }
       }
       if (evt.type === "thinking_done") {
+        recordTaskEvent(taskTraceRef, evt);
         if (tui) tui.onThinkingDone();
         if (display) display.onThinkingDone();
       }
       if (evt.type === "thought") {
+        recordTaskEvent(taskTraceRef, evt);
         if (tui) tui.clearLiveThought();
         if (display) display.onThought(evt.content);
         logLine(`[thought] ${evt.content}`);
       }
       if (evt.type === "tool_use") {
+        recordTaskEvent(taskTraceRef, evt);
         if (turnSummaryRef.value.active) {
           turnSummaryRef.value.tools.push(evt.tool);
           if (evt.tool === "write_file" && evt.input?.path) {
@@ -2102,6 +2244,7 @@ async function main() {
         }
       }
       if (evt.type === "tool_start") {
+        recordTaskEvent(taskTraceRef, evt);
         if (traceRef.value) {
           traceStateRef.value.toolStartByName[evt.tool] = Date.now();
           logLine(`[trace] tool_start name=${evt.tool}`);
@@ -2125,6 +2268,7 @@ async function main() {
         }
       }
       if (evt.type === "tool_end") {
+        recordTaskEvent(taskTraceRef, evt);
         if (traceRef.value) {
           const startedAt = Number(traceStateRef.value.toolStartByName[evt.tool] || 0);
           const durationMs = startedAt > 0 ? Date.now() - startedAt : 0;
@@ -2137,6 +2281,7 @@ async function main() {
   });
 
   if (args.prompt !== null) {
+    startTaskTrace(taskTraceRef, { input: args.prompt, kind: "agent" });
     if (startupAutoSkills.enabled.length > 0) {
       console.log(`auto-loaded skills: ${startupAutoSkills.enabled.join(", ")}`);
     }
@@ -2149,12 +2294,23 @@ async function main() {
       console.log(`auto-enabled skills: ${autoSkillResult.enabled.join(", ")}`);
     }
 
-    const result = await agent.runTurn(args.prompt);
-    const output = typeof result === "string" ? result : JSON.stringify(result, null, 2);
-    if (display) {
-      display.onResponse(output);
-    } else {
-      console.log(`\n${output}`);
+    try {
+      const result = await agent.runTurn(args.prompt);
+      const output = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+      if (display) {
+        display.onResponse(output);
+      } else {
+        console.log(`\n${output}`);
+      }
+      const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done" });
+      if (saved) console.log(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
+    } catch (err) {
+      const saved = await finishTaskTrace(taskTraceRef, workspaceDir, {
+        status: "error",
+        error: String(err?.message || "error"),
+      });
+      if (saved) console.error(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
+      throw err;
     }
     await saveHistory(historyFile, rl.history);
     rl.close();
@@ -2279,18 +2435,25 @@ async function main() {
     exitArmedRef.value = false;
     if (tui) tui.clearInputHint();
     if (finalInput.startsWith("!")) {
+      startTaskTrace(taskTraceRef, { input: finalInput, kind: "shell" });
       currentInputRef.value = "";
       if (tui) tui.render(currentInputRef.value, "running shell command");
-      await runDirectShellCommand(finalInput.slice(1), {
+      const shellResult = await runDirectShellCommand(finalInput.slice(1), {
         workspaceDir,
         logLine,
         tui,
         display,
       });
+      const saved = await finishTaskTrace(taskTraceRef, workspaceDir, {
+        status: shellResult?.ok ? "done" : "error",
+        error: shellResult?.ok ? "" : String(shellResult?.error || ""),
+      });
+      if (saved) logLine(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
       continue;
     }
     const isSlash = finalInput.startsWith("/");
     if (!isSlash) {
+      startTaskTrace(taskTraceRef, { input: finalInput, kind: "agent" });
       logLine(`[task] ${finalInput}`);
     }
     currentInputRef.value = "";
@@ -2330,10 +2493,24 @@ async function main() {
       continue;
     }
 
+    const localTask = maybeHandleLocalInfoTask(finalInput, { logLine, tui, display });
+    if (localTask.handled) {
+      const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done" });
+      if (saved) logLine(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
+      if (display) display.clearSuggestions();
+      currentInputRef.value = "";
+      continue;
+    }
+
     await maybeAutoEnableSkills(finalInput, activeSkillsRef, skillIndex, logLine);
     taskRunningRef.value = true;
     try {
-      await runAgentTurn(agent, finalInput, tui, logLine, display, turnSummaryRef, workspaceDir);
+      const turnResult = await runAgentTurn(agent, finalInput, tui, logLine, display, turnSummaryRef, workspaceDir);
+      const saved = await finishTaskTrace(taskTraceRef, workspaceDir, {
+        status: turnResult?.ok ? "done" : turnResult?.aborted ? "aborted" : "error",
+        error: turnResult?.ok ? "" : String(turnResult?.error || ""),
+      });
+      if (saved) logLine(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
     } finally {
       taskRunningRef.value = false;
       escAbortArmedRef.value = false;

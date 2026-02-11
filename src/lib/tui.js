@@ -65,7 +65,7 @@ function renderInlineMarkdown(line) {
   let out = String(line || "");
   out = out.replace(
     /`([^`]+)`/g,
-    (_m, content) => color(` ${content} `, "46;30")
+    (_m, content) => color(content, "34")
   );
   out = out.replace(
     /(\*\*|__)(?!\s)(.+?)(?<!\s)\1/g,
@@ -646,6 +646,13 @@ export class SimpleTui {
       const leftPad = Math.max(0, raw.indexOf(title));
       return [`${" ".repeat(leftPad)}${color(` ${title} `, "1;30;42")}`];
     }
+    if (line.startsWith("[banner-title-inline] ")) {
+      const raw = String(line.slice(22) || "");
+      let rendered = raw;
+      rendered = rendered.replace(" Pie Code ", color(" Pie Code ", "1;30;42"));
+      rendered = rendered.replace("simple like pie", color("simple like pie", "2;37"));
+      return [rendered];
+    }
     if (line.startsWith("[banner-slogan] ")) {
       return [color(line.slice(16), "2;37")];
     }
@@ -810,7 +817,7 @@ export class SimpleTui {
     const hintLines = this.inputHint ? 1 : 0;
     const thinkingLines = this.thinking ? 1 : 0;
     const thoughtWrapped = this.thoughtStreamVisible ? wrapText(this.thoughtStreamText, width) : [];
-    const thoughtStreamLines = this.thoughtStreamVisible ? Math.min(3, thoughtWrapped.length) : 0;
+    const thoughtStreamLines = this.thoughtStreamVisible ? thoughtWrapped.length : 0;
     const bottomLines = 4 + commandSuggestionLines + modelSuggestionLines + hintLines; // input + pickers + status/hint
     const reservedLines =
       headerLines +
@@ -853,8 +860,7 @@ export class SimpleTui {
     const thinkingBlock = this.thinking ? [color(runningLine, `1;${thinkingColor}`)] : [];
     const thoughtStreamBlock = this.thoughtStreamVisible
       ? (() => {
-          const tail = thoughtWrapped.slice(-3);
-          return tail.map((line) => color(line, "35"));
+          return thoughtWrapped.map((line) => color(line, "35"));
         })()
       : [];
 
