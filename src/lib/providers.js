@@ -11,7 +11,7 @@ const DEFAULT_OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4.1-mini";
 const DEFAULT_OPENROUTER_MODEL = process.env.OPENROUTER_MODEL || "openai/gpt-4.1-mini";
 const DEFAULT_OPENROUTER_BASE_URL =
   process.env.OPENROUTER_BASE_URL || "https://openrouter.ai/api/v1";
-const DEFAULT_CODEX_MODEL = process.env.CODEX_MODEL || "gpt-5-codex";
+const DEFAULT_CODEX_MODEL = process.env.CODEX_MODEL || "gpt-5.3-codex";
 const DEFAULT_SEED_MODEL = process.env.SEED_MODEL || "doubao-seed-code-preview-latest";
 const DEFAULT_SEED_BASE_URL =
   process.env.SEED_BASE_URL || "https://ark.cn-beijing.volces.com/api/coding";
@@ -81,8 +81,10 @@ function getSupportedCodexApiModels(codexHome) {
 
 function resolveCodexModel(codexHome, preferredModel) {
   const supported = getSupportedCodexApiModels(codexHome);
-  if (preferredModel && supported.has(preferredModel)) return preferredModel;
+  const hasSupportData = supported.size > 0;
+  if (preferredModel && (!hasSupportData || supported.has(preferredModel))) return preferredModel;
   if (supported.has(DEFAULT_CODEX_MODEL)) return DEFAULT_CODEX_MODEL;
+  if (supported.has("gpt-5.3-codex")) return "gpt-5.3-codex";
   if (supported.has("gpt-5-codex")) return "gpt-5-codex";
   return preferredModel || DEFAULT_CODEX_MODEL;
 }
@@ -260,7 +262,7 @@ function hasCodexCliSession() {
     });
     if (out.status !== 0) return false;
     const combined = `${String(out.stdout || "")}\n${String(out.stderr || "")}`;
-    return /Logged in/i.test(combined);
+    return /(Logged in|Authenticated|ChatGPT)/i.test(combined);
   } catch {
     return false;
   }
@@ -268,7 +270,8 @@ function hasCodexCliSession() {
 
 function createCodexCliProvider(customModel = null) {
   const codexHome = getCodexHome();
-  const model = resolveCodexModel(codexHome, customModel || process.env.CODEX_MODEL || null);
+  const requestedModel = customModel || process.env.CODEX_MODEL || null;
+  const model = requestedModel || resolveCodexModel(codexHome, null);
   return {
     kind: "codex-cli-session",
     model,
@@ -295,6 +298,10 @@ function createCodexCliProvider(customModel = null) {
         const { stdout } = await execFile("codex", args, {
           maxBuffer: 1024 * 1024 * 8,
           timeout: 120_000,
+          env: {
+            ...process.env,
+            OTEL_SDK_DISABLED: "true",
+          },
         });
 
         let text = "";
@@ -317,6 +324,69 @@ function createCodexCliProvider(customModel = null) {
       }
     },
   };
+}
+
+function createCodexTokenProvider({ configuredModel, configuredBaseUrl, codexAuth }) {
+  return {
+    kind: "codex-auth-token",
+    model: configuredModel || codexAuth.model,
+    async complete({ systemPrompt, prompt }) {
+      const base = (
+        configuredBaseUrl ||
+        process.env.OPENAI_BASE_URL ||
+        "https://api.openai.com/v1"
+      ).replace(/\/$/, "");
+      try {
+        const data = await postJson(
+          `${base}/responses`,
+          { Authorization: `Bearer ${codexAuth.accessToken}` },
+          {
+            model: configuredModel || codexAuth.model,
+            input: [
+              { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
+              { role: "user", content: [{ type: "input_text", text: prompt }] },
+            ],
+          }
+        );
+
+        const text = extractResponsesText(data);
+        if (!text) throw new Error("Codex auth response did not contain text output.");
+        return text;
+      } catch (err) {
+        if (!hasMissingScope(err, "api.responses.write")) {
+          throw err;
+        }
+
+        const chatModel = configuredModel || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL;
+        try {
+          const data = await postJson(
+            `${base}/chat/completions`,
+            { Authorization: `Bearer ${codexAuth.accessToken}` },
+            {
+              model: chatModel,
+              temperature: 0.2,
+              messages: [
+                { role: "system", content: systemPrompt },
+                { role: "user", content: prompt },
+              ],
+            }
+          );
+          const text = data?.choices?.[0]?.message?.content;
+          if (!text) throw new Error("Codex token fallback did not return chat message content.");
+          return text;
+        } catch (fallbackErr) {
+          throw new Error(
+            "Codex login token lacks required API scopes for direct API calls. Use `codex login` and select ChatGPT/Codex API access (session mode), or set OPENAI_API_KEY."
+          );
+        }
+      }
+    },
+  };
+}
+
+function looksLikeCodexModel(modelName) {
+  const name = String(modelName || "").trim().toLowerCase();
+  return Boolean(name) && (name.includes("codex") || name.startsWith("gpt-5"));
 }
 
 export function getProvider(options = {}) {
@@ -408,59 +478,27 @@ export function getProvider(options = {}) {
         });
       }
       if (codexAuth?.accessToken) {
-        // Codex auth token handling
-        return {
-          kind: "codex-auth-token",
-          model: configuredModel || codexAuth.model,
-          async complete({ systemPrompt, prompt }) {
-            const base = (configuredBaseUrl || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
-            try {
-              const data = await postJson(
-                `${base}/responses`,
-                { Authorization: `Bearer ${codexAuth.accessToken}` },
-                {
-                  model: configuredModel || codexAuth.model,
-                  input: [
-                    { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
-                    { role: "user", content: [{ type: "input_text", text: prompt }] },
-                  ],
-                }
-              );
-
-              const text = extractResponsesText(data);
-              if (!text) throw new Error("Codex auth response did not contain text output.");
-              return text;
-            } catch (err) {
-              if (!hasMissingScope(err, "api.responses.write")) {
-                throw err;
-              }
-
-              const chatModel = configuredModel || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL;
-              try {
-                const data = await postJson(
-                  `${base}/chat/completions`,
-                  { Authorization: `Bearer ${codexAuth.accessToken}` },
-                  {
-                    model: chatModel,
-                    temperature: 0.2,
-                    messages: [
-                      { role: "system", content: systemPrompt },
-                      { role: "user", content: prompt },
-                    ],
-                  }
-                );
-                const text = data?.choices?.[0]?.message?.content;
-                if (!text) throw new Error("Codex token fallback did not return chat message content.");
-                return text;
-              } catch (fallbackErr) {
-                throw new Error(
-                  "Codex login token lacks required API scopes. Re-login with an API key (`printenv OPENAI_API_KEY | codex login --with-api-key`), or set OPENAI_API_KEY in your shell."
-                );
-              }
-            }
-          },
-        };
+        return createCodexTokenProvider({ configuredModel, configuredBaseUrl, codexAuth });
       }
+    }
+  }
+
+  // If the selected model is codex-like, prefer codex auth/session before other key-based fallbacks.
+  if (looksLikeCodexModel(configuredModel)) {
+    if (hasCodexCliSession()) {
+      return createCodexCliProvider(configuredModel);
+    }
+    const codexAuth = loadCodexAuth();
+    if (codexAuth?.openaiApiKey) {
+      return createOpenAICompatibleProvider({
+        kind: "codex-auth-key",
+        model: configuredModel || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
+        apiKey: codexAuth.openaiApiKey,
+        baseUrl: configuredBaseUrl || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1",
+      });
+    }
+    if (codexAuth?.accessToken) {
+      return createCodexTokenProvider({ configuredModel, configuredBaseUrl, codexAuth });
     }
   }
 
@@ -537,57 +575,7 @@ export function getProvider(options = {}) {
   }
 
   if (codexAuth?.accessToken) {
-    return {
-      kind: "codex-auth-token",
-      model: configuredModel || codexAuth.model,
-      async complete({ systemPrompt, prompt }) {
-        const base = (configuredBaseUrl || process.env.OPENAI_BASE_URL || "https://api.openai.com/v1").replace(/\/$/, "");
-        try {
-          const data = await postJson(
-            `${base}/responses`,
-            { Authorization: `Bearer ${codexAuth.accessToken}` },
-            {
-              model: configuredModel || codexAuth.model,
-              input: [
-                { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
-                { role: "user", content: [{ type: "input_text", text: prompt }] },
-              ],
-            }
-          );
-
-          const text = extractResponsesText(data);
-          if (!text) throw new Error("Codex auth response did not contain text output.");
-          return text;
-        } catch (err) {
-          if (!hasMissingScope(err, "api.responses.write")) {
-            throw err;
-          }
-
-          const chatModel = configuredModel || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL;
-          try {
-            const data = await postJson(
-              `${base}/chat/completions`,
-              { Authorization: `Bearer ${codexAuth.accessToken}` },
-              {
-                model: chatModel,
-                temperature: 0.2,
-                messages: [
-                  { role: "system", content: systemPrompt },
-                  { role: "user", content: prompt },
-                ],
-              }
-            );
-            const text = data?.choices?.[0]?.message?.content;
-            if (!text) throw new Error("Codex token fallback did not return chat message content.");
-            return text;
-          } catch (fallbackErr) {
-            throw new Error(
-              "Codex login token lacks required API scopes. Re-login with an API key (`printenv OPENAI_API_KEY | codex login --with-api-key`), or set OPENAI_API_KEY in your shell."
-            );
-          }
-        }
-      },
-    };
+    return createCodexTokenProvider({ configuredModel, configuredBaseUrl, codexAuth });
   }
 
   throw new Error(

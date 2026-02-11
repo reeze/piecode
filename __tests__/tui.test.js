@@ -67,9 +67,11 @@ describe("tui usability", () => {
       getApprovalLabel: () => "off",
     });
 
-    expect(stripAnsi(tui.formatTimelineLines("[task] simplify repo")[0])).toContain("> simplify repo");
+    expect(stripAnsi(tui.formatTimelineLines("[task] simplify repo")[0])).toContain("Task: simplify repo");
+    expect(tui.formatTimelineLines("[model] seed-openai-compatible:doubao")).toEqual([]);
+    expect(tui.formatTimelineLines("[plan] budget=3 - scoped plan")).toEqual([]);
     expect(stripAnsi(tui.formatTimelineLines('[run] shell command="echo hi"')[0])).toContain("Bash(echo hi)");
-    expect(stripAnsi(tui.formatTimelineLines("[result] done")[0])).toContain("Result: done");
+    expect(stripAnsi(tui.formatTimelineLines("[result] done")[0])).toContain("✓ done");
     expect(stripAnsi(tui.formatTimelineLines("[banner-1] ██████")[0])).toContain("██████");
     expect(stripAnsi(tui.formatTimelineLines("[banner-meta] model: seed:model")[0])).toContain("model: seed:model");
     expect(stripAnsi(tui.formatTimelineLines("[banner-hint] keys: CTRL+L")[0])).toContain("keys: CTRL+L");
@@ -82,6 +84,9 @@ describe("tui usability", () => {
     expect(markdownResponse).toContain("•");
     expect(markdownResponse).toContain("bold");
     expect(markdownResponse).toContain("code");
+    const plainResponse = stripAnsi(tui.formatTimelineLines("[response] hello world")[0]);
+    expect(plainResponse).toBe("hello world");
+    expect(plainResponse).not.toContain("Assistant:");
   });
 
   test("LLM debug panel appears only in raw log view when CTRL+O is enabled", () => {
@@ -160,11 +165,12 @@ describe("tui usability", () => {
     tui.start();
     const frame = latestFrame(out);
     expect(frame).toContain("status:");
-    expect(frame).toContain("llm:off");
-    expect(frame).toContain("view: timeline");
+    expect(frame).not.toContain("llm:");
+    expect(frame).not.toContain("view:");
+    expect(frame).not.toContain("todos:");
   });
 
-  test("thinking indicator is rendered in workspace while thinking", () => {
+  test("running indicator is rendered in workspace while thinking", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
       out,
@@ -175,9 +181,12 @@ describe("tui usability", () => {
     });
 
     tui.start();
+    tui.event("[task] inspect repo");
     tui.onThinking("turn");
     const frame = latestFrame(out);
-    expect(frame).toContain("thinking");
+    expect(frame).toContain("Task: inspect repo");
+    expect(frame).toContain("running");
+    expect(frame).toContain("tok");
     tui.onThinkingDone();
     tui.stop();
   });
@@ -232,5 +241,27 @@ describe("tui usability", () => {
     expect(frame).toContain("commands");
     expect(frame).toContain("> /model");
     expect(frame).toContain("/model list");
+  });
+
+  test("scrolling shows older content when overflowed", () => {
+    const out = createOut(80, 16);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed/model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+    tui.start();
+    for (let i = 1; i <= 30; i += 1) {
+      tui.event(`line-${i}`);
+    }
+    tui.render("");
+    const latest = latestFrame(out);
+    expect(latest).toContain("line-30");
+
+    tui.scrollPage(1);
+    const scrolled = latestFrame(out);
+    expect(scrolled).toContain("scroll:+");
   });
 });

@@ -140,7 +140,11 @@ export function createToolset({ workspaceDir, autoApproveRef, askApproval, onToo
       return "Command was not approved by the user.";
     }
 
-    onToolStart?.("shell", { command, safety: safety.level });
+    onToolStart?.("shell", {
+      command,
+      safety: safety.level,
+      approval: needsApproval ? "approved" : "auto",
+    });
     try {
       const { stdout, stderr } = await exec(command, {
         cwd: workspaceDir,

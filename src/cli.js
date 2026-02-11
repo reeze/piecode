@@ -40,6 +40,7 @@ const SLASH_COMMANDS = [
 ];
 
 const MODEL_SUGGESTIONS = [
+  "codex:gpt-5.3-codex",
   "seed:doubao-seed-code-preview-latest",
   "openrouter:moonshotai/kimi-k2.5",
   "openrouter:google/gemini-3-flash-preview",
@@ -60,7 +61,7 @@ const MODEL_SUGGESTIONS = [
   "qwen/qwen-2.5-coder-32b-instruct",
   "deepseek/deepseek-chat",
   "doubao-seed-code-preview-latest",
-  "gpt-5-codex",
+  "gpt-5.3-codex",
 ];
 
 const OPENROUTER_ALLOWED_MODELS = [
@@ -126,8 +127,8 @@ function resolveProviderOptions(args, settings) {
 
   const model = 
     args.model ||
-    providerSettings.model ||
     settings.model ||
+    providerSettings.model ||
     null;
 
   const endpoint = 
@@ -217,7 +218,7 @@ async function saveHistory(filePath, history) {
 }
 
 function printHelp() {
-  console.log(`Piecode - CLI coding agent
+  console.log(`Pie Code - CLI coding agent
 
 Usage:
   piecode
@@ -257,7 +258,7 @@ Environment:
   SEED_MODEL           Optional (default doubao-seed-code-preview-latest)
 
   CODEX_HOME           Optional (default ~/.codex)
-  CODEX_MODEL          Optional for codex token mode (default gpt-5-codex)
+  CODEX_MODEL          Optional for codex token mode (default gpt-5.3-codex)
   PIECODE_DISABLE_CODEX_CLI Optional (set 1 to disable codex CLI session backend)
   PIECODE_ENABLE_PLANNER  Optional (set 1 to enable experimental task planner)
   PIECODE_PLAN_FIRST      Optional (default on; set 0 to disable lightweight pre-plan)
@@ -281,6 +282,7 @@ Slash commands in interactive mode:
   /clear               Clear conversation history
   /approve on|off      Toggle shell auto-approval
   /model               Show active provider/model
+                       Tip: use /model codex:gpt-5.3-codex to force Codex provider
   /skills              Show active skills
   /skills list         List discovered skills
   /skills use <name>   Enable a skill
@@ -397,6 +399,21 @@ function estimateTokenCount(text) {
   if (!s) return 0;
   // Heuristic: average ~4 chars/token for mixed code + English prompts.
   return Math.max(1, Math.round(s.length / 4));
+}
+
+function formatCompactNumber(n) {
+  const value = Number(n);
+  if (!Number.isFinite(value)) return "0";
+  const abs = Math.abs(value);
+  if (abs >= 1_000_000) {
+    const v = (value / 1_000_000).toFixed(abs >= 10_000_000 ? 0 : 1);
+    return `${v.replace(/\.0$/, "")}m`;
+  }
+  if (abs >= 1_000) {
+    const v = (value / 1_000).toFixed(abs >= 10_000 ? 0 : 1);
+    return `${v.replace(/\.0$/, "")}k`;
+  }
+  return String(Math.round(value));
 }
 
 function inferContextWindow(modelName) {
@@ -530,11 +547,12 @@ function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
   };
   const shortWorkspace = workspaceDir.length > 64 ? `...${workspaceDir.slice(-61)}` : workspaceDir;
   const logoLines = [
-    `[banner-1] ${center("██████   ██  ███████")}`,
-    `[banner-2] ${center("██   ██  ██  ██")}`,
-    `[banner-3] ${center("██████   ██  █████")}`,
-    `[banner-4] ${center("██       ██  ██")}`,
-    `[banner-5] ${center("██       ██  ███████")}`,
+    `[banner-title] ${center("Pie Code")}`,
+    `[banner-1] ${center(" ____    ___    _____ " )}`,
+    `[banner-2] ${center("|  _ \\  |_ _|  | ____|")}`,
+    `[banner-3] ${center("| |_) |  | |   |  _|  ")}`,
+    `[banner-4] ${center("|  __/   | |   | |___ ")}`,
+    `[banner-5] ${center("|_|     |___|  |_____|")}`,
     `[banner-meta] ${center(`model: ${formatProviderModel(provider)}`)}`,
     `[banner-meta] ${center(`workspace: ${shortWorkspace}`)}`,
     `[banner-hint] ${center("keys: CTRL+L logs | CTRL+O llm i/o | CTRL+T todos")}`,
@@ -664,13 +682,18 @@ async function maybeAutoEnableSkills(input, activeSkillsRef, skillIndex, logLine
 
 async function runAgentTurn(agent, input, tui, logLine, display) {
   const startedAt = Date.now();
+  if (tui) tui.beginTurn();
   try {
     const result = await agent.runTurn(input);
-    if (tui) tui.onTurnSuccess(Date.now() - startedAt);
+    const durationMs = Date.now() - startedAt;
+    if (tui) tui.onTurnSuccess(durationMs);
     const output = typeof result === "string" ? result : JSON.stringify(result, null, 2);
     if (tui) {
+      const usage = tui.getTurnTokenUsage();
       logLine(`[response] ${output}`);
-      logLine(`[result] done in ${Date.now() - startedAt}ms`);
+      logLine(
+        `[result] done | time: ${durationMs}ms | tokens: sent ${formatCompactNumber(usage.sent)} | recv ${formatCompactNumber(usage.received)}`
+      );
       tui.render("", "done");
     } else if (display) {
       display.onResponse(output);
@@ -1075,6 +1098,22 @@ async function main() {
           tui.toggleTodoPanel();
           return;
         }
+        if (key.name === "pageup") {
+          tui.scrollPage(1);
+          return;
+        }
+        if (key.name === "pagedown") {
+          tui.scrollPage(-1);
+          return;
+        }
+        if (key.name === "home") {
+          tui.scrollToTop();
+          return;
+        }
+        if (key.name === "end") {
+          tui.scrollToBottom();
+          return;
+        }
 
         const pickerQuery = getModelQueryFromInput(currentLine);
         if (pickerQuery !== null) {
@@ -1247,12 +1286,21 @@ async function main() {
     const looksLikeSeedModel =
       selectedModel.toLowerCase().includes("doubao-seed") ||
       (seedConfiguredModel && selectedModel === seedConfiguredModel);
+    const looksLikeCodexModel =
+      selectedModel.toLowerCase().includes("codex") ||
+      selectedModel.toLowerCase().startsWith("gpt-5");
     const openRouterConfigured =
       Boolean(process.env.OPENROUTER_API_KEY) ||
       Boolean(settings?.providers?.openrouter?.apiKey) ||
       Boolean(settings?.apiKey && String(settings?.provider || "").toLowerCase() === "openrouter");
     const inferredProvider =
       parsed.provider ||
+      (
+        looksLikeCodexModel &&
+        providerOptionsRef.value.provider !== "codex"
+      ? "codex"
+      : ""
+      ) ||
       (
         looksLikeSeedModel &&
         providerOptionsRef.value.provider !== "seed" &&
@@ -1294,6 +1342,20 @@ async function main() {
     agent.provider = nextProvider;
     settings.model = selectedModel;
     if (nextProviderName) settings.provider = nextProviderName;
+    if (nextProviderName) {
+      if (!settings.providers || typeof settings.providers !== "object") {
+        settings.providers = {};
+      }
+      const existingProviderSettings =
+        settings.providers[nextProviderName] &&
+        typeof settings.providers[nextProviderName] === "object"
+          ? settings.providers[nextProviderName]
+          : {};
+      settings.providers[nextProviderName] = {
+        ...existingProviderSettings,
+        model: selectedModel,
+      };
+    }
     try {
       await saveSettings(settingsFile, settings);
     } catch {
@@ -1313,7 +1375,6 @@ async function main() {
       const approved = await waitForTuiApproval({ stdinStream: stdin, defaultYes });
       approvalActiveRef.value = false;
       tui.clearApprovalPrompt();
-      tui.event(`approval: ${approved ? "yes" : "no"}`);
       tui.render(currentInputRef.value, "approval handled");
       return approved;
     } else {
@@ -1381,10 +1442,12 @@ async function main() {
         if (tui) tui.onThinking(evt.stage);
         if (display) display.onThinking(evt.stage);
         const endpoint = inferEndpointForProvider(providerOptionsRef.value, providerRef.value);
+        const sentTokens = estimateTokenCount(evt.payload);
         if (tui) {
-          const used = estimateTokenCount(evt.payload);
+          const used = sentTokens;
           const limit = inferContextWindow(providerRef.value.model);
           tui.setContextUsage(used, limit);
+          tui.addTokenUsage({ sent: sentTokens, received: 0 });
         }
         logLine(`[thinking] request:${evt.stage} endpoint:${endpoint} ${summarizeForLog(evt.payload)}`);
         if (tui && llmDebugRef.value) {
@@ -1392,6 +1455,8 @@ async function main() {
         }
       }
       if (evt.type === "llm_response") {
+        const receivedTokens = estimateTokenCount(evt.payload);
+        if (tui) tui.addTokenUsage({ sent: 0, received: receivedTokens });
         logLine(`[thinking] response:${evt.stage} ${summarizeForLog(evt.payload)}`);
         if (tui && llmDebugRef.value) {
           tui.setLlmResponse(`[${evt.stage}] ${evt.payload}`);
@@ -1465,7 +1530,7 @@ async function main() {
     }
     tui.render(currentInputRef.value, "Type /help for commands");
   } else {
-    console.log(`Piecode (${formatProviderModel(providerRef.value)})`);
+    console.log(`Pie Code (${formatProviderModel(providerRef.value)})`);
     if (projectInstructionsRef.value?.source) {
       console.log(`loaded project instructions: ${projectInstructionsRef.value.source}`);
     }

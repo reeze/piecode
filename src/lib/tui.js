@@ -195,6 +195,10 @@ export class SimpleTui {
     this.thinkingStage = "";
     this.contextUsed = 0;
     this.contextLimit = 0;
+    this.turnTokensSent = 0;
+    this.turnTokensReceived = 0;
+    this.turnStartedAt = 0;
+    this.currentTaskText = "";
     this.llmDebugEnabled = false;
     this.lastLlmRequest = "";
     this.lastLlmResponse = "";
@@ -214,6 +218,7 @@ export class SimpleTui {
     this.commandSuggestionsVisible = false;
     this.commandSuggestions = [];
     this.commandSuggestionIndex = 0;
+    this.scrollOffset = 0;
   }
 
   start() {
@@ -230,6 +235,9 @@ export class SimpleTui {
   }
 
   event(line) {
+    if (String(line || "").startsWith("[task] ")) {
+      this.currentTaskText = String(line).slice(7).trim();
+    }
     const timestamp = new Date().toLocaleTimeString();
     const entry = `[${timestamp}] ${line}`;
     this.logs.push(entry);
@@ -247,6 +255,29 @@ export class SimpleTui {
     if (this.timeline.length > this.maxTimeline) {
       this.timeline = this.timeline.slice(this.timeline.length - this.maxTimeline);
     }
+  }
+
+  scrollLines(delta) {
+    const step = Math.max(1, Math.round(Math.abs(Number(delta) || 0)));
+    const direction = Number(delta) < 0 ? -1 : 1;
+    this.scrollOffset = Math.max(0, this.scrollOffset + direction * step);
+    this.render();
+    return this.scrollOffset;
+  }
+
+  scrollPage(direction = 1) {
+    const page = Math.max(3, Math.floor((this.out.rows || 30) * 0.5));
+    return this.scrollLines(direction * page);
+  }
+
+  scrollToTop() {
+    this.scrollOffset = 999999;
+    this.render();
+  }
+
+  scrollToBottom() {
+    this.scrollOffset = 0;
+    this.render();
   }
 
   onModelCall(label) {
@@ -286,6 +317,35 @@ export class SimpleTui {
     this.render();
   }
 
+  beginTurn() {
+    this.turnTokensSent = 0;
+    this.turnTokensReceived = 0;
+    this.turnStartedAt = Date.now();
+    this.render();
+  }
+
+  addTokenUsage({ sent = 0, received = 0 } = {}) {
+    const sentN = Number.isFinite(sent) ? Math.max(0, Math.round(sent)) : 0;
+    const recvN = Number.isFinite(received) ? Math.max(0, Math.round(received)) : 0;
+    if (!sentN && !recvN) return;
+    this.turnTokensSent += sentN;
+    this.turnTokensReceived += recvN;
+    this.render();
+  }
+
+  getTurnTokenUsage() {
+    return {
+      sent: this.turnTokensSent,
+      received: this.turnTokensReceived,
+    };
+  }
+
+  formatElapsedSinceTurnStart() {
+    if (!this.turnStartedAt) return "0.0s";
+    const ms = Math.max(0, Date.now() - this.turnStartedAt);
+    return `${(ms / 1000).toFixed(1)}s`;
+  }
+
   setLlmDebugEnabled(enabled) {
     this.llmDebugEnabled = Boolean(enabled);
     this.lastStatus = this.llmDebugEnabled ? "LLM I/O debug ON (CTRL+O to toggle)" : "LLM I/O debug OFF";
@@ -305,7 +365,7 @@ export class SimpleTui {
   onThinking(stage = "") {
     this.thinking = true;
     this.thinkingStage = String(stage || "thinking");
-    this.lastStatus = `thinking: ${this.thinkingStage}`;
+    this.lastStatus = "thinking...";
     this.startThinkingAnimation();
     this.render();
   }
@@ -464,10 +524,13 @@ export class SimpleTui {
   formatTimelineLines(line) {
     if (!line) return [];
     if (line.startsWith("[task] ")) {
-      return [color(`> ${line.slice(7).trim()}`, "1;37")];
+      return [color(`◆ Task: ${line.slice(7).trim()}`, "1;37")];
     }
-    if (line.startsWith("[plan] creating plan")) {
-      return [color("Planning...", "33")];
+    if (line.startsWith("[model] ")) {
+      return [];
+    }
+    if (line.startsWith("[plan]")) {
+      return [];
     }
     if (line.startsWith("[thinking] ")) {
       // Keep thinking state transient (spinner/status line), do not persist into timeline.
@@ -475,11 +538,13 @@ export class SimpleTui {
     }
     if (line.startsWith("[thought] ")) {
       const details = line.slice(9).trim();
-      return [color(`Thought: ${details || "<empty>"}`, "35")];
+      return [color(`Thought: ${details || "<empty>"}`, "35"), ""];
     }
     if (line.startsWith("[run] shell")) {
       const m = line.match(/command=("[^"]*"|\\S+)/);
+      const approvalMatch = line.match(/approval=("[^"]*"|\\S+)/);
       let command = "";
+      let approval = "";
       if (m?.[1]) {
         try {
           command = JSON.parse(m[1]);
@@ -487,24 +552,40 @@ export class SimpleTui {
           command = m[1];
         }
       }
+      if (approvalMatch?.[1]) {
+        try {
+          approval = JSON.parse(approvalMatch[1]);
+        } catch {
+          approval = approvalMatch[1];
+        }
+      }
       const display = command || "shell command";
-      return [color(`Bash(${display})`, "36"), color("L Running...", "2;37")];
+      const tag =
+        approval === "approved"
+          ? color("[APPROVED]", "1;33")
+          : approval === "auto"
+            ? color("[AUTO]", "2;32")
+            : "";
+      return [color(`Bash(${display})`, "36") + (tag ? ` ${tag}` : ""), color("L Running...", "2;37"), ""];
     }
     if (line.startsWith("[tool] ")) {
       return [color(`Tool: ${line.slice(7).trim()}`, "36")];
     }
     if (line.startsWith("[response] ")) {
       const text = line.slice(11).trim();
-      if (!text) return [color("Assistant: <empty>", "32")];
+      if (!text) return ["<empty>", ""];
       const chunks = renderMarkdownLines(text).filter((chunk) => chunk !== undefined);
-      if (chunks.length === 0) return [color("Assistant: <empty>", "32")];
-      return [color(`Assistant: ${chunks[0]}`, "32"), ...chunks.slice(1).map((lineItem) => color(lineItem, "32"))];
+      if (chunks.length === 0) return ["<empty>", ""];
+      return [...chunks, ""];
     }
     if (line.startsWith("[result] ")) {
-      return [color(`Result: ${line.slice(9).trim()}`, "1;32")];
+      return [color(`✓ ${line.slice(9).trim()}`, "1;32"), ""];
     }
     if (line.startsWith("[banner-1] ")) {
       return [color(line.slice(11), "1;82")];
+    }
+    if (line.startsWith("[banner-title] ")) {
+      return [color(line.slice(15), "1;92")];
     }
     if (line.startsWith("[banner-2] ")) {
       return [color(line.slice(11), "1;118")];
@@ -597,7 +678,11 @@ export class SimpleTui {
       this.todos.length > 0
         ? ` | todos: ${this.todos.filter((t) => t.status === "completed").length}/${this.todos.length}`
         : "";
-    const text = ` model: ${this.modelName || this.providerLabel()} | state: ${state} | last: ${time} | tool: ${tool}${ctx}${todoSummary}${phase}`;
+    const tokenSummary =
+      this.turnTokensSent > 0 || this.turnTokensReceived > 0
+        ? ` | tok: ${formatCompactNumber(this.turnTokensSent)}/${formatCompactNumber(this.turnTokensReceived)}`
+        : "";
+    const text = ` model: ${this.modelName || this.providerLabel()} | state: ${state} | last: ${time} | tool: ${tool}${ctx}${tokenSummary}${todoSummary}${phase}`;
     return truncateLine(text, width);
   }
 
@@ -639,10 +724,22 @@ export class SimpleTui {
     const wrappedLogs = this.logs.flatMap((line) => wrapText(line, width));
     const wrappedTimeline = this.timeline.flatMap((line) => wrapText(line, width));
     const sourceLines = this.showRawLogs ? wrappedLogs : wrappedTimeline;
-    const visibleLogs = sourceLines.slice(Math.max(0, sourceLines.length - maxLogLines));
+    const maxScroll = Math.max(0, sourceLines.length - maxLogLines);
+    this.scrollOffset = Math.min(Math.max(0, this.scrollOffset), maxScroll);
+    const start = Math.max(0, sourceLines.length - maxLogLines - this.scrollOffset);
+    const visibleLogs = sourceLines.slice(start, start + maxLogLines);
 
     const inputState = this.buildInputState(this.currentInput, width);
-    const promptStatusRaw = `status: ${status || this.lastStatus || "idle"} | view: ${this.showRawLogs ? "raw" : "timeline"} | llm:${this.llmDebugEnabled ? "on" : "off"} | todos:${this.showTodoPanel ? "on" : "off"}`;
+    const scrollLabel = this.scrollOffset > 0 ? ` | scroll:+${this.scrollOffset}` : "";
+    const ctxStatus =
+      this.contextLimit > 0
+        ? ` | ctx:${formatCompactNumber(this.contextUsed)}/${formatCompactNumber(this.contextLimit)}(${Math.min(999, Math.round((this.contextUsed / this.contextLimit) * 100))}%)`
+        : "";
+    const tokStatus =
+      this.turnTokensSent > 0 || this.turnTokensReceived > 0
+        ? ` | tok:${formatCompactNumber(this.turnTokensSent)}/${formatCompactNumber(this.turnTokensReceived)}`
+        : "";
+    const promptStatusRaw = `status: ${status || this.lastStatus || "idle"}${ctxStatus}${tokStatus}${scrollLabel}`;
     const promptStatus =
       promptStatusRaw.length >= width
         ? truncateLine(promptStatusRaw, width)
@@ -654,8 +751,8 @@ export class SimpleTui {
     const dotFrames = ["", ".", "..", "..."];
     const spin = spinFrames[this.thinkingTick % spinFrames.length];
     const dots = dotFrames[this.thinkingTick % dotFrames.length];
-    const thinkingLine = `${spin} thinking${dots}${this.thinkingStage ? ` (${this.thinkingStage})` : ""}`;
-    const thinkingText = this.thinking ? color(thinkingLine, `1;${thinkingColor}`) : "";
+    const runningLine = `↳ | ${spin} running${dots} | ${this.formatElapsedSinceTurnStart()} | tok ${formatCompactNumber(this.turnTokensSent)}/${formatCompactNumber(this.turnTokensReceived)}`;
+    const thinkingBlock = this.thinking ? [color(runningLine, `1;${thinkingColor}`)] : [];
 
     const todoStatus = (status) =>
       status === "completed" ? "[x]" : status === "in_progress" ? "[~]" : "[ ]";
@@ -703,7 +800,7 @@ export class SimpleTui {
         ? [sep, `\x1b[35m${llmHeader}\x1b[0m`, llmReqTitle, ...llmReqLines, llmResTitle, ...llmResLines]
         : []),
       ...approvalBlock,
-      ...(this.thinking ? [thinkingText] : []),
+      ...thinkingBlock,
       sep,
     ];
     const frameLines = [
