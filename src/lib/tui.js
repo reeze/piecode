@@ -181,12 +181,13 @@ function formatCompactNumber(n) {
 }
 
 export class SimpleTui {
-  constructor({ out, workspaceDir, providerLabel, getSkillsLabel, getApprovalLabel }) {
+  constructor({ out, workspaceDir, providerLabel, getSkillsLabel, getApprovalLabel, layout = null }) {
     this.out = out;
     this.workspaceDir = workspaceDir;
     this.providerLabel = providerLabel;
     this.getSkillsLabel = getSkillsLabel;
     this.getApprovalLabel = getApprovalLabel;
+    this.layout = layout;
     this.logs = [];
     this.maxLogs = 2000;
     this.activity = [];
@@ -239,8 +240,10 @@ export class SimpleTui {
   start() {
     this.active = true;
     // Enable mouse reporting (normal + SGR extended) for wheel scrolling support.
-    this.out.write("\x1b[?1000h\x1b[?1006h");
-    this.out.write("\x1b[?25h");
+    if (!this.layout) {
+      this.out.write("\x1b[?1000h\x1b[?1006h");
+      this.out.write("\x1b[?25h");
+    }
     this.render("", "Ready. Type /help for commands.");
   }
 
@@ -249,8 +252,10 @@ export class SimpleTui {
     this.active = false;
     this.stopThinkingAnimation();
     // Disable mouse reporting on exit.
-    this.out.write("\x1b[?1000l\x1b[?1006l");
-    this.out.write("\x1b[2J\x1b[H\x1b[?25h");
+    if (!this.layout) {
+      this.out.write("\x1b[?1000l\x1b[?1006l");
+      this.out.write("\x1b[2J\x1b[H\x1b[?25h");
+    }
   }
 
   event(line) {
@@ -572,9 +577,20 @@ export class SimpleTui {
   }
 
   formatTimelineLines(line) {
+    const padLeft = (text) => {
+      const s = String(text || "");
+      if (!s) return s;
+      if (s.startsWith(" ")) return s;
+      return ` ${s}`;
+    };
+    const padAll = (lines) =>
+      (Array.isArray(lines) ? lines : [lines]).map((item) => {
+        if (item === "") return item;
+        return padLeft(item);
+      });
     if (!line) return [];
     if (line.startsWith("[task] ")) {
-      return [color(` ◆ Task: ${line.slice(7).trim()} `, "1;30;47")];
+      return padAll([color(` ◆ Task: ${line.slice(7).trim()} `, "1;30;47")]);
     }
     if (line.startsWith("[model] ")) {
       return [];
@@ -588,7 +604,7 @@ export class SimpleTui {
     }
     if (line.startsWith("[thought] ")) {
       const details = trimWorkspaceText(line.slice(9).trim(), 1800).text;
-      return [color(`Thought: ${details || "<empty>"}`, "35"), ""];
+      return padAll([color(`Thought: ${details || "<empty>"}`, "35"), ""]);
     }
     if (line.startsWith("[run] shell")) {
       const m = line.match(/command=("[^"]*"|\\S+)/);
@@ -621,20 +637,20 @@ export class SimpleTui {
           : approval === "auto"
             ? color("[AUTO]", "2;32")
             : "";
-      return [color(`Bash(${safeDisplay})`, "36") + (tag ? ` ${tag}` : ""), color("L Running...", "2;37"), ""];
+      return padAll([color(`Bash(${safeDisplay})`, "36") + (tag ? ` ${tag}` : ""), color("L Running...", "2;37"), ""]);
     }
     if (line.startsWith("[tool] ")) {
-      return [color(`Tool: ${line.slice(7).trim()}`, "36")];
+      return padAll([color(`Tool: ${line.slice(7).trim()}`, "36")]);
     }
     if (line.startsWith("[response] ")) {
       const text = trimWorkspaceText(line.slice(11).trim(), 8000).text;
-      if (!text) return ["<empty>", ""];
+      if (!text) return padAll(["<empty>", ""]);
       const chunks = renderMarkdownLines(text).filter((chunk) => chunk !== undefined);
-      if (chunks.length === 0) return ["<empty>", ""];
-      return [...chunks, ""];
+      if (chunks.length === 0) return padAll(["<empty>", ""]);
+      return padAll([...chunks, ""]);
     }
     if (line.startsWith("[result] ")) {
-      return [color(`✓ ${line.slice(9).trim()}`, "2;37"), ""];
+      return padAll([color(`✓ ${line.slice(9).trim()}`, "2;37"), ""]);
     }
     if (line.startsWith("[banner-1] ")) {
       return [color(line.slice(11), "1;82")];
@@ -651,10 +667,10 @@ export class SimpleTui {
       let rendered = raw;
       rendered = rendered.replace(" Pie Code ", color(" Pie Code ", "1;30;42"));
       rendered = rendered.replace("simple like pie", color("simple like pie", "2;37"));
-      return [rendered];
+      return padAll([rendered]);
     }
     if (line.startsWith("[banner-slogan] ")) {
-      return [color(line.slice(16), "2;37")];
+      return padAll([color(line.slice(16), "2;37")]);
     }
     if (line.startsWith("[banner-2] ")) {
       return [color(line.slice(11), "1;118")];
@@ -678,81 +694,73 @@ export class SimpleTui {
       return [color(line.slice(11), "1;154")];
     }
     if (line.startsWith("[banner-meta] ")) {
-      return [color(line.slice(14), "2;37")];
+      return padAll([color(line.slice(14), "2;37")]);
     }
     if (line.startsWith("[banner-hint] ")) {
-      return [color(line.slice(14), "2;36")];
+      return padAll([color(line.slice(14), "2;36")]);
     }
     if (line.startsWith("loaded project instructions:")) {
-      return [color(line, "2;37")];
+      return padAll([color(line, "2;37")]);
     }
     if (line.startsWith("error:")) {
-      return [color(line, "31")];
+      return padAll([color(line, "31")]);
     }
     if (line.startsWith("[")) {
       // Hide internal event noise in workspace timeline.
       return [];
     }
-    return [trimWorkspaceText(line, 1200).text];
+    return padAll([trimWorkspaceText(line, 1200).text]);
   }
 
   buildInputState(input, width, cursorIndex = null) {
     const rawInput = String(input || "");
     const normalizedSource = rawInput.replace(/\r/g, "");
-    const normalizedInput = normalizedSource.replace(/\n/g, " ↩ ");
     const safeCursorIndex =
       Number.isFinite(cursorIndex) && Number(cursorIndex) >= 0
         ? Math.min(normalizedSource.length, Math.max(0, Math.floor(Number(cursorIndex))))
         : normalizedSource.length;
-    const normalizedCursor = normalizedSource.slice(0, safeCursorIndex).replace(/\n/g, " ↩ ");
+    const beforeCursor = normalizedSource.slice(0, safeCursorIndex);
+    const cursorParts = beforeCursor.split("\n");
+    const cursorRowOffset = Math.max(0, cursorParts.length - 1);
+    const cursorLineRaw = cursorParts[cursorParts.length - 1] || "";
+
     const promptGlyph = "❯";
-    const maxInputWidth = Math.max(0, width - 3);
-    let shownInput = normalizedInput;
-    let shownCursorText = normalizedCursor;
-    if (shownInput.length > maxInputWidth) {
-      const window = Math.max(1, maxInputWidth - 3);
-      const cursorAt = Math.min(normalizedCursor.length, normalizedInput.length);
-      let start = Math.max(0, Math.min(cursorAt - Math.floor(window / 2), normalizedInput.length - window));
-      let segment = normalizedInput.slice(start, start + window);
-      if (start > 0) {
-        shownInput = `...${segment}`;
-        shownCursorText = shownInput.slice(0, 3 + Math.max(0, cursorAt - start));
-      } else {
-        shownInput = `${segment}...`;
-        shownCursorText = shownInput.slice(0, Math.min(shownInput.length, cursorAt));
-      }
-      if (shownInput.length > maxInputWidth) {
-        shownInput = shownInput.slice(0, maxInputWidth);
-        shownCursorText = shownInput.slice(0, Math.min(shownInput.length, shownCursorText.length));
-      }
-    }
+    const firstPrefix = ` ${promptGlyph} `;
+    const contPrefix = "   ";
     const placeholder = 'Try "fix lint errors"';
-    const inputText = shownInput || placeholder;
-    const line = shownInput
-      ? truncateLine(` ${promptGlyph} ${inputText}`, width)
-      : ` ${promptGlyph} \x1b[2m${truncateLine(inputText, maxInputWidth)}\x1b[0m`;
-    const promptPrefix = ` ${promptGlyph} `;
+    const hasContent = normalizedSource.length > 0;
+    const logicalLines = hasContent ? normalizedSource.split("\n") : [""];
+
+    const visibleLines = logicalLines.map((lineText, idx) => {
+      const prefix = idx === 0 ? firstPrefix : contPrefix;
+      const maxLineWidth = Math.max(0, width - stringDisplayWidth(prefix));
+      const clipped = truncateLine(lineText, maxLineWidth);
+      return `${prefix}${clipped}`;
+    });
+    if (!hasContent) {
+      const maxLineWidth = Math.max(0, width - stringDisplayWidth(firstPrefix));
+      visibleLines[0] = `${firstPrefix}\x1b[2m${truncateLine(placeholder, maxLineWidth)}\x1b[0m`;
+    }
+
+    const cursorPrefix = cursorRowOffset === 0 ? firstPrefix : contPrefix;
+    const maxCursorWidth = Math.max(0, width - stringDisplayWidth(cursorPrefix));
+    const cursorShown = truncateLine(cursorLineRaw, maxCursorWidth);
     const cursorCol = Math.max(
       1,
-      Math.min(Math.max(1, width), 1 + stringDisplayWidth(promptPrefix) + stringDisplayWidth(shownCursorText))
+      Math.min(Math.max(1, width), 1 + stringDisplayWidth(cursorPrefix) + stringDisplayWidth(cursorShown))
     );
-    return { line, cursorCol };
+
+    return {
+      lines: visibleLines,
+      cursorCol,
+      cursorRowOffset,
+    };
   }
 
   renderInput(input = "", cursorIndex = null) {
-    if (!this.active || !this.lastInputRow || !this.lastFrameLineCount) return;
+    if (!this.active) return;
     this.currentInput = String(input || "");
-    const termWidth = Math.max(40, this.out.columns || 100);
-    const width = Math.max(20, termWidth - 1);
-    const { line: inputLine, cursorCol } = this.buildInputState(input, width, cursorIndex);
-    if (inputLine === this.lastInputLine) {
-      this.out.write(`\x1b[?25h\x1b[${this.lastInputRow};${cursorCol}H`);
-      return;
-    }
-    this.lastInputLine = inputLine;
-    this.out.write(
-      `\x1b[${this.lastInputRow};1H\x1b[2K\x1b[1m${inputLine}\x1b[0m\x1b[?25h\x1b[${this.lastInputRow};${cursorCol}H`
-    );
+    this.render(this.currentInput, this.lastStatus || "waiting for input", cursorIndex);
   }
 
   formatStatusLine(width) {
@@ -783,7 +791,7 @@ export class SimpleTui {
     return truncateLine(text, width);
   }
 
-  render(input = this.currentInput, status = "") {
+  render(input = this.currentInput, status = "", cursorIndex = null) {
     if (!this.active) return;
     this.currentInput = String(input || "");
 
@@ -818,7 +826,9 @@ export class SimpleTui {
     const thinkingLines = this.thinking ? 1 : 0;
     const thoughtWrapped = this.thoughtStreamVisible ? wrapText(this.thoughtStreamText, width) : [];
     const thoughtStreamLines = this.thoughtStreamVisible ? thoughtWrapped.length : 0;
-    const bottomLines = 4 + commandSuggestionLines + modelSuggestionLines + hintLines; // input + pickers + status/hint
+    const inputState = this.buildInputState(this.currentInput, width, cursorIndex);
+    const inputLineCount = Math.max(1, inputState.lines.length);
+    const bottomLines = inputLineCount + 3 + commandSuggestionLines + modelSuggestionLines + hintLines; // input + pickers + status/hint
     const reservedLines =
       headerLines +
       todoBlockLines +
@@ -827,16 +837,18 @@ export class SimpleTui {
       thinkingLines +
       thoughtStreamLines +
       bottomLines;
-    const maxLogLines = Math.max(1, height - reservedLines);
     const wrappedLogs = this.logs.flatMap((line) => wrapText(line, width));
     const wrappedTimeline = this.timeline.flatMap((line) => wrapText(line, width));
     const sourceLines = this.showRawLogs ? wrappedLogs : wrappedTimeline;
+    // Keep layout in natural flow: do not force-fill the terminal height.
+    // This keeps input/status attached to content instead of sticky at screen bottom.
+    const viewportLogCap = Math.max(8, Math.min(120, Math.floor(height * 0.6)));
+    const maxLogLines = Math.max(1, Math.min(Math.max(1, sourceLines.length || 1), viewportLogCap));
     const maxScroll = Math.max(0, sourceLines.length - maxLogLines);
     this.scrollOffset = Math.min(Math.max(0, this.scrollOffset), maxScroll);
     const start = Math.max(0, sourceLines.length - maxLogLines - this.scrollOffset);
     const visibleLogs = sourceLines.slice(start, start + maxLogLines);
 
-    const inputState = this.buildInputState(this.currentInput, width);
     const scrollLabel = this.scrollOffset > 0 ? ` | scroll:+${this.scrollOffset}` : "";
     const ctxStatus =
       this.contextLimit > 0
@@ -912,11 +924,11 @@ export class SimpleTui {
       ...approvalBlock,
       ...thinkingBlock,
       ...thoughtStreamBlock,
-      sep,
+      sep, // separator directly above input
     ];
     const frameLines = [
       ...beforeInputLines,
-      `\x1b[1m${inputState.line}\x1b[0m`,
+      ...inputState.lines.map((line) => `\x1b[1m${line}\x1b[0m`),
       ...commandSuggestionBlock,
       ...modelSuggestionBlock,
       sep,
@@ -927,7 +939,24 @@ export class SimpleTui {
     const frame = frameLines.join("\n");
     this.lastFrameLineCount = frameLines.length;
     this.lastInputRow = Math.max(1, beforeInputLines.length + 1);
-    this.lastInputLine = inputState.line;
-    this.out.write("\x1b[H\x1b[J" + frame + `\x1b[?25h\x1b[${this.lastInputRow};${inputState.cursorCol}H`);
+    this.lastInputLine = inputState.lines.join("\n");
+    const cursorRow = this.lastInputRow + Math.max(0, inputState.cursorRowOffset);
+    if (this.layout) {
+      const inputComposite = [
+        ...inputState.lines.map((line) => line),
+        ...commandSuggestionBlock,
+        ...modelSuggestionBlock,
+      ];
+      this.layout.render({
+        workspaceLines: beforeInputLines.slice(0, -1),
+        inputLines: inputComposite,
+        statusLine: promptStatus,
+        hintLine: this.inputHint ? ` ${this.inputHint}` : "",
+        cursorRowOffset: Math.max(0, inputState.cursorRowOffset),
+        cursorCol: inputState.cursorCol,
+      });
+      return;
+    }
+    this.out.write("\x1b[H\x1b[J" + frame + `\x1b[?25h\x1b[${cursorRow};${inputState.cursorCol}H`);
   }
 }

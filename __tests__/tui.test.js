@@ -85,7 +85,7 @@ describe("tui usability", () => {
     expect(markdownResponse).toContain("bold");
     expect(markdownResponse).toContain("code");
     const plainResponse = stripAnsi(tui.formatTimelineLines("[response] hello world")[0]);
-    expect(plainResponse).toBe("hello world");
+    expect(plainResponse.trim()).toBe("hello world");
     expect(plainResponse).not.toContain("Assistant:");
     const boldResponse = stripAnsi(tui.formatTimelineLines("[response] this is **BOLD** text")[0]);
     expect(boldResponse).toContain("this is BOLD text");
@@ -230,7 +230,8 @@ describe("tui usability", () => {
     tui.start();
     tui.renderInput("line1\nline2");
     const lastWrite = stripAnsi(out.writes[out.writes.length - 1] || "");
-    expect(lastWrite).toContain("↩");
+    expect(lastWrite).toContain("line1");
+    expect(lastWrite).toContain("line2");
   });
 
   test("renderInput honors explicit cursor position (CTRL+A/CTRL+E behavior)", () => {

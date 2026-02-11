@@ -7,7 +7,7 @@ import { spawnSync, exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
 import * as readlineCore from "node:readline";
 import { createInterface } from "node:readline/promises";
-import { Writable } from "node:stream";
+import { Writable, Transform } from "node:stream";
 import { stdin, stdout } from "node:process";
 import { Agent } from "./lib/agent.js";
 import { getProvider } from "./lib/providers.js";
@@ -25,6 +25,7 @@ import { createSkillInteractive } from "./lib/skillCreator.js";
 import { SimpleTui } from "./lib/tui.js";
 import { Display } from "./lib/display.js";
 import { consumeMouseWheelDeltas, stripMouseInputNoise } from "./lib/mouse.js";
+import { TuiLineEditor } from "./lib/tuiLineEditor.js";
 
 const HISTORY_MAX = 500;
 const execAsync = promisify(execCb);
@@ -464,6 +465,49 @@ function parseArgs(argv) {
   return args;
 }
 
+let neoBlessedProbe = null;
+async function hasNeoBlessedInstalled() {
+  if (neoBlessedProbe !== null) return neoBlessedProbe;
+  try {
+    await import("neo-blessed");
+    neoBlessedProbe = true;
+  } catch {
+    neoBlessedProbe = false;
+  }
+  return neoBlessedProbe;
+}
+
+async function createNeoBlessedKeypressSource({ input, output }) {
+  const loaded = await import("neo-blessed");
+  const blessed = loaded?.default || loaded;
+  const programFactory =
+    (blessed && typeof blessed.program === "function" && blessed.program) ||
+    (loaded && typeof loaded.program === "function" && loaded.program) ||
+    null;
+  if (!programFactory) {
+    return { source: input, destroy: () => {}, blessed: null, program: null };
+  }
+  const rawTerm = String(process.env.TERM || "").toLowerCase();
+  const terminal = rawTerm.includes("ghostty") ? "xterm-256color" : (process.env.TERM || "xterm-256color");
+  const program = programFactory({
+    input,
+    output,
+    terminal,
+  });
+  return {
+    source: program || input,
+    blessed,
+    program,
+    destroy: () => {
+      try {
+        if (program && typeof program.destroy === "function") program.destroy();
+      } catch {
+        // best effort
+      }
+    },
+  };
+}
+
 function createLogger(tui, display, getInput = () => "", onLogLine = null) {
   return (line) => {
     if (typeof onLogLine === "function") onLogLine(line);
@@ -592,7 +636,7 @@ function maybeHandleLocalInfoTask(input, { logLine, tui, display } = {}) {
   ];
   const message = lines.join("\n");
   logLine(`[response] ${message}`);
-  logLine("[result] done | time: 0ms | tokens: sent 0 | recv 0");
+  logLine("[result] done | time: 0ms | tok ↑0 ↓0");
   if (tui) tui.render("", "done");
   if (display) display.onResponse(message);
   return { handled: true };
@@ -1051,13 +1095,81 @@ function createCompleter(getSkillIndex) {
   };
 }
 
+/**
+ * Regex matching terminal escape sequences that encode Shift+Enter / modified Enter.
+ * These are not understood by Node's readline emitKeypressEvents and would leak as
+ * literal text (e.g. "13~") into the input buffer.
+ *
+ * We replace them with a private sentinel control char and handle that sentinel inside
+ * isMultilineShortcut(). This avoids translating modified enter to plain "\n", which
+ * can be interpreted as submit by readline in some terminals.
+ *
+ * Matched sequences:
+ *   \x1b[13;2u        – CSI u  (Shift+Enter, xterm/foot/WezTerm)
+ *   \x1b[13;Nu        – CSI u  with any modifier mask
+ *   \x1b[13;N~        – CSI ~  variant used by some terminal stacks
+ *   \x1b[27;2;13~     – xterm modifyOtherKeys (Shift+Enter)
+ *   \x1b[27;N;13~     – xterm modifyOtherKeys with any modifier
+ *   \x1b[13u          – kitty keyboard protocol (bare Enter, fixup layout)
+ */
+const MULTILINE_ENTER_SENTINEL = "\x1f";
+const MODIFIED_ENTER_RE = /\x1b\[13(?:;\d+)?[u~]|\x1b\[27;\d+;13~/g;
+
+function createStdinFilter() {
+  let buf = "";
+  let flushTimer = null;
+  const self = new Transform({
+    decodeStrings: false,
+    transform(chunk, _enc, cb) {
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+      buf += typeof chunk === "string" ? chunk : chunk.toString("utf-8");
+      // If buffer ends mid-escape, hold bytes until next chunk (up to a short limit).
+      if (buf.includes("\x1b") && buf.length < 32 && /\x1b(?:\[[\d;]*)?$/.test(buf)) {
+        // Flush after a short timeout so a lone ESC keypress isn't delayed forever.
+        flushTimer = setTimeout(() => {
+          flushTimer = null;
+          if (buf) {
+            const out = buf.replace(MODIFIED_ENTER_RE, MULTILINE_ENTER_SENTINEL);
+            buf = "";
+            self.push(out);
+          }
+        }, 50);
+        cb();
+        return;
+      }
+      const out = buf.replace(MODIFIED_ENTER_RE, MULTILINE_ENTER_SENTINEL);
+      buf = "";
+      cb(null, out);
+    },
+    flush(cb) {
+      if (flushTimer) { clearTimeout(flushTimer); flushTimer = null; }
+      if (buf) {
+        cb(null, buf.replace(MODIFIED_ENTER_RE, MULTILINE_ENTER_SENTINEL));
+        buf = "";
+      } else {
+        cb();
+      }
+    },
+  });
+  return self;
+}
+
 function isMultilineShortcut(str, key = {}) {
   const name = String(key?.name || "").toLowerCase();
-  if ((name === "return" || name === "enter") && key.shift) return true;
+  if (str === MULTILINE_ENTER_SENTINEL) return true;
+  if (str === "↩" || str === "↵") return true;
+  // Alt+Enter / Option+Enter (meta modifier).
+  if ((name === "return" || name === "enter") && key.meta && str !== "\r" && str !== "\n") return true;
+  // Some terminals can set shift=true on plain Enter; don't treat that as multiline.
+  if ((name === "return" || name === "enter") && key.shift && str !== "\r" && str !== "\n") return true;
   // Common fallback for newline insertion in terminals.
   if (key.ctrl && name === "j") return true;
-  // xterm/kitty-like modified Enter escape sequences.
+  // xterm/kitty-like modified Enter escape sequences (CSI u and xterm modifyOtherKeys).
   if (str === "\x1b[13;2u" || str === "\x1b[27;2;13~") return true;
+  // Kitty keyboard protocol variants.
+  if (str === "\x1b[13u") return true;
+  // Raw escape + CR/LF from terminals that don't parse modifiers.
+  if (str === "\x1b\r" || str === "\x1b\n") return true;
   return false;
 }
 
@@ -1173,7 +1285,7 @@ async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef,
       const usage = tui.getTurnTokenUsage();
       logLine(`[response] ${output}`);
       logLine(
-        `[result] done | time: ${formatReadableDuration(durationMs)} | tokens: sent ${formatCompactNumber(usage.sent)} | recv ${formatCompactNumber(usage.received)}`
+        `[result] done | time: ${formatReadableDuration(durationMs)} | tok ↑${formatCompactNumber(usage.sent)} ↓${formatCompactNumber(usage.received)}`
       );
       tui.clearLiveThought();
       tui.render("", "done");
@@ -1565,6 +1677,12 @@ async function main() {
   const historyFile = getHistoryFilePath();
   const initialHistory = await loadHistory(historyFile);
   const useTui = args.tui || process.env.PIECODE_TUI === "1";
+  if (useTui) {
+    const neoBlessedAvailable = await hasNeoBlessedInstalled();
+    if (!neoBlessedAvailable) {
+      throw new Error("neo-blessed is required for TUI mode. Please run: npm install");
+    }
+  }
   const display = useTui ? null : new Display();
   const llmDebugRef = { value: false };
   const traceRef = { value: process.env.PIECODE_TRACE === "1" };
@@ -1580,9 +1698,47 @@ async function main() {
   const todoAutoTrackRef = { value: false };
   const readlineOutput = useTui ? createMutedTtyOutput(stdout) : stdout;
 
+  // Filter stdin through a Transform that converts terminal-specific Shift+Enter
+  // escape sequences into plain \n (Ctrl+J) so Node's readline doesn't choke on them.
+  const stdinFilter = createStdinFilter();
+  stdin.pipe(stdinFilter);
+  // Carry over TTY properties so readline treats the stream as a terminal.
+  stdinFilter.isTTY = stdin.isTTY;
+  stdinFilter.isRaw = stdin.isRaw;
+  stdinFilter.setRawMode = (mode) => {
+    if (typeof stdin.setRawMode === "function") {
+      stdin.setRawMode(mode);
+    }
+  };
+  const filteredInput = stdinFilter;
+
+  // In non-TUI mode, normalize keypress events directly from stdin.
+  // In TUI mode, neo-blessed provides its own key event stream.
+  if (!useTui) {
+    readlineCore.emitKeypressEvents(filteredInput);
+  }
+  let keypressSource = filteredInput;
+  let destroyKeypressSource = () => {};
+  if (useTui) {
+    const keypressHub = await createNeoBlessedKeypressSource({
+      input: filteredInput,
+      output: readlineOutput,
+    });
+    keypressSource = keypressHub.source || filteredInput;
+    destroyKeypressSource = typeof keypressHub.destroy === "function" ? keypressHub.destroy : () => {};
+  }
+
   const createReadline = (history = []) => {
+    if (useTui) {
+      return new TuiLineEditor({
+        keypressSource,
+        history,
+        historySize: HISTORY_MAX,
+        removeHistoryDuplicates: true,
+      });
+    }
     const next = createInterface({
-      input: stdin,
+      input: filteredInput,
       output: readlineOutput,
       terminal: true,
       historySize: HISTORY_MAX,
@@ -1636,8 +1792,6 @@ async function main() {
   );
   const exitArmedRef = { value: false };
   const approvalActiveRef = { value: false };
-  const multilineBufferRef = { value: "" };
-  const multilineCommitRef = { value: false };
   const suppressNextSubmitRef = { value: false };
   const pendingCommandSubmitRef = { value: "" };
   const modelPickerRef = { active: false, query: "", options: [], index: 0 };
@@ -1649,7 +1803,6 @@ async function main() {
   let onMouseData = null;
   let renderLiveInput = () => {};
   if (tui || display) {
-    readlineCore.emitKeypressEvents(stdin);
     renderLiveInput = () => {
       if (!tui || isReadlineClosed()) return;
       const lineNow = String(rl.line || "");
@@ -1661,9 +1814,9 @@ async function main() {
       const stableLine = cleanedLineNow;
       const cursorNow = Number.isFinite(rl.cursor) ? Math.max(0, Math.floor(rl.cursor)) : lineNow.length;
       const safeCursor = Math.min(cursorNow, stableLine.length);
-      const inputNow = `${multilineBufferRef.value}${stableLine}`;
+      const inputNow = stableLine;
       currentInputRef.value = inputNow;
-      tui.renderInput(inputNow, multilineBufferRef.value.length + safeCursor);
+      tui.renderInput(inputNow, safeCursor);
     };
     onKeypress = (str, key = {}) => {
       if (isReadlineClosed()) return;
@@ -1674,7 +1827,7 @@ async function main() {
         safeRlWrite(null, { ctrl: true, name: "u" });
         if (currentLine) safeRlWrite(currentLine);
       }
-      const emptyInput = currentLine.trim().length === 0 && !multilineBufferRef.value.trim();
+      const emptyInput = currentLine.trim().length === 0;
 
       if (exitArmedRef.value && (!emptyInput || (key.name && key.name !== "d"))) {
         exitArmedRef.value = false;
@@ -1686,6 +1839,14 @@ async function main() {
           clearTimeout(escAbortTimer);
           escAbortTimer = null;
         }
+      }
+
+      if (isMultilineShortcut(str, key)) {
+        // Insert a newline at cursor without submitting.
+        safeRlWrite("\n");
+        currentInputRef.value = String(rl.line || "");
+        if (tui) tui.renderInput(currentInputRef.value);
+        return;
       }
 
       if (tui) {
@@ -1713,8 +1874,6 @@ async function main() {
         }
         if (key.ctrl && key.name === "c") {
           exitArmedRef.value = false;
-          multilineBufferRef.value = "";
-          multilineCommitRef.value = false;
           suppressNextSubmitRef.value = false;
           pendingCommandSubmitRef.value = "";
           modelPickerRef.active = false;
@@ -1780,8 +1939,7 @@ async function main() {
           (key.name === "up" || key.name === "down") &&
           !modelPickerRef.active &&
           !commandPickerRef.active &&
-          currentLine.trim().length === 0 &&
-          !multilineBufferRef.value.trim()
+          currentLine.trim().length === 0
         ) {
           tui.scrollLines(key.name === "up" ? 1 : -1);
           return;
@@ -1915,16 +2073,6 @@ async function main() {
           }
         }
 
-        if (isMultilineShortcut(str, key)) {
-          multilineBufferRef.value = `${multilineBufferRef.value}${currentLine}\n`;
-          multilineCommitRef.value = true;
-          // Clear current readline line so Shift+Enter does not submit content.
-          safeRlWrite(null, { ctrl: true, name: "u" });
-          currentInputRef.value = multilineBufferRef.value;
-          tui.renderInput(currentInputRef.value);
-          return;
-        }
-
         setImmediate(renderLiveInput);
       }
 
@@ -1944,7 +2092,7 @@ async function main() {
         display.showSuggestions(suggestions);
       }
     };
-    stdin.on("keypress", onKeypress);
+    keypressSource.on("keypress", onKeypress);
   }
   if (tui) {
     let mouseRemainder = "";
@@ -1963,7 +2111,7 @@ async function main() {
       if (!Array.isArray(parsed.deltas) || parsed.deltas.length === 0) return;
       for (const delta of parsed.deltas) tui.scrollLines(delta);
     };
-    stdin.on("data", onMouseData);
+    filteredInput.on("data", onMouseData);
   }
 
   const switchModel = async (modelId) => {
@@ -2065,7 +2213,7 @@ async function main() {
       const compactPrompt = q.replace(/\s+/g, " ").trim();
       approvalActiveRef.value = true;
       tui.setApprovalPrompt(compactPrompt, defaultYes);
-      const approved = await waitForTuiApproval({ stdinStream: stdin, defaultYes });
+      const approved = await waitForTuiApproval({ stdinStream: keypressSource, defaultYes });
       approvalActiveRef.value = false;
       tui.clearApprovalPrompt();
       tui.render(currentInputRef.value, "approval handled");
@@ -2363,8 +2511,6 @@ async function main() {
         message.includes("SIGINT") ||
         message.includes("The operation was aborted");
       if (isSigint) {
-        multilineBufferRef.value = "";
-        multilineCommitRef.value = false;
         suppressNextSubmitRef.value = false;
         pendingCommandSubmitRef.value = "";
         modelPickerRef.active = false;
@@ -2392,7 +2538,7 @@ async function main() {
       if (!isInputAbort) throw err;
 
       if (tui) {
-        if (!exitArmedRef.value && String(rl.line || "").trim().length === 0 && !multilineBufferRef.value.trim()) {
+        if (!exitArmedRef.value && String(rl.line || "").trim().length === 0) {
           exitArmedRef.value = true;
           tui.setInputHint("Press CTRL+D again to exit.");
           const prevHistory = Array.isArray(rl.history) ? [...rl.history] : [];
@@ -2420,15 +2566,7 @@ async function main() {
       }
     }
 
-    if (multilineCommitRef.value) {
-      multilineCommitRef.value = false;
-      currentInputRef.value = multilineBufferRef.value;
-      if (tui) tui.renderInput(currentInputRef.value);
-      continue;
-    }
-
-    const combinedInput = `${multilineBufferRef.value}${rawInput}`;
-    multilineBufferRef.value = "";
+    const combinedInput = `${rawInput}`;
     const finalInput = stripMouseInputNoise(combinedInput).trim();
     if (!finalInput) continue;
     if (display) display.clearSuggestions();
@@ -2448,7 +2586,7 @@ async function main() {
         status: shellResult?.ok ? "done" : "error",
         error: shellResult?.ok ? "" : String(shellResult?.error || ""),
       });
-      if (saved) logLine(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
+      if (saved) logLine(`[trace] session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
       continue;
     }
     const isSlash = finalInput.startsWith("/");
@@ -2496,7 +2634,7 @@ async function main() {
     const localTask = maybeHandleLocalInfoTask(finalInput, { logLine, tui, display });
     if (localTask.handled) {
       const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done" });
-      if (saved) logLine(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
+      if (saved) logLine(`[trace] session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
       if (display) display.clearSuggestions();
       currentInputRef.value = "";
       continue;
@@ -2510,7 +2648,7 @@ async function main() {
         status: turnResult?.ok ? "done" : turnResult?.aborted ? "aborted" : "error",
         error: turnResult?.ok ? "" : String(turnResult?.error || ""),
       });
-      if (saved) logLine(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
+      if (saved) logLine(`[trace] session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
     } finally {
       taskRunningRef.value = false;
       escAbortArmedRef.value = false;
@@ -2539,9 +2677,13 @@ async function main() {
   try {
     await saveHistory(historyFile, rl.history);
   } finally {
-    if (onKeypress) stdin.off("keypress", onKeypress);
+    if (onKeypress && keypressSource && typeof keypressSource.off === "function") {
+      keypressSource.off("keypress", onKeypress);
+    }
     if (escAbortTimer) clearTimeout(escAbortTimer);
-    if (onMouseData) stdin.off("data", onMouseData);
+    if (onMouseData) filteredInput.off("data", onMouseData);
+    stdin.unpipe(stdinFilter);
+    destroyKeypressSource();
     if (onResize) {
       stdout.off("resize", onResize);
       process.off("SIGWINCH", onResize);
