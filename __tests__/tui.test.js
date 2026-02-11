@@ -141,6 +141,26 @@ describe("tui usability", () => {
     expect(lastWrite).toContain(`\x1b[${tui.lastInputRow};`);
   });
 
+  test("cursor anchor remains on prompt row across repeated renders", () => {
+    const out = createOut(80, 22);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+    tui.start();
+    for (let i = 0; i < 3; i += 1) {
+      tui.toggleTodoPanel();
+      tui.toggleTodoPanel();
+      tui.render("", "waiting for input");
+      tui.renderInput("", 0);
+      const lastWrite = out.writes[out.writes.length - 1] || "";
+      expect(lastWrite).toContain(`\x1b[${tui.lastInputRow};4H`);
+    }
+  });
+
   test("input hint renders below prompt without moving cursor off input row", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({

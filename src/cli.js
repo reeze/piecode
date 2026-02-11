@@ -227,7 +227,7 @@ async function saveHistory(filePath, history) {
 }
 
 function printHelp() {
-  console.log(`Pie Code - CLI coding agent
+  console.log(`Pie Code - Coding agent
 
 Usage:
   piecode
@@ -873,30 +873,10 @@ function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
     const left = Math.max(0, Math.floor((width - clipped.length) / 2));
     return `${" ".repeat(left)}${clipped}`;
   };
-  const centerInWidth = (text, targetWidth) => {
-    const raw = String(text || "");
-    const w = Math.max(1, Number(targetWidth) || 1);
-    if (raw.length >= w) return raw.slice(0, w);
-    const left = Math.floor((w - raw.length) / 2);
-    const right = w - raw.length - left;
-    return `${" ".repeat(left)}${raw}${" ".repeat(right)}`;
-  };
   const shortWorkspace = workspaceDir.length > 64 ? `...${workspaceDir.slice(-61)}` : workspaceDir;
-  const titleMain = "Pie Code";
-  const titleSlogan = "simple like pie";
-  const titleText = `${titleMain} ${titleSlogan}`;
-  const preferredInner = Math.max(titleText.length + 8, 34);
-  // Keep extra horizontal safety padding so ANSI color codes and terminal quirks
-  // do not visually clip the right border in some terminals.
-  const maxInner = Math.max(16, width - 12);
-  const innerWidth = Math.min(preferredInner, maxInner);
-  const titleTop = `┌${"─".repeat(innerWidth)}┐`;
-  const titleMid = `│${centerInWidth(`  ${titleMain} ${titleSlogan}  `, innerWidth)}│`;
-  const titleBottom = `└${"─".repeat(innerWidth)}┘`;
   const logoLines = [
-    `[banner-title-box] ${center(titleTop)}`,
-    `[banner-title-mid] ${center(titleMid)}`,
-    `[banner-title-box] ${center(titleBottom)}`,
+    `[banner-title] ${center(" Pie Code ")}`,
+    `[banner-slogan] ${center("simple like pie")}`,
     `[banner-meta] ${center(`model: ${formatProviderModel(provider)}`)}`,
     `[banner-meta] ${center(`workspace: ${shortWorkspace}`)}`,
     `[banner-hint] ${center("keys: CTRL+L logs | CTRL+O llm i/o | CTRL+T todos")}`,

@@ -574,7 +574,7 @@ export class SimpleTui {
   formatTimelineLines(line) {
     if (!line) return [];
     if (line.startsWith("[task] ")) {
-      return [color(`◆ Task: ${line.slice(7).trim()}`, "1;37")];
+      return [color(` ◆ Task: ${line.slice(7).trim()} `, "1;30;47")];
     }
     if (line.startsWith("[model] ")) {
       return [];
@@ -645,16 +645,6 @@ export class SimpleTui {
       if (!title) return [color(raw, "1;92")];
       const leftPad = Math.max(0, raw.indexOf(title));
       return [`${" ".repeat(leftPad)}${color(` ${title} `, "1;30;42")}`];
-    }
-    if (line.startsWith("[banner-title-box] ")) {
-      return [color(line.slice(19), "1;92")];
-    }
-    if (line.startsWith("[banner-title-mid] ")) {
-      const raw = String(line.slice(19) || "");
-      let rendered = raw.replace(/[│┌┐└┘─]/g, (ch) => color(ch, "1;92"));
-      rendered = rendered.replace("Pie Code", color("Pie Code", "1;92"));
-      rendered = rendered.replace("simple like pie", color("simple like pie", "2;37"));
-      return [rendered];
     }
     if (line.startsWith("[banner-slogan] ")) {
       return [color(line.slice(16), "2;37")];
@@ -737,7 +727,7 @@ export class SimpleTui {
     const promptPrefix = ` ${promptGlyph} `;
     const cursorCol = Math.max(
       1,
-      Math.min(width, 1 + stringDisplayWidth(promptPrefix) + stringDisplayWidth(shownCursorText))
+      Math.min(Math.max(1, width), 1 + stringDisplayWidth(promptPrefix) + stringDisplayWidth(shownCursorText))
     );
     return { line, cursorCol };
   }
@@ -745,7 +735,8 @@ export class SimpleTui {
   renderInput(input = "", cursorIndex = null) {
     if (!this.active || !this.lastInputRow || !this.lastFrameLineCount) return;
     this.currentInput = String(input || "");
-    const width = Math.max(40, this.out.columns || 100);
+    const termWidth = Math.max(40, this.out.columns || 100);
+    const width = Math.max(20, termWidth - 1);
     const { line: inputLine, cursorCol } = this.buildInputState(input, width, cursorIndex);
     if (inputLine === this.lastInputLine) {
       this.out.write(`\x1b[?25h\x1b[${this.lastInputRow};${cursorCol}H`);
@@ -789,7 +780,8 @@ export class SimpleTui {
     if (!this.active) return;
     this.currentInput = String(input || "");
 
-    const width = Math.max(40, this.out.columns || 100);
+    const termWidth = Math.max(40, this.out.columns || 100);
+    const width = Math.max(20, termWidth - 1);
     const height = Math.max(16, this.out.rows || 30);
     const sep = `\x1b[90m${"─".repeat(width)}\x1b[0m`;
     const errorLine = this.lastError ? truncateLine(` error: ${this.lastError}`, width) : "";
