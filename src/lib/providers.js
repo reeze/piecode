@@ -15,6 +15,10 @@ const DEFAULT_CODEX_MODEL = process.env.CODEX_MODEL || "gpt-5.3-codex";
 const DEFAULT_SEED_MODEL = process.env.SEED_MODEL || "doubao-seed-code-preview-latest";
 const DEFAULT_SEED_BASE_URL =
   process.env.SEED_BASE_URL || "https://ark.cn-beijing.volces.com/api/coding";
+const DEFAULT_MODEL_TIMEOUT_MS = Math.max(
+  5_000,
+  Number.parseInt(process.env.PIECODE_MODEL_TIMEOUT_MS || "120000", 10) || 120_000
+);
 const execFile = promisify(execFileCb);
 
 function requireEnv(name) {
@@ -25,15 +29,45 @@ function requireEnv(name) {
   return value;
 }
 
-async function postJson(url, headers, body) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: {
-      "content-type": "application/json",
-      ...headers,
-    },
-    body: JSON.stringify(body),
-  });
+async function postJson(url, headers, body, options = {}) {
+  const controller = new AbortController();
+  const externalSignal = options?.signal;
+  let abortListener = null;
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    abortListener = () => controller.abort();
+    externalSignal.addEventListener("abort", abortListener, { once: true });
+  }
+  const timeout = setTimeout(() => controller.abort(), DEFAULT_MODEL_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...headers,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      if (externalSignal?.aborted) {
+        const abortErr = new Error("Model request aborted.");
+        abortErr.code = "ABORT_ERR";
+        throw abortErr;
+      }
+      throw new Error(`Model request timed out after ${DEFAULT_MODEL_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  } finally {
+    clearTimeout(timeout);
+    if (externalSignal && abortListener) {
+      try {
+        externalSignal.removeEventListener("abort", abortListener);
+      } catch {}
+    }
+  }
 
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -43,6 +77,103 @@ async function postJson(url, headers, body) {
     throw err;
   }
   return data;
+}
+
+async function postJsonStream(url, headers, body, onChunk, options = {}) {
+  const controller = new AbortController();
+  const externalSignal = options?.signal;
+  let abortListener = null;
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    abortListener = () => controller.abort();
+    externalSignal.addEventListener("abort", abortListener, { once: true });
+  }
+  const timeout = setTimeout(() => controller.abort(), DEFAULT_MODEL_TIMEOUT_MS);
+  let res;
+  try {
+    res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        ...headers,
+      },
+      body: JSON.stringify(body),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    if (err?.name === "AbortError") {
+      if (externalSignal?.aborted) {
+        const abortErr = new Error("Model stream aborted.");
+        abortErr.code = "ABORT_ERR";
+        throw abortErr;
+      }
+      throw new Error(`Model stream timed out after ${DEFAULT_MODEL_TIMEOUT_MS}ms`);
+    }
+    throw err;
+  }
+  try {
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      const err = new Error(`Model API error (${res.status}): ${JSON.stringify(data)}`);
+      err.status = res.status;
+      err.data = data;
+      throw err;
+    }
+
+    if (!res.body) return "";
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+    let combined = "";
+
+    while (true) {
+      let packet;
+      try {
+        packet = await reader.read();
+      } catch (err) {
+        if (err?.name === "AbortError") {
+          if (externalSignal?.aborted) {
+            const abortErr = new Error("Model stream aborted.");
+            abortErr.code = "ABORT_ERR";
+            throw abortErr;
+          }
+          throw new Error(`Model stream timed out after ${DEFAULT_MODEL_TIMEOUT_MS}ms`);
+        }
+        throw err;
+      }
+      const { done, value } = packet;
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+      const lines = buffer.split("\n");
+      buffer = lines.pop() || "";
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line.startsWith("data:")) continue;
+        const data = line.slice(5).trim();
+        if (!data || data === "[DONE]") continue;
+        try {
+          const parsed = JSON.parse(data);
+          const delta = parsed?.choices?.[0]?.delta?.content;
+          if (typeof delta === "string" && delta.length > 0) {
+            combined += delta;
+            onChunk?.(delta);
+          }
+        } catch {
+          // Ignore malformed event chunks and continue.
+        }
+      }
+    }
+
+    return combined.trim();
+  } finally {
+    clearTimeout(timeout);
+    if (externalSignal && abortListener) {
+      try {
+        externalSignal.removeEventListener("abort", abortListener);
+      } catch {}
+    }
+  }
 }
 
 function readJsonFile(filePath) {
@@ -140,21 +271,61 @@ function createOpenAICompatibleProvider({ kind, model, apiKey, baseUrl, extraHea
   return {
     kind,
     model,
-    async complete({ systemPrompt, prompt }) {
+    supportsNativeTools: true,
+    async complete({ systemPrompt, prompt, messages, tools, signal }) {
+      const useNative = Array.isArray(messages) && Array.isArray(tools);
+      const body = useNative
+        ? {
+            model,
+            temperature: 0.2,
+            messages: [{ role: "system", content: systemPrompt }, ...messages],
+            tools,
+          }
+        : {
+            model,
+            temperature: 0.2,
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: prompt },
+            ],
+          };
       const data = await postJson(
+        chatUrl,
+        { Authorization: `Bearer ${apiKey}`, ...extraHeaders },
+        body,
+        { signal }
+      );
+      if (useNative) {
+        const msg = data?.choices?.[0]?.message;
+        if (!msg) throw new Error("OpenAI-compatible response did not contain message.");
+        return { type: "native", format: "openai", message: msg, finishReason: data?.choices?.[0]?.finish_reason };
+      }
+      const text = data?.choices?.[0]?.message?.content;
+      if (!text) throw new Error("OpenAI-compatible response did not contain message content.");
+      return text;
+    },
+    async completeStream({ systemPrompt, prompt, messages, tools, onDelta, signal }) {
+      // For native tool calling, fall back to non-streaming complete() since
+      // streaming tool_calls requires accumulating delta fragments.
+      if (Array.isArray(messages) && Array.isArray(tools)) {
+        return this.complete({ systemPrompt, prompt, messages, tools, signal });
+      }
+      const text = await postJsonStream(
         chatUrl,
         { Authorization: `Bearer ${apiKey}`, ...extraHeaders },
         {
           model,
           temperature: 0.2,
+          stream: true,
           messages: [
             { role: "system", content: systemPrompt },
             { role: "user", content: prompt },
           ],
-        }
+        },
+        onDelta,
+        { signal }
       );
-      const text = data?.choices?.[0]?.message?.content;
-      if (!text) throw new Error("OpenAI-compatible response did not contain message content.");
+      if (!text) throw new Error("OpenAI-compatible stream did not contain message content.");
       return text;
     },
   };
@@ -193,11 +364,17 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
   return {
     kind: "seed-openai-compatible",
     model: resolvedModel,
-    async complete({ systemPrompt, prompt }) {
+    supportsNativeTools: true,
+    async completeStream({ systemPrompt, prompt, messages, tools, onDelta, signal }) {
+      // For native tool calling, fall back to non-streaming
+      if (Array.isArray(messages) && Array.isArray(tools)) {
+        return this.complete({ systemPrompt, prompt, messages, tools, signal });
+      }
       const chatUrls = buildSeedChatUrls(resolvedBase);
       const openaiBody = {
         model: resolvedModel,
         temperature: 0.2,
+        stream: true,
         messages: [
           { role: "system", content: systemPrompt },
           { role: "user", content: prompt },
@@ -207,7 +384,56 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
       let lastErr = null;
       for (const url of chatUrls) {
         try {
-          const data = await postJson(url, { Authorization: `Bearer ${apiKey}` }, openaiBody);
+          const text = await postJsonStream(
+            url,
+            { Authorization: `Bearer ${apiKey}` },
+            openaiBody,
+            onDelta,
+            { signal }
+          );
+          if (text) return text;
+        } catch (err) {
+          lastErr = err;
+          if (err?.status !== 404) {
+            break;
+          }
+        }
+      }
+
+      // Fall back to non-stream mode when streaming is unavailable upstream.
+      return this.complete({ systemPrompt, prompt, signal }).catch((err) => {
+        throw new Error(
+          `Seed stream failed. Last stream error: ${lastErr?.message || "unknown"}. Fallback error: ${err?.message || "unknown"}`
+        );
+      });
+    },
+    async complete({ systemPrompt, prompt, messages, tools, signal }) {
+      const useNative = Array.isArray(messages) && Array.isArray(tools);
+      const chatUrls = buildSeedChatUrls(resolvedBase);
+      const openaiBody = useNative
+        ? {
+            model: resolvedModel,
+            temperature: 0.2,
+            messages: [{ role: "system", content: systemPrompt }, ...messages],
+            tools,
+          }
+        : {
+            model: resolvedModel,
+            temperature: 0.2,
+            messages: [
+              { role: "system", content: systemPrompt },
+              { role: "user", content: prompt },
+            ],
+          };
+
+      let lastErr = null;
+      for (const url of chatUrls) {
+        try {
+          const data = await postJson(url, { Authorization: `Bearer ${apiKey}` }, openaiBody, { signal });
+          if (useNative) {
+            const msg = data?.choices?.[0]?.message;
+            if (msg) return { type: "native", format: "openai", message: msg, finishReason: data?.choices?.[0]?.finish_reason };
+          }
           const text = data?.choices?.[0]?.message?.content;
           if (text) return text;
         } catch (err) {
@@ -233,7 +459,7 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
 
       for (const headers of anthHeaders) {
         try {
-          const data = await postJson(anthropicUrl, headers, anthropicBody);
+          const data = await postJson(anthropicUrl, headers, anthropicBody, { signal });
           const text = extractAnthropicText(data);
           if (text) return text;
         } catch (err) {
@@ -275,7 +501,8 @@ function createCodexCliProvider(customModel = null) {
   return {
     kind: "codex-cli-session",
     model,
-    async complete({ systemPrompt, prompt }) {
+    supportsNativeTools: false,
+    async complete({ systemPrompt, prompt, signal }) {
       const tmpFile = path.join(
         os.tmpdir(),
         `piecode-last-message-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`
@@ -298,6 +525,7 @@ function createCodexCliProvider(customModel = null) {
         const { stdout } = await execFile("codex", args, {
           maxBuffer: 1024 * 1024 * 8,
           timeout: 120_000,
+          signal,
           env: {
             ...process.env,
             OTEL_SDK_DISABLED: "true",
@@ -330,7 +558,8 @@ function createCodexTokenProvider({ configuredModel, configuredBaseUrl, codexAut
   return {
     kind: "codex-auth-token",
     model: configuredModel || codexAuth.model,
-    async complete({ systemPrompt, prompt }) {
+    supportsNativeTools: true,
+    async complete({ systemPrompt, prompt, signal }) {
       const base = (
         configuredBaseUrl ||
         process.env.OPENAI_BASE_URL ||
@@ -346,7 +575,8 @@ function createCodexTokenProvider({ configuredModel, configuredBaseUrl, codexAut
               { role: "system", content: [{ type: "input_text", text: systemPrompt }] },
               { role: "user", content: [{ type: "input_text", text: prompt }] },
             ],
-          }
+          },
+          { signal }
         );
 
         const text = extractResponsesText(data);
@@ -369,7 +599,8 @@ function createCodexTokenProvider({ configuredModel, configuredBaseUrl, codexAut
                 { role: "system", content: systemPrompt },
                 { role: "user", content: prompt },
               ],
-            }
+            },
+            { signal }
           );
           const text = data?.choices?.[0]?.message?.content;
           if (!text) throw new Error("Codex token fallback did not return chat message content.");
@@ -380,6 +611,51 @@ function createCodexTokenProvider({ configuredModel, configuredBaseUrl, codexAut
           );
         }
       }
+    },
+  };
+}
+
+function createAnthropicProvider({ apiKey, model }) {
+  return {
+    kind: "anthropic",
+    model,
+    supportsNativeTools: true,
+    async complete({ systemPrompt, prompt, messages, tools, signal }) {
+      const useNative = Array.isArray(messages) && Array.isArray(tools);
+      const body = useNative
+        ? {
+            model,
+            max_tokens: 4096,
+            system: systemPrompt,
+            messages,
+            tools,
+          }
+        : {
+            model,
+            max_tokens: 1600,
+            system: systemPrompt,
+            messages: [{ role: "user", content: prompt }],
+          };
+      const data = await postJson(
+        "https://api.anthropic.com/v1/messages",
+        {
+          "x-api-key": apiKey,
+          "anthropic-version": "2023-06-01",
+        },
+        body,
+        { signal }
+      );
+      if (useNative) {
+        return {
+          type: "native",
+          format: "anthropic",
+          content: Array.isArray(data?.content) ? data.content : [],
+          stopReason: data?.stop_reason || "",
+        };
+      }
+      const text = data?.content?.find((c) => c?.type === "text")?.text;
+      if (!text) throw new Error("Anthropic response did not contain text content.");
+      return text;
     },
   };
 }
@@ -399,29 +675,10 @@ export function getProvider(options = {}) {
     const provider = options.provider.toLowerCase();
 
     if (provider === "anthropic" && options.apiKey) {
-      return {
-        kind: "anthropic",
+      return createAnthropicProvider({
+        apiKey: options.apiKey,
         model: options.model || process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_MODEL,
-        async complete({ systemPrompt, prompt }) {
-          const data = await postJson(
-            "https://api.anthropic.com/v1/messages",
-            {
-              "x-api-key": options.apiKey,
-              "anthropic-version": "2023-06-01",
-            },
-            {
-              model: options.model || process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_MODEL,
-              max_tokens: 1600,
-              system: systemPrompt,
-              messages: [{ role: "user", content: prompt }],
-            }
-          );
-
-          const text = data?.content?.find((c) => c?.type === "text")?.text;
-          if (!text) throw new Error("Anthropic response did not contain text content.");
-          return text;
-        },
-      };
+      });
     }
 
     if (provider === "openai" && configuredApiKey) {
@@ -504,30 +761,10 @@ export function getProvider(options = {}) {
 
   // Environment variables (original behavior)
   if (process.env.ANTHROPIC_API_KEY) {
-    return {
-      kind: "anthropic",
-      model: configuredModel || DEFAULT_ANTHROPIC_MODEL,
-      async complete({ systemPrompt, prompt }) {
-        const apiKey = requireEnv("ANTHROPIC_API_KEY");
-        const data = await postJson(
-          "https://api.anthropic.com/v1/messages",
-          {
-            "x-api-key": apiKey,
-            "anthropic-version": "2023-06-01",
-          },
-          {
-            model: configuredModel || process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_MODEL,
-            max_tokens: 1600,
-            system: systemPrompt,
-            messages: [{ role: "user", content: prompt }],
-          }
-        );
-
-        const text = data?.content?.find((c) => c?.type === "text")?.text;
-        if (!text) throw new Error("Anthropic response did not contain text content.");
-        return text;
-      },
-    };
+    return createAnthropicProvider({
+      apiKey: requireEnv("ANTHROPIC_API_KEY"),
+      model: configuredModel || process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_MODEL,
+    });
   }
 
   if (process.env.OPENAI_API_KEY) {

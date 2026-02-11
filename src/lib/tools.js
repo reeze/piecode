@@ -4,6 +4,8 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 const exec = promisify(execCb);
+const SHELL_INLINE_MAX_CHARS = 12000;
+const SHELL_PREVIEW_CHARS = 1800;
 
 const SAFE_COMMANDS = new Set([
   "ls",
@@ -121,8 +123,59 @@ function normalizeTodoItems(items) {
   return out;
 }
 
+function truncatePreview(text, maxChars) {
+  const source = String(text || "");
+  if (source.length <= maxChars) return source;
+  return `${source.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+async function formatShellResult({
+  workspaceDir,
+  command,
+  exitCodeLabel,
+  errorMessage = "",
+  stdout = "",
+  stderr = "",
+}) {
+  const payload = [
+    exitCodeLabel,
+    errorMessage ? `error: ${errorMessage}` : null,
+    `stdout:\n${stdout || "<empty>"}`,
+    `stderr:\n${stderr || "<empty>"}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+
+  if (payload.length <= SHELL_INLINE_MAX_CHARS) {
+    return payload;
+  }
+
+  const dir = path.join(workspaceDir, ".piecode", "shell");
+  await fs.mkdir(dir, { recursive: true });
+  const stamp = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const relPath = path.join(".piecode", "shell", `result-${stamp}.txt`);
+  const absPath = path.join(workspaceDir, relPath);
+  await fs.writeFile(absPath, payload, "utf8");
+
+  const stdoutPreview = truncatePreview(stdout || "<empty>", SHELL_PREVIEW_CHARS);
+  const stderrPreview = truncatePreview(stderr || "<empty>", Math.floor(SHELL_PREVIEW_CHARS / 2));
+  return [
+    `${exitCodeLabel}`,
+    errorMessage ? `error: ${errorMessage}` : null,
+    `Result too long (chars: ${payload.length}). Full output saved to ${relPath}`,
+    `stdout preview:\n${stdoutPreview || "<empty>"}`,
+    `stderr preview:\n${stderrPreview || "<empty>"}`,
+    "Next step suggestion:",
+    `- use read_file with path \"${relPath}\"`,
+    `- or run targeted grep/rg on that file for specific sections`,
+    `- original command: ${command}`,
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
 export function createToolset({ workspaceDir, autoApproveRef, askApproval, onToolStart, onTodoWrite }) {
-  const runShell = async ({ command, timeout = 300000, maxBuffer = 10 * 1024 * 1024 }) => {
+  const runShell = async ({ command, timeout = 300000, maxBuffer = 10 * 1024 * 1024 }, ctx = {}) => {
     if (!command || typeof command !== "string") {
       throw new Error("shell tool requires { command: string }");
     }
@@ -150,19 +203,27 @@ export function createToolset({ workspaceDir, autoApproveRef, askApproval, onToo
         cwd: workspaceDir,
         timeout,
         maxBuffer,
+        signal: ctx?.signal,
       });
-      return [
-        "exit_code: 0",
-        `stdout:\n${stdout || "<empty>"}`,
-        `stderr:\n${stderr || "<empty>"}`,
-      ].join("\n\n");
+      return formatShellResult({
+        workspaceDir,
+        command,
+        exitCodeLabel: "exit_code: 0",
+        stdout,
+        stderr,
+      });
     } catch (err) {
-      return [
-        "exit_code: non-zero",
-        `error: ${err.message}`,
-        `stdout:\n${err.stdout || "<empty>"}`,
-        `stderr:\n${err.stderr || "<empty>"}`,
-      ].join("\n\n");
+      if (err?.code === "ABORT_ERR" || err?.name === "AbortError") {
+        throw err;
+      }
+      return formatShellResult({
+        workspaceDir,
+        command,
+        exitCodeLabel: "exit_code: non-zero",
+        errorMessage: err.message,
+        stdout: err.stdout || "",
+        stderr: err.stderr || "",
+      });
     }
   };
 

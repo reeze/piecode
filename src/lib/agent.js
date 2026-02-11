@@ -1,5 +1,5 @@
 import { createToolset } from "./tools.js";
-import { buildSystemPrompt, formatHistory, parseModelAction } from "./prompt.js";
+import { buildSystemPrompt, formatHistory, parseModelAction, buildToolDefinitions, buildMessages, parseNativeResponse } from "./prompt.js";
 import { TaskPlanner, TaskExecutor } from "./taskPlanner.js";
 
 export class Agent {
@@ -30,7 +30,7 @@ export class Agent {
     });
     this.enablePlanner = process.env.PIECODE_ENABLE_PLANNER === "1";
     this.taskPlanner = this.enablePlanner ? new TaskPlanner(this) : null;
-    this.planFirstEnabled = process.env.PIECODE_PLAN_FIRST !== "0";
+    this.planFirstEnabled = process.env.PIECODE_PLAN_FIRST === "1";
     this.defaultToolBudget = Math.max(
       1,
       Math.min(12, Number.parseInt(process.env.PIECODE_TOOL_BUDGET || "6", 10) || 6)
@@ -39,10 +39,109 @@ export class Agent {
       5,
       Number.parseInt(process.env.PIECODE_ITERATION_CHECKPOINT || "20", 10) || 20
     );
+    this.activeAbortController = null;
   }
 
   clearHistory() {
     this.history = [];
+  }
+
+  requestAbort() {
+    if (this.activeAbortController && !this.activeAbortController.signal.aborted) {
+      this.activeAbortController.abort();
+      return true;
+    }
+    return false;
+  }
+
+  throwIfAborted(signal) {
+    if (signal?.aborted) {
+      const err = new Error("Task aborted by user.");
+      err.code = "TASK_ABORTED";
+      throw err;
+    }
+  }
+
+  async compactHistory({ preserveRecent = 12 } = {}) {
+    const keep = Math.max(2, Number.parseInt(String(preserveRecent), 10) || 12);
+    if (this.history.length <= keep) {
+      return {
+        compacted: false,
+        beforeMessages: this.history.length,
+        afterMessages: this.history.length,
+        removedMessages: 0,
+        summary: "Not enough context to compact.",
+      };
+    }
+
+    const cutoff = Math.max(1, this.history.length - keep);
+    const older = this.history.slice(0, cutoff);
+    const recent = this.history.slice(cutoff);
+    const olderText = formatHistory(older).slice(0, 24000);
+    const fallbackSummary = this.buildFallbackCompactionSummary(older);
+
+    const compactPrompt = [
+      "Summarize this conversation history for future coding turns.",
+      "Keep only concrete facts, decisions, constraints, and unresolved items.",
+      "Output concise plain text bullets (max 8 lines).",
+      "",
+      olderText,
+    ].join("\n");
+
+    let summary = fallbackSummary;
+    try {
+      this.onEvent?.({
+        type: "llm_request",
+        stage: "planning",
+        payload: `SYSTEM:\nContext compaction\n\nUSER:\n${compactPrompt}`,
+      });
+      const raw = await this.provider.complete({
+        systemPrompt: "You compress coding-session memory into concise durable notes.",
+        prompt: compactPrompt,
+      });
+      const text = String(raw || "").trim();
+      if (text) summary = text.slice(0, 4000);
+      this.onEvent?.({ type: "llm_response", stage: "planning", payload: String(raw || "") });
+    } catch {
+      // fall back to deterministic summary without failing user command
+    }
+
+    const summaryMessage = [
+      "[CONTEXT SUMMARY]",
+      summary,
+      "End of summary. Continue from this plus recent turns.",
+    ].join("\n");
+
+    const beforeMessages = this.history.length;
+    this.history = [{ role: "assistant", content: summaryMessage }, ...recent];
+    const afterMessages = this.history.length;
+    return {
+      compacted: true,
+      beforeMessages,
+      afterMessages,
+      removedMessages: Math.max(0, beforeMessages - afterMessages),
+      summary,
+    };
+  }
+
+  buildFallbackCompactionSummary(messages) {
+    const list = Array.isArray(messages) ? messages : [];
+    const lastUser = [...list]
+      .reverse()
+      .find((m) => String(m?.role || "").toLowerCase() === "user");
+    const lastAssistant = [...list]
+      .reverse()
+      .find((m) => String(m?.role || "").toLowerCase() === "assistant");
+    const userText = String(lastUser?.content || "").replace(/\s+/g, " ").trim();
+    const assistantText = String(lastAssistant?.content || "").replace(/\s+/g, " ").trim();
+
+    const lines = [
+      `- Compacted ${list.length} prior messages.`,
+      userText ? `- Last user request: ${userText.slice(0, 220)}` : "",
+      assistantText ? `- Last assistant response: ${assistantText.slice(0, 220)}` : "",
+      "- Keep project instructions and active skills unchanged.",
+    ].filter(Boolean);
+    return lines.join("\n");
   }
 
   getActiveSkills() {
@@ -99,7 +198,7 @@ export class Agent {
     return null;
   }
 
-  async planTurn(userMessage) {
+  async planTurn(userMessage, signal = null) {
     const planSystemPrompt = [
       "You are a planning assistant for a coding agent.",
       "Create a short plan before tool usage.",
@@ -119,7 +218,7 @@ export class Agent {
         stage: "planning",
         payload: `SYSTEM:\n${planSystemPrompt}\n\nUSER:\n${planPrompt}`,
       });
-      const raw = await this.provider.complete({ systemPrompt: planSystemPrompt, prompt: planPrompt });
+      const raw = await this.provider.complete({ systemPrompt: planSystemPrompt, prompt: planPrompt, signal });
       this.onEvent?.({ type: "llm_response", stage: "planning", payload: String(raw || "") });
       const plan = this.parsePlan(raw);
       if (!plan) return null;
@@ -130,7 +229,7 @@ export class Agent {
     }
   }
 
-  async replanTurn({ userMessage, previousPlan, toolCalls }) {
+  async replanTurn({ userMessage, previousPlan, toolCalls, signal = null }) {
     const replanSystemPrompt = [
       "You are replanning a coding task after partial execution.",
       "Output strict JSON only:",
@@ -157,7 +256,7 @@ export class Agent {
         stage: "replanning",
         payload: `SYSTEM:\n${replanSystemPrompt}\n\nUSER:\n${replanPrompt}`,
       });
-      const raw = await this.provider.complete({ systemPrompt: replanSystemPrompt, prompt: replanPrompt });
+      const raw = await this.provider.complete({ systemPrompt: replanSystemPrompt, prompt: replanPrompt, signal });
       this.onEvent?.({ type: "llm_response", stage: "replanning", payload: String(raw || "") });
       const plan = this.parsePlan(raw);
       if (!plan) return null;
@@ -169,151 +268,215 @@ export class Agent {
   }
 
   async runTurn(userMessage) {
+    this.activeAbortController = new AbortController();
+    const signal = this.activeAbortController.signal;
     this.history.push({ role: "user", content: userMessage });
     let activePlan = null;
 
-    if (this.planFirstEnabled && !this.enablePlanner) {
-      activePlan = await this.planTurn(userMessage);
-    }
+    try {
+      this.throwIfAborted(signal);
+      if (this.planFirstEnabled && !this.enablePlanner) {
+        activePlan = await this.planTurn(userMessage, signal);
+      }
 
-    // 首先检查是否需要任务规划
-    const shouldPlan = this.shouldPlanTask(userMessage);
-    if (shouldPlan) {
-      return await this.runPlannedTask(userMessage);
-    }
+      // 首先检查是否需要任务规划
+      const shouldPlan = this.shouldPlanTask(userMessage);
+      if (shouldPlan) {
+        this.throwIfAborted(signal);
+        return await this.runPlannedTask(userMessage);
+      }
 
-    const toolBudget = activePlan?.toolBudget ?? this.defaultToolBudget;
-    let toolCalls = 0;
-    let budget = toolBudget;
-    let didReplan = false;
+      const toolBudget = activePlan?.toolBudget ?? this.defaultToolBudget;
+      let toolCalls = 0;
+      let budget = toolBudget;
+      let didReplan = false;
 
-    // 对于简单任务，使用原有的循环方式
-    let i = 0;
-    while (true) {
-      i += 1;
-      if (i % this.iterationCheckpoint === 0) {
-        const shouldContinue = await this.askApproval(
-          `The agent has run ${i} model iterations in this turn. Continue? [Y/n]: `
-        );
-        if (!shouldContinue) {
-          const msg = `Stopped after ${i} iterations by user choice.`;
+      // 对于简单任务，使用原有的循环方式
+      let i = 0;
+      while (true) {
+        this.throwIfAborted(signal);
+        i += 1;
+        if (i % this.iterationCheckpoint === 0) {
+          const shouldContinue = await this.askApproval(
+            `The agent has run ${i} model iterations in this turn. Continue? [Y/n]: `
+          );
+          if (!shouldContinue) {
+            const msg = `Stopped after ${i} iterations by user choice.`;
+            this.history.push({ role: "assistant", content: msg });
+            return msg;
+          }
+        }
+
+        const useNativeTools = this.provider.supportsNativeTools === true;
+        const nativeFormat = this.provider.kind === "anthropic" ? "anthropic" : "openai";
+
+        const systemPrompt = buildSystemPrompt({
+          workspaceDir: this.workspaceDir,
+          autoApprove: this.autoApproveRef.value,
+          activeSkills: this.getActiveSkills(),
+          activePlan,
+          projectInstructions: this.projectInstructionsRef?.value || null,
+          nativeTools: useNativeTools,
+        });
+
+        this.onEvent?.({ type: "model_call", provider: this.provider.kind, model: this.provider.model });
+
+        let action;
+        if (useNativeTools) {
+          const messages = buildMessages(this.history, { format: nativeFormat });
+          const tools = buildToolDefinitions(nativeFormat);
+          this.onEvent?.({
+            type: "llm_request",
+            stage: "turn",
+            payload: `SYSTEM:\n${systemPrompt}\n\nMESSAGES: ${messages.length} entries\nTOOLS: ${tools.length} definitions`,
+          });
+          const response =
+            typeof this.provider.completeStream === "function"
+              ? await this.provider.completeStream({
+                  systemPrompt,
+                  messages,
+                  tools,
+                  signal,
+                  onDelta: (delta) =>
+                    this.onEvent?.({ type: "llm_response_delta", stage: "turn", delta: String(delta || "") }),
+                })
+              : await this.provider.complete({ systemPrompt, messages, tools, signal });
+          this.throwIfAborted(signal);
+          this.onEvent?.({ type: "llm_response", stage: "turn", payload: String(JSON.stringify(response) || "") });
+          action = parseNativeResponse(response, nativeFormat);
+        } else {
+          const prompt = formatHistory(this.history);
+          this.onEvent?.({
+            type: "llm_request",
+            stage: "turn",
+            payload: `SYSTEM:\n${systemPrompt}\n\nUSER:\n${prompt}`,
+          });
+          const raw =
+            typeof this.provider.completeStream === "function"
+              ? await this.provider.completeStream({
+                  systemPrompt,
+                  prompt,
+                  signal,
+                  onDelta: (delta) =>
+                    this.onEvent?.({ type: "llm_response_delta", stage: "turn", delta: String(delta || "") }),
+                })
+              : await this.provider.complete({ systemPrompt, prompt, signal });
+          this.throwIfAborted(signal);
+          this.onEvent?.({ type: "llm_response", stage: "turn", payload: String(raw || "") });
+          action = parseModelAction(raw);
+        }
+
+        if (action.type === "final") {
+          this.onEvent?.({ type: "thinking_done" });
+          this.history.push({ role: "assistant", content: action.message });
+          return action.message;
+        }
+
+        if (action.type === "thought") {
+          this.onEvent?.({ type: "thinking_done" });
+          this.onEvent?.({ type: "thought", content: action.content });
+          this.history.push({
+            role: "assistant",
+            content: JSON.stringify({ type: "thought", content: action.content })
+          });
+          continue;
+        }
+
+        const toolFn = this.tools[action.tool];
+        if (!toolFn) {
+          const msg = `Unknown tool: ${action.tool}`;
           this.history.push({ role: "assistant", content: msg });
           return msg;
         }
-      }
 
-      const systemPrompt = buildSystemPrompt({
-        workspaceDir: this.workspaceDir,
-        autoApprove: this.autoApproveRef.value,
-        activeSkills: this.getActiveSkills(),
-        activePlan,
-        projectInstructions: this.projectInstructionsRef?.value || null,
-      });
+        toolCalls += 1;
+        const callId = action._callId || `call_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
 
-      const prompt = formatHistory(this.history);
-      this.onEvent?.({ type: "model_call", provider: this.provider.kind, model: this.provider.model });
-      this.onEvent?.({
-        type: "llm_request",
-        stage: "turn",
-        payload: `SYSTEM:\n${systemPrompt}\n\nUSER:\n${prompt}`,
-      });
-      const raw = await this.provider.complete({ systemPrompt, prompt });
-      this.onEvent?.({ type: "llm_response", stage: "turn", payload: String(raw || "") });
-      const action = parseModelAction(raw);
+        const toolCallMessage = {
+          type: "tool_use",
+          tool: action.tool,
+          input: action.input,
+          reason: action.reason || "",
+          _callId: callId,
+        };
 
-      if (action.type === "final") {
         this.onEvent?.({ type: "thinking_done" });
-        this.history.push({ role: "assistant", content: action.message });
-        return action.message;
-      }
+        this.onEvent?.({
+          type: "tool_use",
+          tool: action.tool,
+          reason: action.reason || "",
+          input: action.input
+        });
 
-      if (action.type === "thought") {
-        this.onEvent?.({ type: "thinking_done" });
-        this.onEvent?.({ type: "thought", content: action.content });
         this.history.push({
           role: "assistant",
-          content: JSON.stringify({ type: "thought", content: action.content })
+          content: JSON.stringify(toolCallMessage),
+          ...(useNativeTools ? { toolCall: { id: callId, name: action.tool, input: action.input } } : {}),
         });
-        continue;
-      }
 
-      const toolFn = this.tools[action.tool];
-      if (!toolFn) {
-        const msg = `Unknown tool: ${action.tool}`;
-        this.history.push({ role: "assistant", content: msg });
-        return msg;
-      }
+        let result;
+        let toolError = null;
+        try {
+          result = await toolFn(action.input || {}, { signal });
+        } catch (err) {
+          if (err?.code === "ABORT_ERR" || err?.name === "AbortError") {
+            const abortErr = new Error("Task aborted by user.");
+            abortErr.code = "TASK_ABORTED";
+            throw abortErr;
+          }
+          result = `Tool error: ${err.message}`;
+          toolError = err.message;
+        }
+        this.throwIfAborted(signal);
 
-      toolCalls += 1;
-
-      const toolCallMessage = {
-        type: "tool_use",
-        tool: action.tool,
-        input: action.input,
-        reason: action.reason || "",
-      };
-
-      this.onEvent?.({ type: "thinking_done" });
-      this.onEvent?.({
-        type: "tool_use",
-        tool: action.tool,
-        reason: action.reason || "",
-        input: action.input
-      });
-
-      this.history.push({
-        role: "assistant",
-        content: JSON.stringify(toolCallMessage)
-      });
-
-      let result;
-      let toolError = null;
-      try {
-        result = await toolFn(action.input || {});
-      } catch (err) {
-        result = `Tool error: ${err.message}`;
-        toolError = err.message;
-      }
-
-      this.onEvent?.({
-        type: "tool_end",
-        tool: action.tool,
-        result: String(result || ""),
-        error: toolError,
-      });
-
-      const toolResultMessage = {
-        type: "tool_result",
-        tool: action.tool,
-        result: result
-      };
-
-      this.history.push({
-        role: "user",
-        content: JSON.stringify(toolResultMessage)
-      });
-
-      if (activePlan && toolCalls >= budget && !didReplan) {
-        const newPlan = await this.replanTurn({
-          userMessage,
-          previousPlan: activePlan,
-          toolCalls,
+        this.onEvent?.({
+          type: "tool_end",
+          tool: action.tool,
+          result: String(result || ""),
+          error: toolError,
         });
-        if (newPlan) {
-          activePlan = newPlan;
-          budget = Math.max(newPlan.toolBudget || budget, budget + 1);
-          didReplan = true;
-          this.onEvent?.({
-            type: "plan_progress",
-            message: `Replanned after ${toolCalls} tools. New budget: ${budget}`,
+
+        const toolResultMessage = {
+          type: "tool_result",
+          tool: action.tool,
+          result: result,
+          _callId: callId,
+        };
+
+        this.history.push({
+          role: "user",
+          content: JSON.stringify(toolResultMessage),
+          ...(useNativeTools ? { toolResult: { toolCallId: callId, name: action.tool, result } } : {}),
+        });
+
+        if (activePlan && toolCalls >= budget && !didReplan) {
+          const newPlan = await this.replanTurn({
+            userMessage,
+            previousPlan: activePlan,
+            toolCalls,
+            signal,
           });
+          if (newPlan) {
+            activePlan = newPlan;
+            budget = Math.max(newPlan.toolBudget || budget, budget + 1);
+            didReplan = true;
+            this.onEvent?.({
+              type: "plan_progress",
+              message: `Replanned after ${toolCalls} tools. New budget: ${budget}`,
+            });
+          }
         }
       }
+    } catch (err) {
+      if (signal?.aborted || err?.code === "ABORT_ERR" || err?.name === "AbortError") {
+        const abortErr = new Error("Task aborted by user.");
+        abortErr.code = "TASK_ABORTED";
+        throw abortErr;
+      }
+      throw err;
+    } finally {
+      this.activeAbortController = null;
     }
-
-    const fallback = "Stopped after max tool iterations for this turn.";
-    this.history.push({ role: "assistant", content: fallback });
-    return fallback;
   }
 
   shouldPlanTask(message) {

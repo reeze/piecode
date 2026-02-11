@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { spawnSync } from "node:child_process";
 import * as readlineCore from "node:readline";
 import { createInterface } from "node:readline/promises";
 import { Writable } from "node:stream";
@@ -20,6 +21,7 @@ import {
 import { createSkillInteractive } from "./lib/skillCreator.js";
 import { SimpleTui } from "./lib/tui.js";
 import { Display } from "./lib/display.js";
+import { consumeMouseWheelDeltas, stripMouseInputNoise } from "./lib/mouse.js";
 
 const HISTORY_MAX = 500;
 const SLASH_COMMANDS = [
@@ -27,7 +29,9 @@ const SLASH_COMMANDS = [
   "/exit",
   "/quit",
   "/clear",
+  "/compact",
   "/approve",
+  "/trace",
   "/model",
   "/skills",
   "/skills list",
@@ -261,7 +265,7 @@ Environment:
   CODEX_MODEL          Optional for codex token mode (default gpt-5.3-codex)
   PIECODE_DISABLE_CODEX_CLI Optional (set 1 to disable codex CLI session backend)
   PIECODE_ENABLE_PLANNER  Optional (set 1 to enable experimental task planner)
-  PIECODE_PLAN_FIRST      Optional (default on; set 0 to disable lightweight pre-plan)
+  PIECODE_PLAN_FIRST      Optional (default off; set 1 to enable lightweight pre-plan)
   PIECODE_TOOL_BUDGET     Optional (default 6, range 1-12)
   PIECODE_SETTINGS_FILE Optional (default ~/.piecode/settings.json)
   PIECODE_SKILLS_DIR Optional (comma-separated skill root directories)
@@ -279,8 +283,10 @@ Slash commands in interactive mode:
   /help                Show commands
   /exit                Quit
   /quit                Quit (alias)
-  /clear               Clear conversation history
+  /clear               Clear all turn context (history + todos)
+  /compact             Compact older context and keep recent turns
   /approve on|off      Toggle shell auto-approval
+  /trace on|off        Toggle runtime trace logs (timings/stages)
   /model               Show active provider/model
                        Tip: use /model codex:gpt-5.3-codex to force Codex provider
   /skills              Show active skills
@@ -292,9 +298,16 @@ Slash commands in interactive mode:
   /skill-creator       Interactive skill creation tool
   /workspace           Return to workspace timeline view
   CTRL+D               Press twice on empty input to exit (TUI mode)
+  CTRL+C               Clear current input (TUI mode)
+  UP/DOWN              Scroll timeline when input is empty (TUI mode)
+  SHIFT+UP/DOWN        Scroll timeline line-by-line (TUI mode)
+  PAGEUP/PAGEDOWN      Scroll timeline by page (TUI mode)
+  HOME/END             Jump to oldest/newest timeline content (TUI mode)
   CTRL+L               Toggle event log panel (TUI mode)
   CTRL+T               Toggle TODO panel (TUI mode)
   CTRL+O               Toggle LLM request/response debug panel (TUI mode)
+  CTRL+A / CTRL+E      Move cursor to start/end of input (TUI mode)
+  ESC (twice)          Abort current running task (TUI mode)
   SHIFT+ENTER / CTRL+J Insert newline in prompt (TUI mode)
 
 Skill invocation:
@@ -401,6 +414,114 @@ function estimateTokenCount(text) {
   return Math.max(1, Math.round(s.length / 4));
 }
 
+function extractThoughtContentFromPartialJson(raw) {
+  const source = String(raw || "");
+  const hasThoughtType =
+    /"type"\s*:\s*"thought/i.test(source) || /"type"\s*:\s*"tho/i.test(source);
+  if (!hasThoughtType) return null;
+
+  const contentKey = source.search(/"content"\s*:\s*"/i);
+  if (contentKey < 0) return "";
+  let i = contentKey;
+  while (i < source.length && source[i] !== ":") i += 1;
+  if (i >= source.length) return "";
+  i += 1;
+  while (i < source.length && /\s/.test(source[i])) i += 1;
+  if (source[i] !== "\"") return "";
+  i += 1;
+
+  let out = "";
+  let escaped = false;
+  for (; i < source.length; i += 1) {
+    const ch = source[i];
+    if (escaped) {
+      if (ch === "n") out += "\n";
+      else if (ch === "t") out += "\t";
+      else out += ch;
+      escaped = false;
+      continue;
+    }
+    if (ch === "\\") {
+      escaped = true;
+      continue;
+    }
+    if (ch === "\"") break;
+    out += ch;
+  }
+  return out.trim();
+}
+
+function extractReadableThinkingPreview(raw) {
+  const source = String(raw || "");
+  const thought = extractThoughtContentFromPartialJson(source);
+  if (thought) return thought;
+
+  const compact = source.replace(/\s+/g, " ").trim();
+  if (!compact) return "";
+
+  const reasonMatch = compact.match(
+    /"(reason|analysis|summary|thought|rationale)"\s*:\s*"((?:[^"\\]|\\.)*)"/i
+  );
+  if (reasonMatch?.[2]) {
+    return reasonMatch[2]
+      .replace(/\\n/g, "\n")
+      .replace(/\\t/g, "\t")
+      .replace(/\\"/g, '"')
+      .trim();
+  }
+
+  // If output is raw JSON/tool schema and we cannot extract a readable field yet, avoid noise.
+  if (compact.startsWith("{") || compact.startsWith("[")) return "";
+
+  return compact.slice(0, 280);
+}
+
+function extractJsonObject(raw) {
+  const source = String(raw || "");
+  const start = source.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < source.length; i += 1) {
+    const ch = source[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === "\"") inString = false;
+      continue;
+    }
+    if (ch === "\"") {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    if (ch === "}") depth -= 1;
+    if (depth === 0) return source.slice(start, i + 1);
+  }
+  return null;
+}
+
+function extractThinkingFromFinalModelPayload(raw) {
+  const objText = extractJsonObject(raw);
+  if (!objText) return "";
+  try {
+    const parsed = JSON.parse(objText);
+    if (String(parsed?.type || "").toLowerCase() === "thought") {
+      return String(parsed?.content || "").trim();
+    }
+    if (String(parsed?.type || "").toLowerCase() === "tool_use") {
+      const reason = String(parsed?.reason || "").trim();
+      if (reason) return reason;
+      const tool = String(parsed?.tool || "").trim();
+      if (tool) return `Preparing to use tool: ${tool}`;
+    }
+  } catch {
+    // ignore parse failures
+  }
+  return "";
+}
+
 function formatCompactNumber(n) {
   const value = Number(n);
   if (!Number.isFinite(value)) return "0";
@@ -428,6 +549,149 @@ function inferContextWindow(modelName) {
   if (model.includes("doubao-seed")) return 128000;
   if (model.includes("deepseek")) return 128000;
   return 128000;
+}
+
+function isTaskAbortError(err) {
+  const message = String(err?.message || "");
+  return (
+    err?.code === "TASK_ABORTED" ||
+    err?.code === "ABORT_ERR" ||
+    err?.name === "AbortError" ||
+    /task aborted by user/i.test(message)
+  );
+}
+
+function getGitChangedFileSet(workspaceDir) {
+  try {
+    const out = spawnSync("git", ["status", "--porcelain"], {
+      cwd: workspaceDir,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    if (out.status !== 0) return null;
+    const files = new Set();
+    for (const raw of String(out.stdout || "").split("\n")) {
+      const line = raw.trimEnd();
+      if (!line) continue;
+      const body = line.slice(3).trim();
+      if (!body) continue;
+      const renamed = body.split(" -> ");
+      files.add((renamed[renamed.length - 1] || body).trim());
+    }
+    return files;
+  } catch {
+    return null;
+  }
+}
+
+function parseNumstatOutput(raw, targetMap) {
+  const map = targetMap || new Map();
+  for (const lineRaw of String(raw || "").split("\n")) {
+    const line = lineRaw.trim();
+    if (!line) continue;
+    const parts = line.split("\t");
+    if (parts.length < 3) continue;
+    const addRaw = parts[0];
+    const delRaw = parts[1];
+    const fileRaw = parts.slice(2).join("\t").trim();
+    const file = fileRaw.split(" -> ").pop().trim();
+    const add = Number.isFinite(Number(addRaw)) ? Number(addRaw) : 0;
+    const del = Number.isFinite(Number(delRaw)) ? Number(delRaw) : 0;
+    const prev = map.get(file) || { add: 0, del: 0 };
+    map.set(file, { add: prev.add + add, del: prev.del + del });
+  }
+  return map;
+}
+
+function getGitNumstatMap(workspaceDir) {
+  try {
+    const map = new Map();
+    const unstaged = spawnSync("git", ["diff", "--numstat"], {
+      cwd: workspaceDir,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    if (unstaged.status === 0) parseNumstatOutput(unstaged.stdout, map);
+
+    const staged = spawnSync("git", ["diff", "--cached", "--numstat"], {
+      cwd: workspaceDir,
+      encoding: "utf8",
+      timeout: 5000,
+    });
+    if (staged.status === 0) parseNumstatOutput(staged.stdout, map);
+    return map;
+  } catch {
+    return null;
+  }
+}
+
+function diffGitNumstat(beforeMap, afterMap) {
+  const out = [];
+  if (!(beforeMap instanceof Map) || !(afterMap instanceof Map)) return out;
+  const files = new Set([...beforeMap.keys(), ...afterMap.keys()]);
+  for (const file of files) {
+    const before = beforeMap.get(file) || { add: 0, del: 0 };
+    const after = afterMap.get(file) || { add: 0, del: 0 };
+    const add = Math.max(0, after.add - before.add);
+    const del = Math.max(0, after.del - before.del);
+    if (add > 0 || del > 0) out.push({ file, add, del });
+  }
+  out.sort((a, b) => a.file.localeCompare(b.file));
+  return out;
+}
+
+function formatToolCounts(tools) {
+  const counts = new Map();
+  for (const t of Array.isArray(tools) ? tools : []) {
+    const key = String(t || "").trim();
+    if (!key) continue;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([k, n]) => `${k} x${n}`)
+    .join(", ");
+}
+
+function buildTurnSummary({ tools = [], filesChanged = [], fileStats = [], useColor = false } = {}) {
+  const toolText = formatToolCounts(tools) || "none";
+  const files = Array.isArray(filesChanged)
+    ? filesChanged.map((f) => String(f || "").trim()).filter(Boolean)
+    : [];
+  const filesText = files.length > 0 ? files.join(", ") : "none";
+  const green = (s) => (useColor ? `\x1b[32m${s}\x1b[0m` : s);
+  const red = (s) => (useColor ? `\x1b[31m${s}\x1b[0m` : s);
+  const statsLines = Array.isArray(fileStats)
+    ? fileStats.map((s) => {
+        const file = String(s?.file || "").trim();
+        if (!file) return null;
+        const add = Number(s?.add || 0);
+        const del = Number(s?.del || 0);
+        return `  - ${file} ${green(`+${add}`)} ${red(`-${del}`)}`;
+      }).filter(Boolean)
+    : [];
+  return [
+    "Summary:",
+    `- Actions: ${toolText}`,
+    `- Files changed: ${filesText}`,
+    ...(statsLines.length > 0 ? ["- Diff stat:", ...statsLines] : []),
+  ].join("\n");
+}
+
+function shouldShowTurnSummary({ tools = [], filesChanged = [] } = {}) {
+  const files = Array.isArray(filesChanged)
+    ? filesChanged.map((f) => String(f || "").trim()).filter(Boolean)
+    : [];
+  if (files.length > 0) return true;
+
+  const list = Array.isArray(tools) ? tools.map((t) => String(t || "").trim()).filter(Boolean) : [];
+  if (list.length === 0) return false;
+
+  // Show summary only for materially active turns.
+  const significantTools = new Set(["write_file", "shell", "todo_write", "todowrite"]);
+  if (list.some((t) => significantTools.has(t))) return true;
+  if (list.length >= 3) return true;
+
+  return false;
 }
 
 async function waitForTuiApproval({ stdinStream, defaultYes }) {
@@ -546,13 +810,29 @@ function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
     return `${" ".repeat(left)}${clipped}`;
   };
   const shortWorkspace = workspaceDir.length > 64 ? `...${workspaceDir.slice(-61)}` : workspaceDir;
+  const lineWidth = (s) => String(s || "").length;
+  const maxLineWidth = (lines) => Math.max(0, ...lines.map((l) => lineWidth(l)));
+  const wideLogo = [
+    "██████    ████    ████████",
+    "██   ██    ██     ██",
+    "██████     ██     ██████",
+    "██         ██     ██",
+    "██        ████    ████████",
+  ];
+  const compactLogo = [
+    "██████    ████    ████████",
+    "██   ██    ██     ██",
+    "██████     ██     ██████",
+    "██         ██     ██",
+    "██        ████    ████████",
+  ];
+  const chosenLogo =
+    maxLineWidth(wideLogo) <= Math.max(1, width - 2)
+      ? wideLogo
+      : compactLogo;
   const logoLines = [
     `[banner-title] ${center("Pie Code")}`,
-    `[banner-1] ${center(" ____    ___    _____ " )}`,
-    `[banner-2] ${center("|  _ \\  |_ _|  | ____|")}`,
-    `[banner-3] ${center("| |_) |  | |   |  _|  ")}`,
-    `[banner-4] ${center("|  __/   | |   | |___ ")}`,
-    `[banner-5] ${center("|_|     |___|  |_____|")}`,
+    ...chosenLogo.map((line, index) => `[banner-${index + 1}] ${center(line)}`),
     `[banner-meta] ${center(`model: ${formatProviderModel(provider)}`)}`,
     `[banner-meta] ${center(`workspace: ${shortWorkspace}`)}`,
     `[banner-hint] ${center("keys: CTRL+L logs | CTRL+O llm i/o | CTRL+T todos")}`,
@@ -680,20 +960,52 @@ async function maybeAutoEnableSkills(input, activeSkillsRef, skillIndex, logLine
   }
 }
 
-async function runAgentTurn(agent, input, tui, logLine, display) {
+async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef, workspaceDir) {
   const startedAt = Date.now();
   if (tui) tui.beginTurn();
+  const beforeGitSet = getGitChangedFileSet(workspaceDir);
+  const beforeGitNumstat = getGitNumstatMap(workspaceDir);
+  if (turnSummaryRef?.value) {
+    turnSummaryRef.value.active = true;
+    turnSummaryRef.value.tools = [];
+    turnSummaryRef.value.filesChanged = new Set();
+    turnSummaryRef.value.beforeGitSet = beforeGitSet;
+    turnSummaryRef.value.beforeGitNumstat = beforeGitNumstat;
+  }
   try {
     const result = await agent.runTurn(input);
     const durationMs = Date.now() - startedAt;
     if (tui) tui.onTurnSuccess(durationMs);
-    const output = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+    const afterGitSet = getGitChangedFileSet(workspaceDir);
+    const afterGitNumstat = getGitNumstatMap(workspaceDir);
+    const filesChangedSet = new Set([...(turnSummaryRef?.value?.filesChanged || [])]);
+    if (beforeGitSet && afterGitSet) {
+      for (const file of afterGitSet) {
+        if (!beforeGitSet.has(file)) filesChangedSet.add(file);
+      }
+    }
+    const fileStats = diffGitNumstat(beforeGitNumstat, afterGitNumstat);
+    for (const stat of fileStats) filesChangedSet.add(stat.file);
+    const turnSummary = buildTurnSummary({
+      tools: turnSummaryRef?.value?.tools || [],
+      filesChanged: [...filesChangedSet],
+      fileStats,
+      useColor: Boolean(tui),
+    });
+    const baseOutput = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+    const output = shouldShowTurnSummary({
+      tools: turnSummaryRef?.value?.tools || [],
+      filesChanged: [...filesChangedSet],
+    })
+      ? `${baseOutput}\n\n${turnSummary}`
+      : baseOutput;
     if (tui) {
       const usage = tui.getTurnTokenUsage();
       logLine(`[response] ${output}`);
       logLine(
         `[result] done | time: ${durationMs}ms | tokens: sent ${formatCompactNumber(usage.sent)} | recv ${formatCompactNumber(usage.received)}`
       );
+      tui.clearLiveThought();
       tui.render("", "done");
     } else if (display) {
       display.onResponse(output);
@@ -701,14 +1013,28 @@ async function runAgentTurn(agent, input, tui, logLine, display) {
       console.log(`\n${output}`);
     }
   } catch (err) {
-    if (tui) tui.onTurnError(err.message, Date.now() - startedAt);
+    const aborted = isTaskAbortError(err);
     if (tui) {
-      tui.event(`error: ${err.message}`);
-      tui.render("", "error");
+      if (aborted) tui.onTurnSuccess(Date.now() - startedAt);
+      else tui.onTurnError(err.message, Date.now() - startedAt);
+    }
+    if (tui) {
+      tui.clearLiveThought();
+      if (aborted) {
+        logLine("[result] aborted by user");
+        tui.render("", "aborted");
+      } else {
+        tui.event(`error: ${err.message}`);
+        tui.render("", "error");
+      }
     } else if (display) {
-      display.onError(err.message);
+      display.onError(aborted ? "Task aborted by user." : err.message);
     } else {
-      console.error(`error: ${err.message}`);
+      console.error(`error: ${aborted ? "Task aborted by user." : err.message}`);
+    }
+  } finally {
+    if (turnSummaryRef?.value) {
+      turnSummaryRef.value.active = false;
     }
   }
 }
@@ -717,6 +1043,7 @@ async function handleSlashCommand(input, ctx) {
   const {
     agent,
     autoApproveRef,
+    traceRef,
     providerRef,
     skillIndex,
     activeSkillsRef,
@@ -743,7 +1070,9 @@ async function handleSlashCommand(input, ctx) {
         "/help",
         "/exit | /quit",
         "/clear",
+        "/compact",
         "/approve on|off",
+        "/trace on|off",
         "/model",
         "/skills",
         "/skills list",
@@ -761,7 +1090,23 @@ async function handleSlashCommand(input, ctx) {
   }
   if (lower === "/clear") {
     agent.clearHistory();
-    logLine("history cleared");
+    if (ctx.todosRef) {
+      ctx.todosRef.value = [];
+      if (ctx.tui) ctx.tui.setTodos([]);
+    }
+    if (ctx.todoAutoTrackRef) ctx.todoAutoTrackRef.value = false;
+    logLine("all context cleared");
+    return { done: false, handled: true };
+  }
+  if (lower === "/compact") {
+    const result = await agent.compactHistory();
+    if (!result.compacted) {
+      logLine(`compact skipped: ${result.summary}`);
+      return { done: false, handled: true };
+    }
+    logLine(
+      `context compacted: ${result.beforeMessages} -> ${result.afterMessages} messages (removed ${result.removedMessages})`
+    );
     return { done: false, handled: true };
   }
   if (lower.startsWith("/approve")) {
@@ -771,6 +1116,16 @@ async function handleSlashCommand(input, ctx) {
       logLine(`shell auto-approval ${mode}`);
     } else {
       logLine("usage: /approve on|off");
+    }
+    return { done: false, handled: true };
+  }
+  if (lower.startsWith("/trace")) {
+    const mode = normalized.split(/\s+/)[1]?.toLowerCase();
+    if (mode === "on" || mode === "off") {
+      traceRef.value = mode === "on";
+      logLine(`trace ${mode}`);
+    } else {
+      logLine("usage: /trace on|off");
     }
     return { done: false, handled: true };
   }
@@ -1024,6 +1379,12 @@ async function main() {
   const useTui = args.tui || process.env.PIECODE_TUI === "1";
   const display = useTui ? null : new Display();
   const llmDebugRef = { value: false };
+  const traceRef = { value: process.env.PIECODE_TRACE === "1" };
+  const llmStreamRef = { value: { turn: "", planning: "", replanning: "" } };
+  const traceStateRef = { value: { turnId: 0, turnStartedAt: 0, llmStageStart: {}, toolStartByName: {} } };
+  const turnSummaryRef = {
+    value: { active: false, tools: [], filesChanged: new Set(), beforeGitSet: null },
+  };
   const currentInputRef = { value: "" };
   const todosRef = { value: [] };
   const todoAutoTrackRef = { value: false };
@@ -1042,6 +1403,24 @@ async function main() {
     return next;
   };
   let rl = createReadline(initialHistory);
+  const isReadlineClosed = () => {
+    if (!rl) return true;
+    if (rl.closed === true) return true;
+    if (rl.input && rl.input.destroyed) return true;
+    return false;
+  };
+  const safeRlWrite = (...args) => {
+    if (isReadlineClosed()) return false;
+    try {
+      rl.write(...args);
+      return true;
+    } catch (err) {
+      if (err && (err.code === "ERR_USE_AFTER_CLOSE" || /readline was closed/i.test(String(err.message || "")))) {
+        return false;
+      }
+      throw err;
+    }
+  };
 
   let tui = null;
   let onResize = null;
@@ -1071,23 +1450,104 @@ async function main() {
   const pendingCommandSubmitRef = { value: "" };
   const modelPickerRef = { active: false, query: "", options: [], index: 0 };
   const commandPickerRef = { active: false, options: [], index: 0 };
+  const taskRunningRef = { value: false };
+  const escAbortArmedRef = { value: false };
+  let escAbortTimer = null;
   let onKeypress = null;
+  let onMouseData = null;
+  let renderLiveInput = () => {};
   if (tui || display) {
     readlineCore.emitKeypressEvents(stdin);
+    renderLiveInput = () => {
+      if (!tui || isReadlineClosed()) return;
+      const lineNow = String(rl.line || "");
+      const cleanedLineNow = stripMouseInputNoise(lineNow);
+      if (cleanedLineNow !== lineNow) {
+        safeRlWrite(null, { ctrl: true, name: "u" });
+        if (cleanedLineNow) safeRlWrite(cleanedLineNow);
+      }
+      const stableLine = cleanedLineNow;
+      const cursorNow = Number.isFinite(rl.cursor) ? Math.max(0, Math.floor(rl.cursor)) : lineNow.length;
+      const safeCursor = Math.min(cursorNow, stableLine.length);
+      const inputNow = `${multilineBufferRef.value}${stableLine}`;
+      currentInputRef.value = inputNow;
+      tui.renderInput(inputNow, multilineBufferRef.value.length + safeCursor);
+    };
     onKeypress = (str, key = {}) => {
+      if (isReadlineClosed()) return;
       if (approvalActiveRef.value) return;
-      const currentLine = String(rl.line || "");
+      const currentLineRaw = String(rl.line || "");
+      const currentLine = stripMouseInputNoise(currentLineRaw);
+      if (currentLine !== currentLineRaw) {
+        safeRlWrite(null, { ctrl: true, name: "u" });
+        if (currentLine) safeRlWrite(currentLine);
+      }
       const emptyInput = currentLine.trim().length === 0 && !multilineBufferRef.value.trim();
 
       if (exitArmedRef.value && (!emptyInput || (key.name && key.name !== "d"))) {
         exitArmedRef.value = false;
         if (tui) tui.clearInputHint();
       }
+      if (escAbortArmedRef.value && key.name !== "escape") {
+        escAbortArmedRef.value = false;
+        if (escAbortTimer) {
+          clearTimeout(escAbortTimer);
+          escAbortTimer = null;
+        }
+      }
 
       if (tui) {
+        if (key.name === "escape" && taskRunningRef.value) {
+          if (escAbortArmedRef.value) {
+            escAbortArmedRef.value = false;
+            if (escAbortTimer) {
+              clearTimeout(escAbortTimer);
+              escAbortTimer = null;
+            }
+            const requested = agent.requestAbort();
+            tui.clearInputHint();
+            tui.render(currentInputRef.value, requested ? "aborting task..." : "no active task to abort");
+            return;
+          }
+          escAbortArmedRef.value = true;
+          tui.setInputHint("Press ESC again to abort current task.");
+          if (escAbortTimer) clearTimeout(escAbortTimer);
+          escAbortTimer = setTimeout(() => {
+            escAbortArmedRef.value = false;
+            escAbortTimer = null;
+            tui.clearInputHint();
+          }, 1200);
+          return;
+        }
+        if (key.ctrl && key.name === "c") {
+          exitArmedRef.value = false;
+          multilineBufferRef.value = "";
+          multilineCommitRef.value = false;
+          suppressNextSubmitRef.value = false;
+          pendingCommandSubmitRef.value = "";
+          modelPickerRef.active = false;
+          modelPickerRef.query = "";
+          modelPickerRef.options = [];
+          modelPickerRef.index = 0;
+          commandPickerRef.active = false;
+          commandPickerRef.options = [];
+          commandPickerRef.index = 0;
+          tui.clearModelSuggestions();
+          tui.clearCommandSuggestions();
+          tui.clearInputHint();
+          safeRlWrite(null, { ctrl: true, name: "u" });
+          currentInputRef.value = "";
+          tui.renderInput("");
+          tui.render("", "input cleared");
+          return;
+        }
         if (key.ctrl && key.name === "o") {
           llmDebugRef.value = !llmDebugRef.value;
           tui.setLlmDebugEnabled(llmDebugRef.value);
+          return;
+        }
+        if (key.ctrl && (key.name === "a" || key.name === "e")) {
+          setImmediate(renderLiveInput);
           return;
         }
         if (key.ctrl && key.name === "l") {
@@ -1096,6 +1556,14 @@ async function main() {
         }
         if (key.ctrl && key.name === "t") {
           tui.toggleTodoPanel();
+          return;
+        }
+        if (key.shift && key.name === "up") {
+          tui.scrollLines(1);
+          return;
+        }
+        if (key.shift && key.name === "down") {
+          tui.scrollLines(-1);
           return;
         }
         if (key.name === "pageup") {
@@ -1112,6 +1580,16 @@ async function main() {
         }
         if (key.name === "end") {
           tui.scrollToBottom();
+          return;
+        }
+        if (
+          (key.name === "up" || key.name === "down") &&
+          !modelPickerRef.active &&
+          !commandPickerRef.active &&
+          currentLine.trim().length === 0 &&
+          !multilineBufferRef.value.trim()
+        ) {
+          tui.scrollLines(key.name === "up" ? 1 : -1);
           return;
         }
 
@@ -1176,8 +1654,8 @@ async function main() {
             modelPickerRef.index = (modelPickerRef.index + delta + len) % len;
             const selectedModel = modelPickerRef.options[modelPickerRef.index];
             const nextLine = `/model ${selectedModel}`;
-            rl.write(null, { ctrl: true, name: "u" });
-            rl.write(nextLine);
+            safeRlWrite(null, { ctrl: true, name: "u" });
+            safeRlWrite(nextLine);
             currentInputRef.value = nextLine;
             tui.setModelSuggestions(modelPickerRef.options, modelPickerRef.index);
             tui.renderInput(currentInputRef.value);
@@ -1199,8 +1677,8 @@ async function main() {
             modelPickerRef.options = [];
             modelPickerRef.index = 0;
             tui.clearModelSuggestions();
-            rl.write(null, { ctrl: true, name: "u" });
-            rl.write(`/model ${selectedModel}`);
+            safeRlWrite(null, { ctrl: true, name: "u" });
+            safeRlWrite(`/model ${selectedModel}`);
             currentInputRef.value = `/model ${selectedModel}`;
             tui.renderInput(currentInputRef.value);
             return;
@@ -1213,8 +1691,8 @@ async function main() {
             const len = commandPickerRef.options.length;
             commandPickerRef.index = (commandPickerRef.index + delta + len) % len;
             const selectedCommand = commandPickerRef.options[commandPickerRef.index];
-            rl.write(null, { ctrl: true, name: "u" });
-            rl.write(selectedCommand);
+            safeRlWrite(null, { ctrl: true, name: "u" });
+            safeRlWrite(selectedCommand);
             currentInputRef.value = selectedCommand;
             tui.setCommandSuggestions(commandPickerRef.options, commandPickerRef.index);
             tui.renderInput(currentInputRef.value);
@@ -1235,8 +1713,8 @@ async function main() {
             commandPickerRef.options = [];
             commandPickerRef.index = 0;
             tui.clearCommandSuggestions();
-            rl.write(null, { ctrl: true, name: "u" });
-            rl.write(selectedCommand);
+            safeRlWrite(null, { ctrl: true, name: "u" });
+            safeRlWrite(selectedCommand);
             currentInputRef.value = selectedCommand;
             tui.renderInput(currentInputRef.value);
             return;
@@ -1247,14 +1725,13 @@ async function main() {
           multilineBufferRef.value = `${multilineBufferRef.value}${currentLine}\n`;
           multilineCommitRef.value = true;
           // Clear current readline line so Shift+Enter does not submit content.
-          rl.write(null, { ctrl: true, name: "u" });
+          safeRlWrite(null, { ctrl: true, name: "u" });
           currentInputRef.value = multilineBufferRef.value;
           tui.renderInput(currentInputRef.value);
           return;
         }
 
-        currentInputRef.value = `${multilineBufferRef.value}${currentLine}`;
-        tui.renderInput(currentInputRef.value);
+        setImmediate(renderLiveInput);
       }
 
       if (tui) return;
@@ -1274,6 +1751,25 @@ async function main() {
       }
     };
     stdin.on("keypress", onKeypress);
+  }
+  if (tui) {
+    let mouseRemainder = "";
+    onMouseData = (chunk) => {
+      if (isReadlineClosed()) return;
+      const parsed = consumeMouseWheelDeltas(chunk, mouseRemainder);
+      mouseRemainder = parsed.remainder;
+      const lineNow = String(rl.line || "");
+      const cleanedLine = stripMouseInputNoise(lineNow);
+      if (cleanedLine !== lineNow) {
+        safeRlWrite(null, { ctrl: true, name: "u" });
+        if (cleanedLine) safeRlWrite(cleanedLine);
+        renderLiveInput();
+      }
+      if (approvalActiveRef.value) return;
+      if (!Array.isArray(parsed.deltas) || parsed.deltas.length === 0) return;
+      for (const delta of parsed.deltas) tui.scrollLines(delta);
+    };
+    stdin.on("data", onMouseData);
   }
 
   const switchModel = async (modelId) => {
@@ -1439,8 +1935,19 @@ async function main() {
         logLine(`[plan] ${evt.message}`);
       }
       if (evt.type === "llm_request") {
+        if (traceRef.value) {
+          traceStateRef.value.llmStageStart[evt.stage] = Date.now();
+          const chars = String(evt.payload || "").length;
+          logLine(`[trace] llm_request stage=${evt.stage} chars=${chars}`);
+        }
         if (tui) tui.onThinking(evt.stage);
         if (display) display.onThinking(evt.stage);
+        if (llmStreamRef.value && Object.prototype.hasOwnProperty.call(llmStreamRef.value, evt.stage)) {
+          llmStreamRef.value[evt.stage] = "";
+        }
+        if (tui && evt.stage === "turn") {
+          tui.setLiveThought("Analyzing request...");
+        }
         const endpoint = inferEndpointForProvider(providerOptionsRef.value, providerRef.value);
         const sentTokens = estimateTokenCount(evt.payload);
         if (tui) {
@@ -1454,7 +1961,35 @@ async function main() {
           tui.setLlmRequest(`[${evt.stage}] endpoint=${endpoint}\n${evt.payload}`);
         }
       }
+      if (evt.type === "llm_response_delta") {
+        if (llmStreamRef.value && Object.prototype.hasOwnProperty.call(llmStreamRef.value, evt.stage)) {
+          llmStreamRef.value[evt.stage] += String(evt.delta || "");
+        }
+        if (tui && evt.stage === "turn") {
+          const preview = extractReadableThinkingPreview(llmStreamRef.value.turn);
+          if (preview) {
+            tui.setLiveThought(preview);
+          }
+        }
+      }
       if (evt.type === "llm_response") {
+        if (traceRef.value) {
+          const startedAt = Number(traceStateRef.value.llmStageStart[evt.stage] || 0);
+          const durationMs = startedAt > 0 ? Date.now() - startedAt : 0;
+          const chars = String(evt.payload || "").length;
+          logLine(`[trace] llm_response stage=${evt.stage} chars=${chars} duration=${durationMs}ms`);
+        }
+        if (llmStreamRef.value && Object.prototype.hasOwnProperty.call(llmStreamRef.value, evt.stage)) {
+          llmStreamRef.value[evt.stage] = String(evt.payload || "");
+        }
+        if (tui && evt.stage === "turn") {
+          const preview =
+            extractThinkingFromFinalModelPayload(llmStreamRef.value.turn) ||
+            extractReadableThinkingPreview(llmStreamRef.value.turn);
+          if (preview) {
+            tui.setLiveThought(preview);
+          }
+        }
         const receivedTokens = estimateTokenCount(evt.payload);
         if (tui) tui.addTokenUsage({ sent: 0, received: receivedTokens });
         logLine(`[thinking] response:${evt.stage} ${summarizeForLog(evt.payload)}`);
@@ -1467,11 +2002,21 @@ async function main() {
         if (display) display.onThinkingDone();
       }
       if (evt.type === "thought") {
+        if (tui) tui.clearLiveThought();
         if (display) display.onThought(evt.content);
         logLine(`[thought] ${evt.content}`);
       }
       if (evt.type === "tool_use") {
+        if (turnSummaryRef.value.active) {
+          turnSummaryRef.value.tools.push(evt.tool);
+          if (evt.tool === "write_file" && evt.input?.path) {
+            turnSummaryRef.value.filesChanged.add(String(evt.input.path));
+          }
+        }
         if (tui) tui.onToolUse(evt.tool);
+        if (tui && evt.reason) {
+          tui.setLiveThought(String(evt.reason));
+        }
         if (display) display.onToolUse(evt.tool, evt.input, evt.reason);
         const details = Object.entries(evt.input || {})
           .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
@@ -1479,6 +2024,10 @@ async function main() {
         logLine(`[tool] ${evt.tool}${evt.reason ? ` - ${evt.reason}` : ""}${details ? ` (${details})` : ""}`);
       }
       if (evt.type === "tool_start") {
+        if (traceRef.value) {
+          traceStateRef.value.toolStartByName[evt.tool] = Date.now();
+          logLine(`[trace] tool_start name=${evt.tool}`);
+        }
         if (display) display.onToolStart(evt.tool, evt.input);
         const details = Object.entries(evt.input || {})
           .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
@@ -1493,6 +2042,12 @@ async function main() {
         }
       }
       if (evt.type === "tool_end") {
+        if (traceRef.value) {
+          const startedAt = Number(traceStateRef.value.toolStartByName[evt.tool] || 0);
+          const durationMs = startedAt > 0 ? Date.now() - startedAt : 0;
+          const err = evt.error ? "yes" : "no";
+          logLine(`[trace] tool_end name=${evt.tool} duration=${durationMs}ms error=${err}`);
+        }
         if (display) display.onToolEnd(evt.tool, evt.result, evt.error);
       }
     },
@@ -1548,6 +2103,34 @@ async function main() {
       rawInput = await rl.question(tui ? "" : "\n> ");
     } catch (err) {
       const message = String(err?.message || "");
+      const isSigint =
+        err?.code === "ABORT_ERR" ||
+        message.includes("SIGINT") ||
+        message.includes("The operation was aborted");
+      if (isSigint) {
+        multilineBufferRef.value = "";
+        multilineCommitRef.value = false;
+        suppressNextSubmitRef.value = false;
+        pendingCommandSubmitRef.value = "";
+        modelPickerRef.active = false;
+        modelPickerRef.query = "";
+        modelPickerRef.options = [];
+        modelPickerRef.index = 0;
+        commandPickerRef.active = false;
+        commandPickerRef.options = [];
+        commandPickerRef.index = 0;
+        if (tui) {
+          tui.clearModelSuggestions();
+          tui.clearCommandSuggestions();
+          tui.clearInputHint();
+        }
+        safeRlWrite(null, { ctrl: true, name: "u" });
+        currentInputRef.value = "";
+        if (tui) tui.renderInput("");
+        if (tui) tui.render("", "input cleared");
+        else process.stdout.write("\n");
+        continue;
+      }
       const isEof = message.includes("Ctrl+D") || message.includes("EOT");
       const isClosed = message.includes("readline was closed");
       const isInputAbort = isEof || isClosed;
@@ -1591,7 +2174,7 @@ async function main() {
 
     const combinedInput = `${multilineBufferRef.value}${rawInput}`;
     multilineBufferRef.value = "";
-    const finalInput = combinedInput.trim();
+    const finalInput = stripMouseInputNoise(combinedInput).trim();
     if (!finalInput) continue;
     if (display) display.clearSuggestions();
     exitArmedRef.value = false;
@@ -1602,10 +2185,20 @@ async function main() {
     }
     currentInputRef.value = "";
     if (tui) tui.render(currentInputRef.value, isSlash ? "handling command" : "processing task");
+    if (!isSlash) {
+      traceStateRef.value.turnId += 1;
+      traceStateRef.value.turnStartedAt = Date.now();
+      traceStateRef.value.llmStageStart = {};
+      traceStateRef.value.toolStartByName = {};
+      if (traceRef.value) {
+        logLine(`[trace] turn_start id=${traceStateRef.value.turnId} input_chars=${finalInput.length}`);
+      }
+    }
 
     const slash = await handleSlashCommand(finalInput, {
       agent,
       autoApproveRef,
+      traceRef,
       providerRef,
       skillIndex,
       activeSkillsRef,
@@ -1617,6 +2210,8 @@ async function main() {
       setModel: switchModel,
       settings,
       modelCatalogRef,
+      todosRef,
+      todoAutoTrackRef,
     });
     if (slash.done) break;
     if (slash.handled) {
@@ -1626,7 +2221,24 @@ async function main() {
     }
 
     await maybeAutoEnableSkills(finalInput, activeSkillsRef, skillIndex, logLine);
-    await runAgentTurn(agent, finalInput, tui, logLine, display);
+    taskRunningRef.value = true;
+    try {
+      await runAgentTurn(agent, finalInput, tui, logLine, display, turnSummaryRef, workspaceDir);
+    } finally {
+      taskRunningRef.value = false;
+      escAbortArmedRef.value = false;
+      if (escAbortTimer) {
+        clearTimeout(escAbortTimer);
+        escAbortTimer = null;
+      }
+      if (tui) tui.clearInputHint();
+    }
+    if (traceRef.value) {
+      const elapsed = traceStateRef.value.turnStartedAt
+        ? Date.now() - traceStateRef.value.turnStartedAt
+        : 0;
+      logLine(`[trace] turn_end id=${traceStateRef.value.turnId} duration=${elapsed}ms`);
+    }
     if (todoAutoTrackRef.value) {
       const advancedAfterTurn = advanceTodosOnTurnDone(todosRef.value);
       if (advancedAfterTurn.length > 0) {
@@ -1641,6 +2253,8 @@ async function main() {
     await saveHistory(historyFile, rl.history);
   } finally {
     if (onKeypress) stdin.off("keypress", onKeypress);
+    if (escAbortTimer) clearTimeout(escAbortTimer);
+    if (onMouseData) stdin.off("data", onMouseData);
     if (onResize) {
       stdout.off("resize", onResize);
       process.off("SIGWINCH", onResize);

@@ -87,6 +87,12 @@ describe("tui usability", () => {
     const plainResponse = stripAnsi(tui.formatTimelineLines("[response] hello world")[0]);
     expect(plainResponse).toBe("hello world");
     expect(plainResponse).not.toContain("Assistant:");
+    const boldResponse = stripAnsi(tui.formatTimelineLines("[response] this is **BOLD** text")[0]);
+    expect(boldResponse).toContain("this is BOLD text");
+    expect(boldResponse).not.toContain("**BOLD**");
+    const longResponse = `[response] ${"a".repeat(9000)}`;
+    const longLines = tui.formatTimelineLines(longResponse).map((line) => stripAnsi(line));
+    expect(longLines.join("\n")).toContain("[trimmed ");
   });
 
   test("LLM debug panel appears only in raw log view when CTRL+O is enabled", () => {
@@ -205,6 +211,47 @@ describe("tui usability", () => {
     tui.renderInput("line1\nline2");
     const lastWrite = stripAnsi(out.writes[out.writes.length - 1] || "");
     expect(lastWrite).toContain("↩");
+  });
+
+  test("renderInput honors explicit cursor position (CTRL+A/CTRL+E behavior)", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.renderInput("abcdef", 0);
+    let lastWrite = out.writes[out.writes.length - 1] || "";
+    expect(lastWrite).toContain(`\x1b[${tui.lastInputRow};4H`);
+
+    tui.renderInput("abcdef", 6);
+    lastWrite = out.writes[out.writes.length - 1] || "";
+    expect(lastWrite).toContain(`\x1b[${tui.lastInputRow};10H`);
+  });
+
+  test("live thought content is rendered in workspace", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.setLiveThought("inspect files first");
+    let frame = latestFrame(out);
+    expect(frame).toContain("Thought:");
+    expect(frame).toContain("inspect files first");
+    tui.clearLiveThought();
+    frame = latestFrame(out);
+    expect(frame).not.toContain("inspect files first");
+    tui.stop();
   });
 
   test("model suggestions render between prompt and status with selection indicator", () => {

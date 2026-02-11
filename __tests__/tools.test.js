@@ -132,4 +132,27 @@ describe("tools usability", () => {
     expect(asked).toBe(1);
     expect(result).toBe("Command was not approved by the user.");
   });
+
+  test("large shell output is stored to workspace file with preview", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: false },
+      askApproval: async () => true,
+    });
+
+    const result = await tools.shell({
+      command: 'node -e "process.stdout.write(\'x\'.repeat(20000))"',
+      timeout: 30000,
+    });
+
+    expect(result).toContain("Result too long (chars:");
+    const match = result.match(/saved to (\.piecode\/shell\/result-[^\s]+\.txt)/);
+    expect(match).toBeTruthy();
+    const relPath = match[1];
+    const abs = path.join(dir, relPath);
+    const saved = await fs.readFile(abs, "utf8");
+    expect(saved).toContain("exit_code: 0");
+    expect(saved.length).toBeGreaterThan(12000);
+  });
 });

@@ -1,7 +1,7 @@
 {
-  "name": "piecode-agent",
+  "name": "piecode",
   "version": "0.1.0",
-  "description": "Claude Code-like command line coding agent",
+  "description": "The coding agent that cook easily",
   "type": "module",
   "bin": {
     "piecode": "./src/cli.js"
@@ -10,6 +10,10 @@
     "start": "node src/cli.js",
     "agent": "node src/cli.js --tui",
     "help": "node src/cli.js --help",
+    "build": "node scripts/build.mjs",
+    "install:local": "node scripts/install-local.mjs",
+    "release": "node scripts/release.mjs",
+    "release:dry-run": "node scripts/release.mjs",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
     "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
@@ -27,6 +31,8 @@
   },
   "dependencies": {
     "axios": "^1.13.5",
-    "jsdom": "^28.0.0"
+    "jsdom": "^28.0.0",
+    "react": "^19.2.4",
+    "react-dom": "^19.2.4"
   }
 }

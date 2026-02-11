@@ -86,6 +86,25 @@ node src/cli.js --prompt "use $vercel-react-best-practices to optimize this Reac
 node src/cli.js --tui
 ```
 
+Build and release:
+
+```bash
+# Build distributable artifact into dist/
+npm run build
+
+# Install locally to ~/.local/piecode (binary in ~/.local/piecode/bin/piecode)
+npm run install:local
+
+# Install to a custom local path
+npm run install:local -- --prefix /tmp/piecode-local
+
+# Release dry-run (build + show publish command)
+npm run release
+
+# Publish to npm from built tarball
+npm run release -- --publish
+```
+
 TUI includes live model status (running/idle/error), last turn duration, and last tool used.
 
 The agent now performs a lightweight pre-plan before execution (default on) to reduce unnecessary tool calls. If the first plan underestimates the work, it auto-replans and continues.
@@ -126,5 +145,5 @@ You can also mention `$skill-name` in a prompt to auto-enable that skill for the
 - Set `PIECODE_SETTINGS_FILE` to override the settings file location.
 - Set `PIECODE_ENABLE_PLANNER=1` to enable the experimental task planner (disabled by default).
 - Set `PIECODE_SKILLS_DIR` to override/extend skill root directories (comma-separated).
-- Set `PIECODE_PLAN_FIRST=0` to disable lightweight pre-plan.
+- Set `PIECODE_PLAN_FIRST=1` to enable lightweight pre-plan (disabled by default).
 - Set `PIECODE_TOOL_BUDGET` to set initial planning budget guidance (default `6`, range `1-12`).

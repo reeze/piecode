@@ -25,4 +25,15 @@ describe("provider selection", () => {
       else process.env.OPENROUTER_API_KEY = prev;
     }
   });
+
+  test("seed provider exposes stream completion", () => {
+    const provider = getProvider({
+      provider: "seed",
+      apiKey: "seed-test-key",
+      model: "doubao-seed-code-preview-latest",
+      baseUrl: "https://ark.cn-beijing.volces.com/api/coding",
+    });
+    expect(provider.kind).toBe("seed-openai-compatible");
+    expect(typeof provider.completeStream).toBe("function");
+  });
 });
