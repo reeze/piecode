@@ -7,3 +7,4 @@ npm-debug.log*
 .npmrc.local
 dist/*.tgz
 .piecode/shell
+.piecode/tasks
