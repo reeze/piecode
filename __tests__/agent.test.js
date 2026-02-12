@@ -393,9 +393,229 @@ describe("agent context controls", () => {
     const result = await agent.runTurn(
       "summerize the diff tell me what happened, please generate a commit message for it."
     );
-    expect(nativeTurns).toBe(2);
+    expect(nativeTurns).toBe(1);
     expect(finalizeTurns).toBe(1);
     expect(result.toLowerCase()).toContain("suggested commit message");
+  });
+
+  test("blocks non-read-only shell commands in diff-summary turns", async () => {
+    let calls = 0;
+    const agent = new Agent({
+      provider: {
+        kind: "test-provider",
+        model: "test-model",
+        async complete(args = {}) {
+          calls += 1;
+          if (calls === 1) {
+            return JSON.stringify({
+              type: "tool_use",
+              tool: "shell",
+              input: { command: "git commit -m \"oops\"" },
+              reason: "commit changes",
+            });
+          }
+          if (args?.prompt && String(args.prompt).includes("Collected evidence:")) {
+            return "Summary only.\nSuggested commit message: chore: summarize diff";
+          }
+          return JSON.stringify({ type: "final", message: "done" });
+        },
+      },
+      workspaceDir: process.cwd(),
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      activeSkillsRef: { value: [] },
+      projectInstructionsRef: { value: null },
+    });
+
+    const result = await agent.runTurn(
+      "summerize the diff tell me what happened, please generate a commit message for it."
+    );
+    const hasCommitToolResult = agent.history.some((m) => {
+      if (m.role !== "user") return false;
+      try {
+        const parsed = JSON.parse(String(m.content || ""));
+        return parsed?.type === "tool_result" && String(parsed?.result || "").includes("git commit");
+      } catch {
+        return false;
+      }
+    });
+    expect(hasCommitToolResult).toBe(false);
+    expect(result.toLowerCase()).toContain("suggested commit message");
+  });
+
+  test("commit request finalizes after first commit attempt to avoid repeated commits", async () => {
+    let calls = 0;
+    const agent = new Agent({
+      provider: {
+        kind: "test-provider",
+        model: "test-model",
+        async complete() {
+          calls += 1;
+          if (calls === 1) {
+            return JSON.stringify({
+              type: "tool_use",
+              tool: "shell",
+              input: { command: "git commit --dry-run -m \"test\"" },
+              reason: "commit changes",
+            });
+          }
+          return JSON.stringify({
+            type: "tool_use",
+            tool: "shell",
+            input: { command: "git status" },
+            reason: "retry status",
+          });
+        },
+      },
+      workspaceDir: process.cwd(),
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      activeSkillsRef: { value: [] },
+      projectInstructionsRef: { value: null },
+    });
+
+    const result = await agent.runTurn("please help me commit them with the generated message");
+    expect(calls).toBe(1);
+    expect(result.toLowerCase()).toContain("git commit --dry-run -m \"test\"");
+  });
+
+  test("commit request does not loop on repeated git status and finalizes from evidence", async () => {
+    let normalTurns = 0;
+    let finalizeTurns = 0;
+    const agent = new Agent({
+      provider: {
+        kind: "test-provider",
+        model: "test-model",
+        async complete(args = {}) {
+          if (String(args?.prompt || "").includes("Collected evidence:")) {
+            finalizeTurns += 1;
+            return "Checked repository state once.\nUse: git add -A && git commit -m \"chore: commit changes\"";
+          }
+          normalTurns += 1;
+          return JSON.stringify({
+            type: "tool_use",
+            tool: "shell",
+            input: { command: "git status" },
+            reason: "check status before commit",
+          });
+        },
+      },
+      workspaceDir: process.cwd(),
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      activeSkillsRef: { value: [] },
+      projectInstructionsRef: { value: null },
+    });
+
+    const result = await agent.runTurn("please help me commit them with the generated message");
+    expect(normalTurns).toBe(2);
+    expect(finalizeTurns).toBe(1);
+    expect(result.toLowerCase()).toContain("git commit");
+    expect(result.toLowerCase()).not.toContain("same verified step result");
+  });
+
+  test("commit request with batched duplicate status continues to diff and commit", async () => {
+    let calls = 0;
+    const agent = new Agent({
+      provider: {
+        kind: "openrouter-compatible",
+        model: "moonshotai/kimi-k2.5",
+        supportsNativeTools: true,
+        async complete() {
+          calls += 1;
+          if (calls === 1) {
+            return {
+              message: {
+                role: "assistant",
+                content: "",
+                tool_calls: [
+                  {
+                    id: "shell:0",
+                    type: "function",
+                    function: { name: "shell", arguments: "{\"command\":\"git status\"}" },
+                  },
+                ],
+              },
+              finishReason: "tool_calls",
+            };
+          }
+          if (calls === 2) {
+            return {
+              message: {
+                role: "assistant",
+                content: "",
+                tool_calls: [
+                  {
+                    id: "shell:1",
+                    type: "function",
+                    function: { name: "shell", arguments: "{\"command\":\"git status\"}" },
+                  },
+                  {
+                    id: "shell:2",
+                    type: "function",
+                    function: { name: "shell", arguments: "{\"command\":\"git diff --stat\"}" },
+                  },
+                ],
+              },
+              finishReason: "tool_calls",
+            };
+          }
+          if (calls === 3) {
+            return {
+              message: {
+                role: "assistant",
+                content: "",
+                tool_calls: [
+                  {
+                    id: "shell:3",
+                    type: "function",
+                    function: { name: "shell", arguments: "{\"command\":\"git add -A\"}" },
+                  },
+                ],
+              },
+              finishReason: "tool_calls",
+            };
+          }
+          return {
+            message: {
+              role: "assistant",
+              content: "",
+              tool_calls: [
+                {
+                  id: "shell:4",
+                  type: "function",
+                  function: { name: "shell", arguments: "{\"command\":\"git commit --dry-run -m \\\"chore: test\\\"\"}" },
+                },
+              ],
+            },
+            finishReason: "tool_calls",
+          };
+        },
+      },
+      workspaceDir: process.cwd(),
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      activeSkillsRef: { value: [] },
+      projectInstructionsRef: { value: null },
+    });
+
+    await agent.runTurn("please help me commit the changes with a generated commit message");
+    const assistantToolUses = agent.history
+      .filter((m) => m.role === "assistant")
+      .map((m) => {
+        try {
+          return JSON.parse(String(m.content || ""));
+        } catch {
+          return null;
+        }
+      })
+      .filter((v) => v && v.type === "tool_use");
+    const sawDiffStat = assistantToolUses.some((u) => String(u?.input?.command || "").includes("git diff --stat"));
+    const sawCommit = assistantToolUses.some((u) =>
+      String(u?.input?.command || "").toLowerCase().startsWith("git commit --dry-run")
+    );
+    expect(sawDiffStat).toBe(true);
+    expect(sawCommit).toBe(true);
   });
 
   test("stops alternating tools when a verified outcome repeats", async () => {

@@ -38,6 +38,7 @@ const SLASH_COMMANDS = [
   "/compact",
   "/approve",
   "/trace",
+  "/debug llm",
   "/model",
   "/skills",
   "/skills list",
@@ -303,6 +304,20 @@ async function finishTaskTrace(taskTraceRef, workspaceDir, { status = "done", er
   }
 }
 
+async function persistLlmSessionEvent(taskTraceRef, workspaceDir, entry) {
+  if (!entry || typeof entry !== "object") return;
+  try {
+    const sessionDir =
+      taskTraceRef.sessionDir ||
+      (await ensureSessionStoreDir(workspaceDir, taskTraceRef.sessionId));
+    taskTraceRef.sessionDir = sessionDir;
+    const llmPath = path.join(sessionDir, "llm.jsonl");
+    await fs.appendFile(llmPath, `${JSON.stringify(entry)}\n`, "utf8");
+  } catch {
+    // Best effort only; runtime should continue even if logging fails.
+  }
+}
+
 async function loadProjectInstructions(workspaceDir) {
   const candidates = ["AGENTS.md"];
   for (const name of candidates) {
@@ -458,6 +473,7 @@ Slash commands in interactive mode:
   /compact             Compact older context and keep recent turns
   /approve on|off      Toggle shell auto-approval
   /trace on|off        Toggle runtime trace logs (timings/stages)
+  /debug llm           Dump latest LLM request/response payloads
   /model               Show active provider/model
                        Tip: use /model codex:gpt-5.3-codex to force Codex provider
   /skills              Show active skills
@@ -476,7 +492,7 @@ Slash commands in interactive mode:
   HOME/END             Jump to oldest/newest timeline content (TUI mode)
   CTRL+L               Toggle event log panel (TUI mode)
   CTRL+T               Toggle TODO panel (TUI mode)
-  CTRL+O               Toggle LLM request/response debug panel (TUI mode)
+  CTRL+O               Open LLM debug panel (TUI mode)
   CTRL+A / CTRL+E      Move cursor to start/end of input (TUI mode)
   ESC (twice)          Abort current running task (TUI mode)
   SHIFT+ENTER / CTRL+J Insert newline in prompt (TUI mode)
@@ -529,6 +545,207 @@ function parseArgs(argv) {
     }
   }
   return args;
+}
+
+function formatJsonMaybe(value) {
+  const text = String(value || "");
+  if (!text.trim()) return { text: "", parsed: null };
+  try {
+    const parsed = JSON.parse(text);
+    return { text: JSON.stringify(parsed, null, 2), parsed };
+  } catch {
+    return { text, parsed: null };
+  }
+}
+
+function collectContentParts(value) {
+  if (value == null) return [];
+  if (typeof value === "string") return value.trim() ? [value.trim()] : [];
+  if (Array.isArray(value)) return value.flatMap((item) => collectContentParts(item));
+  if (typeof value !== "object") return [];
+
+  const out = [];
+  if (typeof value.text === "string" && value.text.trim()) out.push(value.text.trim());
+  if (typeof value.content === "string" && value.content.trim()) out.push(value.content.trim());
+  if (typeof value.output_text === "string" && value.output_text.trim()) out.push(value.output_text.trim());
+  if (value.message) out.push(...collectContentParts(value.message));
+  if (value.delta) out.push(...collectContentParts(value.delta));
+  if (value.content && typeof value.content === "object") out.push(...collectContentParts(value.content));
+  if (value.output && typeof value.output === "object") out.push(...collectContentParts(value.output));
+  if (value.choices && typeof value.choices === "object") out.push(...collectContentParts(value.choices));
+  return out;
+}
+
+function summarizeResponsePayload(parsed) {
+  if (!parsed || typeof parsed !== "object") return [];
+  const lines = [];
+  const finishReason =
+    parsed.stop_reason ||
+    parsed.finish_reason ||
+    parsed?.choices?.[0]?.finish_reason ||
+    parsed?.response?.stop_reason ||
+    "";
+  if (finishReason) lines.push(`- finish_reason: ${finishReason}`);
+
+  const usage = parsed.usage || parsed?.response?.usage || null;
+  if (usage && typeof usage === "object") {
+    const inTok = usage.input_tokens ?? usage.prompt_tokens ?? usage.tokens_in;
+    const outTok = usage.output_tokens ?? usage.completion_tokens ?? usage.tokens_out;
+    const totalTok = usage.total_tokens ?? usage.tokens;
+    if (inTok != null || outTok != null || totalTok != null) {
+      lines.push(`- usage: in=${inTok ?? "-"} out=${outTok ?? "-"} total=${totalTok ?? "-"}`);
+    }
+  }
+
+  const parts = collectContentParts(parsed).filter(Boolean);
+  if (parts.length > 0) {
+    const merged = parts.join("\n").trim();
+    lines.push("- content:");
+    lines.push("```text");
+    lines.push(merged);
+    lines.push("```");
+  }
+  return lines;
+}
+
+function trackLlmDebugEvent(llmHistoryRef, direction, payload) {
+  if (!llmHistoryRef || !llmHistoryRef.value) return null;
+  const state = llmHistoryRef.value;
+  if (!Array.isArray(state.entries)) state.entries = [];
+  if (!Number.isFinite(state.seq)) state.seq = 0;
+  if (!Number.isFinite(state.index)) state.index = -1;
+  const nextId = () => {
+    state.seq += 1;
+    return state.seq;
+  };
+
+  const data = payload && typeof payload === "object" ? payload : {};
+  if (direction === "request") {
+    const item = { id: nextId(), request: data, response: null, stage: String(data.stage || "") };
+    state.entries.push(item);
+    state.index = state.entries.length - 1;
+    return item;
+  }
+
+  if (direction === "response") {
+    let target = null;
+    for (let i = state.entries.length - 1; i >= 0; i -= 1) {
+      const entry = state.entries[i];
+      if (!entry || entry.response) continue;
+      if (!entry.stage || entry.stage === String(data.stage || "")) {
+        target = entry;
+        break;
+      }
+    }
+    if (!target) {
+      target = { id: nextId(), request: null, response: data, stage: String(data.stage || "") };
+      state.entries.push(target);
+    } else {
+      target.response = data;
+    }
+    state.index = state.entries.length - 1;
+    return target;
+  }
+
+  return null;
+}
+
+function appendThinkingToLlmDebugEvent(llmHistoryRef, stage, delta) {
+  if (!llmHistoryRef?.value || !delta) return null;
+  const state = llmHistoryRef.value;
+  if (!Array.isArray(state.entries) || state.entries.length === 0) return null;
+  const targetStage = String(stage || "");
+  let target = null;
+  for (let i = state.entries.length - 1; i >= 0; i -= 1) {
+    const entry = state.entries[i];
+    if (!entry) continue;
+    if (!targetStage || !entry.stage || entry.stage === targetStage) {
+      target = entry;
+      break;
+    }
+  }
+  if (!target) return null;
+  target.thinking = `${String(target.thinking || "")}${String(delta || "")}`;
+  return target;
+}
+
+function renderLlmDebugEntry(entry, position, total) {
+  const lines = ["## LLM Debug Dump"];
+  lines.push("", `Entry: ${position}/${total}`);
+  const req = entry?.request || null;
+  const res = entry?.response || null;
+  const thinking = String(entry?.thinking || "");
+
+  if (req) {
+    const formattedReq = formatJsonMaybe(String(req.payload || ""));
+    lines.push(
+      "",
+      `Request: stage=${req.stage || "-"} provider=${req.provider || "-"} model=${req.model || "-"} endpoint=${req.endpoint || "-"}`,
+      "```text",
+      formattedReq.text,
+      "```"
+    );
+  } else {
+    lines.push("", "Request: <none>");
+  }
+
+  if (thinking) {
+    lines.push("", "Thinking Output:", "```text", thinking, "```");
+  } else {
+    lines.push("", "Thinking Output: <none>");
+  }
+  if (res) {
+    const formattedRes = formatJsonMaybe(String(res.payload || ""));
+    const keySummary = summarizeResponsePayload(formattedRes.parsed);
+    lines.push(
+      "",
+      `Response: stage=${res.stage || "-"} provider=${res.provider || "-"} model=${res.model || "-"} endpoint=${res.endpoint || "-"}`
+    );
+    if (keySummary.length > 0) {
+      lines.push("", "Response Key Content:", ...keySummary);
+    }
+    lines.push(
+      "",
+      "Response Raw:",
+      "```text",
+      formattedRes.text,
+      "```"
+    );
+  } else {
+    lines.push("", "Response: <none>");
+  }
+  return lines.join("\n");
+}
+
+function openLlmDebugOverlay({ tui, llmHistoryRef, llmLastRef, logLine }) {
+  let entries = Array.isArray(llmHistoryRef?.value?.entries) ? llmHistoryRef.value.entries : [];
+  if (entries.length === 0) {
+    const req = llmLastRef?.value?.request || null;
+    const res = llmLastRef?.value?.response || null;
+    if (!req && !res) {
+      if (typeof logLine === "function") logLine("no llm request/response captured yet");
+      return false;
+    }
+    if (req) trackLlmDebugEvent(llmHistoryRef, "request", req);
+    if (res) trackLlmDebugEvent(llmHistoryRef, "response", res);
+    entries = Array.isArray(llmHistoryRef?.value?.entries) ? llmHistoryRef.value.entries : [];
+  }
+  if (entries.length === 0) {
+    if (typeof logLine === "function") logLine("no llm request/response captured yet");
+    return false;
+  }
+  const selected = Math.max(0, Math.min(entries.length - 1, Number(llmHistoryRef.value.index) || entries.length - 1));
+  llmHistoryRef.value.index = selected;
+  const payload = renderLlmDebugEntry(entries[selected], selected + 1, entries.length);
+  if (tui && typeof tui.openOverlay === "function") {
+    tui.openOverlay(`LLM Debug ${selected + 1}/${entries.length}`, payload, {
+      mode: "llm-debug",
+      hint: " /:search  n/p: switch entry  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close ",
+    });
+  } else if (typeof logLine === "function") {
+    logLine(`[response] ${payload}`);
+  }
+  return true;
 }
 
 let neoBlessedProbe = null;
@@ -1114,7 +1331,7 @@ function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
     `[banner-title-inline] ${center(" Pie Code  simple like pie")}`,
     `[banner-meta] ${center(`model: ${formatProviderModel(provider)}`)}`,
     `[banner-meta] ${center(`workspace: ${shortWorkspace}`)}`,
-    `[banner-hint] ${center("keys: CTRL+L logs | CTRL+O llm i/o | CTRL+T todos")}`,
+    `[banner-hint] ${center("keys: CTRL+L logs | CTRL+O llm debug | CTRL+T todos")}`,
   ];
   for (const line of logoLines) {
     tui.event(line);
@@ -1405,6 +1622,8 @@ async function handleSlashCommand(input, ctx) {
     setModel,
     settings,
     modelCatalogRef,
+    llmLastRef,
+    llmHistoryRef,
   } = ctx;
 
   const raw = String(input || "").trim();
@@ -1423,6 +1642,7 @@ async function handleSlashCommand(input, ctx) {
         "/compact",
         "/approve on|off",
         "/trace on|off",
+        "/debug llm",
         "/model",
         "/skills",
         "/skills list",
@@ -1481,6 +1701,10 @@ async function handleSlashCommand(input, ctx) {
     } else {
       logLine("usage: /trace on|off");
     }
+    return { done: false, handled: true };
+  }
+  if (lower === "/debug llm") {
+    openLlmDebugOverlay({ tui, llmHistoryRef, llmLastRef, logLine });
     return { done: false, handled: true };
   }
   if (lower === "/model") {
@@ -1752,7 +1976,8 @@ async function main() {
     }
   }
   const display = useTui ? null : new Display();
-  const llmDebugRef = { value: false };
+  const llmLastRef = { value: { request: null, response: null } };
+  const llmHistoryRef = { value: { entries: [], seq: 0, index: -1 } };
   const traceRef = { value: process.env.PIECODE_TRACE === "1" };
   const verboseToolLogs = process.env.PIECODE_VERBOSE_TOOL_LOGS === "1";
   const llmStreamRef = { value: { turn: "", planning: "", replanning: "" } };
@@ -1803,6 +2028,7 @@ async function main() {
         history,
         historySize: HISTORY_MAX,
         removeHistoryDuplicates: true,
+        shouldHandleKeypress: () => !(tui && tui.isOverlayOpen && tui.isOverlayOpen()),
       });
     }
     const next = createInterface({
@@ -1847,7 +2073,6 @@ async function main() {
       getApprovalLabel: () => (autoApproveRef.value ? "on" : "off"),
     });
     tui.setProjectInstructionsStatus(projectInstructionsStatusRef.value);
-    tui.setLlmDebugEnabled(llmDebugRef.value);
     tui.setTodos(todosRef.value);
     onResize = () => {
       tui.render(currentInputRef.value);
@@ -1910,7 +2135,7 @@ async function main() {
         }
       }
 
-      if (isMultilineShortcut(str, key)) {
+      if (isMultilineShortcut(str, key) && !(tui && tui.isOverlayOpen && tui.isOverlayOpen())) {
         // Insert a newline at cursor without submitting.
         safeRlWrite("\n");
         currentInputRef.value = String(rl.line || "");
@@ -1919,6 +2144,111 @@ async function main() {
       }
 
       if (tui) {
+        if (tui.isOverlayOpen && tui.isOverlayOpen()) {
+          if (tui.isOverlaySearchActive && tui.isOverlaySearchActive()) {
+            if (!key.ctrl && !key.meta && !key.shift && key.name === "escape") {
+              tui.cancelOverlaySearch();
+              return;
+            }
+            if (!key.ctrl && !key.meta && (key.name === "return" || key.name === "enter")) {
+              tui.submitOverlaySearch();
+              return;
+            }
+            if (!key.ctrl && !key.meta && key.name === "backspace") {
+              tui.backspaceOverlaySearch();
+              return;
+            }
+            if (
+              !key.ctrl &&
+              !key.meta &&
+              typeof str === "string" &&
+              str &&
+              str !== "\r" &&
+              str !== "\n"
+            ) {
+              tui.appendOverlaySearch(str);
+              return;
+            }
+            return;
+          }
+          if (!key.ctrl && !key.meta && !key.shift && (key.name === "/" || str === "/")) {
+            tui.startOverlaySearch();
+            return;
+          }
+          if (
+            !key.ctrl &&
+            !key.meta &&
+            !key.shift &&
+            key.name === "n" &&
+            tui.getOverlayMode &&
+            tui.getOverlayMode() === "llm-debug"
+          ) {
+            const entries = Array.isArray(llmHistoryRef.value.entries) ? llmHistoryRef.value.entries : [];
+            if (entries.length > 0) {
+              const next = ((Number(llmHistoryRef.value.index) || 0) + 1 + entries.length) % entries.length;
+              llmHistoryRef.value.index = next;
+              const payload = renderLlmDebugEntry(entries[next], next + 1, entries.length);
+              tui.openOverlay(`LLM Debug ${next + 1}/${entries.length}`, payload, {
+                mode: "llm-debug",
+                hint: " /:search  n/p: switch entry  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close ",
+              });
+            }
+            return;
+          }
+          if (
+            !key.ctrl &&
+            !key.meta &&
+            !key.shift &&
+            key.name === "p" &&
+            tui.getOverlayMode &&
+            tui.getOverlayMode() === "llm-debug"
+          ) {
+            const entries = Array.isArray(llmHistoryRef.value.entries) ? llmHistoryRef.value.entries : [];
+            if (entries.length > 0) {
+              const prev = ((Number(llmHistoryRef.value.index) || 0) - 1 + entries.length) % entries.length;
+              llmHistoryRef.value.index = prev;
+              const payload = renderLlmDebugEntry(entries[prev], prev + 1, entries.length);
+              tui.openOverlay(`LLM Debug ${prev + 1}/${entries.length}`, payload, {
+                mode: "llm-debug",
+                hint: " /:search  n/p: switch entry  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close ",
+              });
+            }
+            return;
+          }
+          if (!key.ctrl && !key.meta && !key.shift && key.name === "q") {
+            tui.closeOverlay();
+            return;
+          }
+          if (!key.ctrl && !key.meta && key.shift && key.name === "j") {
+            tui.jumpOverlaySection("request");
+            return;
+          }
+          if (!key.ctrl && !key.meta && key.shift && key.name === "k") {
+            tui.jumpOverlaySection("response");
+            return;
+          }
+          if (!key.ctrl && !key.meta && !key.shift && key.name === "j") {
+            tui.scrollOverlayLines(1);
+            return;
+          }
+          if (!key.ctrl && !key.meta && !key.shift && key.name === "k") {
+            tui.scrollOverlayLines(-1);
+            return;
+          }
+          if (!key.ctrl && !key.meta && !key.shift && key.name === "g") {
+            tui.jumpOverlayCurrentSectionBottom();
+            return;
+          }
+          if (key.ctrl && key.name === "f") {
+            tui.scrollOverlayPage(1);
+            return;
+          }
+          if (key.ctrl && key.name === "b") {
+            tui.scrollOverlayPage(-1);
+            return;
+          }
+          return;
+        }
         if (key.name === "escape" && taskRunningRef.value) {
           if (escAbortArmedRef.value) {
             escAbortArmedRef.value = false;
@@ -1962,10 +2292,7 @@ async function main() {
           return;
         }
         if (key.ctrl && key.name === "o") {
-          llmDebugRef.value = !llmDebugRef.value;
-          tui.setLlmDebugEnabled(llmDebugRef.value);
-          tui.setRawLogsVisible(llmDebugRef.value);
-          tui.render(currentInputRef.value, llmDebugRef.value ? "LLM I/O panel ON" : "LLM I/O panel OFF");
+          openLlmDebugOverlay({ tui, llmHistoryRef, llmLastRef, logLine });
           return;
         }
         if (key.ctrl && (key.name === "a" || key.name === "e")) {
@@ -2367,6 +2694,27 @@ async function main() {
         const sentChars = String(evt.payload || "").length;
         const requestProvider = providerPrefix(providerRef.value?.kind);
         const requestModel = String(providerRef.value?.model || "");
+        llmLastRef.value.request = {
+          at: new Date().toISOString(),
+          stage: String(evt.stage || ""),
+          provider: requestProvider,
+          model: requestModel,
+          endpoint,
+          payload: String(evt.payload || ""),
+        };
+        const trackedRequest = trackLlmDebugEvent(llmHistoryRef, "request", llmLastRef.value.request);
+        void persistLlmSessionEvent(taskTraceRef, workspaceDir, {
+          at: llmLastRef.value.request.at,
+          type: "llm_request",
+          pairId: trackedRequest?.id || null,
+          turnId: traceStateRef.value.turnId,
+          taskId: taskTraceRef.current?.id || "",
+          stage: llmLastRef.value.request.stage,
+          provider: requestProvider,
+          model: requestModel,
+          endpoint,
+          payload: llmLastRef.value.request.payload,
+        });
         recordTaskLlm(taskTraceRef, {
           direction: "request",
           stage: evt.stage,
@@ -2396,12 +2744,19 @@ async function main() {
           tui.addTokenUsage({ sent: sentTokens, received: 0 });
         }
         logLine(`[thinking] request:${evt.stage} endpoint:${endpoint} ${summarizeForLog(evt.payload)}`);
-        if (tui && llmDebugRef.value) {
-          tui.setLlmRequest(`[${evt.stage}] endpoint=${endpoint}\n${evt.payload}`);
-        }
       }
       if (evt.type === "llm_response_delta") {
         recordTaskEvent(taskTraceRef, evt);
+        const trackedThinking = appendThinkingToLlmDebugEvent(llmHistoryRef, evt.stage, evt.delta);
+        void persistLlmSessionEvent(taskTraceRef, workspaceDir, {
+          at: new Date().toISOString(),
+          type: "llm_response_delta",
+          pairId: trackedThinking?.id || null,
+          turnId: traceStateRef.value.turnId,
+          taskId: taskTraceRef.current?.id || "",
+          stage: String(evt.stage || ""),
+          delta: String(evt.delta || ""),
+        });
         if (llmStreamRef.value && Object.prototype.hasOwnProperty.call(llmStreamRef.value, evt.stage)) {
           llmStreamRef.value[evt.stage] += String(evt.delta || "");
         }
@@ -2422,6 +2777,29 @@ async function main() {
         const responseChars = String(evt.payload || "").length;
         const startedAt = Number(traceStateRef.value.llmStageStart[evt.stage] || 0);
         const responseDurationMs = startedAt > 0 ? Date.now() - startedAt : 0;
+        llmLastRef.value.response = {
+          at: new Date().toISOString(),
+          stage: String(evt.stage || ""),
+          provider: responseProvider,
+          model: responseModel,
+          endpoint: responseEndpoint,
+          payload: String(evt.payload || ""),
+        };
+        const trackedResponse = trackLlmDebugEvent(llmHistoryRef, "response", llmLastRef.value.response);
+        void persistLlmSessionEvent(taskTraceRef, workspaceDir, {
+          at: llmLastRef.value.response.at,
+          type: "llm_response",
+          pairId: trackedResponse?.id || null,
+          turnId: traceStateRef.value.turnId,
+          taskId: taskTraceRef.current?.id || "",
+          stage: llmLastRef.value.response.stage,
+          provider: responseProvider,
+          model: responseModel,
+          endpoint: responseEndpoint,
+          durationMs: responseDurationMs,
+          thinking: String(trackedResponse?.thinking || ""),
+          payload: llmLastRef.value.response.payload,
+        });
         recordTaskLlm(taskTraceRef, {
           direction: "response",
           stage: evt.stage,
@@ -2451,9 +2829,6 @@ async function main() {
         const receivedTokens = estimateTokenCount(evt.payload);
         if (tui) tui.addTokenUsage({ sent: 0, received: receivedTokens });
         logLine(`[thinking] response:${evt.stage} ${summarizeForLog(evt.payload)}`);
-        if (tui && llmDebugRef.value) {
-          tui.setLlmResponse(`[${evt.stage}] ${evt.payload}`);
-        }
       }
       if (evt.type === "thinking_done") {
         recordTaskEvent(taskTraceRef, evt);
@@ -2532,6 +2907,14 @@ async function main() {
 
   if (args.prompt !== null) {
     startTaskTrace(taskTraceRef, { input: args.prompt, kind: "agent" });
+    const localInfo = maybeHandleLocalInfoTask(args.prompt, { logLine, tui, display });
+    if (localInfo.handled) {
+      const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done" });
+      if (saved) console.log(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
+      await saveHistory(historyFile, rl.history);
+      rl.close();
+      return;
+    }
     if (tui) tui.setProjectInstructionsVisible(false);
     if (startupAutoSkills.enabled.length > 0) {
       console.log(`auto-loaded skills: ${startupAutoSkills.enabled.join(", ")}`);
@@ -2725,6 +3108,8 @@ async function main() {
       modelCatalogRef,
       todosRef,
       todoAutoTrackRef,
+      llmLastRef,
+      llmHistoryRef,
     });
     if (slash.done) break;
     if (slash.handled) {

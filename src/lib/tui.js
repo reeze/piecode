@@ -114,6 +114,26 @@ function renderMarkdownLines(text) {
   return out;
 }
 
+function highlightOverlaySectionLine(line) {
+  const text = String(line || "");
+  if (/^\s*Request:/i.test(text)) {
+    return text.replace(/^\s*Request:/i, (m) => color(m.trim(), "1;36"));
+  }
+  if (/^\s*Response:/i.test(text)) {
+    return text.replace(/^\s*Response:/i, (m) => color(m.trim(), "1;35"));
+  }
+  if (/^\s*Response Key Content:/i.test(text)) {
+    return text.replace(/^\s*Response Key Content:/i, (m) => color(m.trim(), "1;33"));
+  }
+  if (/^\s*Response Raw:/i.test(text)) {
+    return text.replace(/^\s*Response Raw:/i, (m) => color(m.trim(), "1;90"));
+  }
+  if (/^\s*Thinking Output:/i.test(text)) {
+    return text.replace(/^\s*Thinking Output:/i, (m) => color(m.trim(), "1;32"));
+  }
+  return text;
+}
+
 function trimWorkspaceText(text, maxChars = 6000) {
   const source = String(text || "");
   const limit = Math.max(200, Number(maxChars) || 6000);
@@ -241,6 +261,14 @@ export class SimpleTui {
       detail: "",
     };
     this.showProjectInstructionsStatus = true;
+    this.overlayVisible = false;
+    this.overlayTitle = "";
+    this.overlayText = "";
+    this.overlayScroll = 0;
+    this.overlayMode = "";
+    this.overlayHint = "";
+    this.overlaySearchActive = false;
+    this.overlaySearchQuery = "";
   }
 
   start() {
@@ -388,7 +416,7 @@ export class SimpleTui {
 
   setLlmDebugEnabled(enabled) {
     this.llmDebugEnabled = Boolean(enabled);
-    this.lastStatus = this.llmDebugEnabled ? "LLM I/O debug ON (CTRL+O to toggle)" : "LLM I/O debug OFF";
+    this.lastStatus = this.llmDebugEnabled ? "LLM debug ON" : "LLM debug OFF";
     this.render();
   }
 
@@ -528,6 +556,169 @@ export class SimpleTui {
     if (!this.inputHint) return;
     this.inputHint = "";
     this.render();
+  }
+
+  openOverlay(title, text, options = {}) {
+    this.overlayVisible = true;
+    this.overlayTitle = String(title || "Details");
+    this.overlayText = String(text || "");
+    this.overlayScroll = 0;
+    this.overlayMode = String(options?.mode || "");
+    this.overlayHint = String(options?.hint || "");
+    this.overlaySearchActive = false;
+    this.overlaySearchQuery = "";
+    this.render();
+  }
+
+  closeOverlay() {
+    if (!this.overlayVisible) return;
+    this.overlayVisible = false;
+    this.overlayTitle = "";
+    this.overlayText = "";
+    this.overlayScroll = 0;
+    this.overlayMode = "";
+    this.overlayHint = "";
+    this.overlaySearchActive = false;
+    this.overlaySearchQuery = "";
+    this.render();
+  }
+
+  isOverlayOpen() {
+    return this.overlayVisible;
+  }
+
+  getOverlayMode() {
+    return this.overlayMode;
+  }
+
+  isOverlaySearchActive() {
+    return this.overlayVisible && this.overlaySearchActive;
+  }
+
+  startOverlaySearch() {
+    if (!this.overlayVisible) return false;
+    this.overlaySearchActive = true;
+    this.overlaySearchQuery = "";
+    this.render();
+    return true;
+  }
+
+  appendOverlaySearch(text) {
+    if (!this.overlayVisible || !this.overlaySearchActive) return "";
+    this.overlaySearchQuery += String(text || "");
+    this.render();
+    return this.overlaySearchQuery;
+  }
+
+  backspaceOverlaySearch() {
+    if (!this.overlayVisible || !this.overlaySearchActive) return "";
+    this.overlaySearchQuery = this.overlaySearchQuery.slice(0, -1);
+    this.render();
+    return this.overlaySearchQuery;
+  }
+
+  cancelOverlaySearch() {
+    if (!this.overlayVisible || !this.overlaySearchActive) return false;
+    this.overlaySearchActive = false;
+    this.overlaySearchQuery = "";
+    this.render();
+    return true;
+  }
+
+  findInOverlay(pattern) {
+    if (!this.overlayVisible) return -1;
+    const needle = String(pattern || "").toLowerCase();
+    if (!needle) return -1;
+    const width = Math.max(20, Math.max(40, this.out.columns || 100) - 1);
+    const layout = this.buildOverlayLayout(width);
+    const lines = layout.wrapped.map((line) => String(line || "").toLowerCase());
+    if (lines.length === 0) return -1;
+    const start = Math.max(0, Math.min(lines.length - 1, this.overlayScroll + 1));
+    for (let i = start; i < lines.length; i += 1) {
+      if (lines[i].includes(needle)) {
+        this.overlayScroll = i;
+        this.render();
+        return i;
+      }
+    }
+    for (let i = 0; i < start; i += 1) {
+      if (lines[i].includes(needle)) {
+        this.overlayScroll = i;
+        this.render();
+        return i;
+      }
+    }
+    return -1;
+  }
+
+  submitOverlaySearch() {
+    if (!this.overlayVisible || !this.overlaySearchActive) return false;
+    const query = this.overlaySearchQuery;
+    this.overlaySearchActive = false;
+    this.overlaySearchQuery = "";
+    const idx = this.findInOverlay(query);
+    if (idx >= 0) return true;
+    this.render();
+    return false;
+  }
+
+  scrollOverlayLines(delta) {
+    if (!this.overlayVisible) return 0;
+    const step = Math.max(1, Math.round(Math.abs(Number(delta) || 0)));
+    const direction = Number(delta) < 0 ? -1 : 1;
+    this.overlayScroll = Math.max(0, this.overlayScroll + direction * step);
+    this.render();
+    return this.overlayScroll;
+  }
+
+  scrollOverlayPage(direction = 1) {
+    if (!this.overlayVisible) return 0;
+    const page = Math.max(3, Math.floor((this.out.rows || 30) * 0.6));
+    return this.scrollOverlayLines(direction * page);
+  }
+
+  buildOverlayLayout(width) {
+    const rawLines = String(this.overlayText || "").replace(/\r/g, "").split("\n");
+    const wrapped = [];
+    const rawStartOffsets = [];
+    for (const line of rawLines) {
+      rawStartOffsets.push(wrapped.length);
+      const chunks = wrapText(line, width);
+      if (chunks.length === 0) wrapped.push("");
+      else wrapped.push(...chunks);
+    }
+    let requestOffset = 0;
+    let responseOffset = Math.max(0, wrapped.length - 1);
+    for (let i = 0; i < rawLines.length; i += 1) {
+      const line = String(rawLines[i] || "").trimStart().toLowerCase();
+      if (line.startsWith("request:")) requestOffset = rawStartOffsets[i] || 0;
+      if (line.startsWith("response:")) responseOffset = rawStartOffsets[i] || responseOffset;
+    }
+    return { wrapped, requestOffset, responseOffset };
+  }
+
+  jumpOverlaySection(which = "request") {
+    if (!this.overlayVisible) return 0;
+    const width = Math.max(20, Math.max(40, this.out.columns || 100) - 1);
+    const layout = this.buildOverlayLayout(width);
+    this.overlayScroll = which === "response" ? layout.responseOffset : layout.requestOffset;
+    this.render();
+    return this.overlayScroll;
+  }
+
+  jumpOverlayCurrentSectionBottom() {
+    if (!this.overlayVisible) return 0;
+    const width = Math.max(20, Math.max(40, this.out.columns || 100) - 1);
+    const height = Math.max(16, this.out.rows || 30);
+    const viewport = Math.max(4, height - 4);
+    const layout = this.buildOverlayLayout(width);
+    const inResponse = this.overlayScroll >= layout.responseOffset;
+    const sectionStart = inResponse ? layout.responseOffset : layout.requestOffset;
+    const sectionEnd = inResponse ? layout.wrapped.length : layout.responseOffset;
+    const target = Math.max(sectionStart, Math.max(0, sectionEnd - viewport));
+    this.overlayScroll = target;
+    this.render();
+    return this.overlayScroll;
   }
 
   setModelSuggestions(options, selectedIndex = 0) {
@@ -757,6 +948,9 @@ export class SimpleTui {
       const prefix = idx === 0 ? firstPrefix : contPrefix;
       const maxLineWidth = Math.max(0, width - stringDisplayWidth(prefix));
       const clipped = truncateLine(lineText, maxLineWidth);
+      if (idx === 0 && clipped.startsWith("!")) {
+        return `${prefix}${color("!", "31")}${clipped.slice(1)}`;
+      }
       return `${prefix}${clipped}`;
     });
     if (!hasContent) {
@@ -840,19 +1034,48 @@ export class SimpleTui {
     const termWidth = Math.max(40, this.out.columns || 100);
     const width = Math.max(20, termWidth - 1);
     const height = Math.max(16, this.out.rows || 30);
+
+    if (this.overlayVisible) {
+      const sep = `\x1b[90m${"─".repeat(width)}\x1b[0m`;
+      const title = truncateLine(` ${this.overlayTitle}`, width);
+      const fallbackHint = " /:search  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close ";
+      const hintText = this.overlaySearchActive
+        ? ` /${this.overlaySearchQuery}  (enter: jump, esc: cancel, backspace: edit)`
+        : this.overlayHint || fallbackHint;
+      const hint = truncateLine(hintText, width);
+      const { wrapped } = this.buildOverlayLayout(width);
+      const viewport = Math.max(4, height - 4);
+      const maxStart = Math.max(0, wrapped.length - viewport);
+      this.overlayScroll = Math.max(0, Math.min(this.overlayScroll, maxStart));
+      const visible = wrapped
+        .slice(this.overlayScroll, this.overlayScroll + viewport)
+        .map((line) => highlightOverlaySectionLine(line));
+      const scrollLabel = ` lines ${Math.min(wrapped.length, this.overlayScroll + 1)}-${Math.min(wrapped.length, this.overlayScroll + visible.length)} / ${wrapped.length}`;
+      const statusLine = truncateLine(scrollLabel, width);
+      const frameLines = [sep, `\x1b[1m${title}\x1b[0m`, sep, ...visible, sep, `\x1b[2m${statusLine}\x1b[0m`, `\x1b[2m${hint}\x1b[0m`];
+      const frame = frameLines.join("\n");
+      this.lastFrameLineCount = frameLines.length;
+      this.lastInputRow = 1;
+      this.lastInputLine = "";
+      if (this.layout) {
+        this.layout.render({
+          workspaceLines: frameLines,
+          inputLines: [""],
+          statusLine: "",
+          hintLine: "",
+          cursorRowOffset: 0,
+          cursorCol: 1,
+        });
+        return;
+      }
+      this.out.write("\x1b[H\x1b[J" + frame + `\x1b[?25h\x1b[1;1H`);
+      return;
+    }
+
     const sep = `\x1b[90m${"─".repeat(width)}\x1b[0m`;
     const errorLine = this.lastError ? truncateLine(` error: ${this.lastError}`, width) : "";
 
-    const llmHeader = truncateLine(" LLM I/O DEBUG (CTRL+O to toggle)", width);
-    const llmReqTitle = truncateLine(" request:", width);
-    const llmResTitle = truncateLine(" response:", width);
-    const llmReqLines = this.llmDebugEnabled ? wrapText(this.lastLlmRequest || "<empty>", width).slice(0, 3) : [];
-    const llmResLines = this.llmDebugEnabled ? wrapText(this.lastLlmResponse || "<empty>", width).slice(0, 3) : [];
-
     const headerLines = errorLine ? 1 : 0;
-    const debugBlockLines = this.showRawLogs && this.llmDebugEnabled
-      ? 1 + 1 + llmReqLines.length + 1 + llmResLines.length
-      : 0;
     const todoLines = this.showTodoPanel
       ? Math.min(
           1 + this.todos.length,
@@ -874,7 +1097,6 @@ export class SimpleTui {
     const reservedLines =
       headerLines +
       todoBlockLines +
-      debugBlockLines +
       approvalLines +
       thinkingLines +
       thoughtStreamLines +
@@ -900,20 +1122,22 @@ export class SimpleTui {
         ? ` | session tok:↑${formatCompactNumber(this.sessionTokensSent)} ↓${formatCompactNumber(this.sessionTokensReceived)}`
         : "";
     const promptStatusRaw = `status: ${status || this.lastStatus || "idle"}${ctxStatus}${tokStatus}${scrollLabel}`;
+    const bashMode = /^\s*!/.test(this.currentInput) ? " | mode:bash" : "";
     const projectLabel = this.formatProjectInstructionsLabel();
     let promptStatus = "";
     if (projectLabel) {
       const left = truncateLine(` ${projectLabel}`, width);
       const fixedLeft = stringDisplayWidth(left);
       const rightBudget = Math.max(0, width - fixedLeft - 1);
-      const right = truncateLine(promptStatusRaw, rightBudget);
+      const right = truncateLine(`${promptStatusRaw}${bashMode}`, rightBudget);
       const pad = Math.max(1, width - fixedLeft - stringDisplayWidth(right));
       promptStatus = `${left}${" ".repeat(pad)}${right}`;
     } else {
+      const raw = `${promptStatusRaw}${bashMode}`;
       promptStatus =
-        promptStatusRaw.length >= width
-          ? truncateLine(promptStatusRaw, width)
-          : `${" ".repeat(Math.max(0, width - promptStatusRaw.length))}${promptStatusRaw}`;
+        raw.length >= width
+          ? truncateLine(raw, width)
+          : `${" ".repeat(Math.max(0, width - raw.length))}${raw}`;
     }
     const approvalBlock = this.approvalPrompt ? [sep, ...approvalContentLines] : [];
     const thinkingColors = ["82", "118", "154", "190", "201"];
@@ -970,9 +1194,6 @@ export class SimpleTui {
       ...(errorLine ? [`\x1b[31m${errorLine}\x1b[0m`] : []),
       ...visibleLogs,
       ...todoLinesBlock,
-      ...(this.showRawLogs && this.llmDebugEnabled
-        ? [sep, `\x1b[35m${llmHeader}\x1b[0m`, llmReqTitle, ...llmReqLines, llmResTitle, ...llmResLines]
-        : []),
       ...approvalBlock,
       ...thinkingBlock,
       ...thoughtStreamBlock,

@@ -188,6 +188,7 @@ export class Agent {
         allowedTools: ["shell"],
         forceFinalizeAfterTool: !asksCommitMessage,
         requireCommitMessage: asksCommitMessage,
+        readOnlyShellOnly: true,
         disableTodos: true,
         note: asksCommitMessage
           ? "Use at most two shell checks (prefer git diff/git status once each), then provide a concise summary and a commit message."
@@ -199,6 +200,24 @@ export class Agent {
       /\bgit\s+status\b/.test(lower) ||
       /\b(check|show|get)\b.*\b(status)\b.*\b(repo|repository)\b/.test(lower) ||
       /\b(status)\b.*\b(repo|repository)\b/.test(lower);
+
+    const asksCommitAction =
+      /\bcommit\b/.test(lower) &&
+      (/\b(help|please|can you|do it|them|changes|generated message|message)\b/.test(lower) ||
+        /\bgit\s+commit\b/.test(lower));
+
+    if (asksCommitAction) {
+      return {
+        name: "repo_commit_request",
+        maxToolCalls: 4,
+        allowedTools: ["shell"],
+        forceFinalizeAfterTool: false,
+        disableTodos: true,
+        allowCommitFlowShellOnly: true,
+        finalizeAfterFirstCommitAttempt: true,
+        note: "For commit requests, use git status/diff/add/commit commands and stop after one commit attempt or when repo is already clean.",
+      };
+    }
 
     if (asksGitStatus) {
       return {
@@ -248,6 +267,26 @@ export class Agent {
     }
 
     return cmd.trim();
+  }
+
+  isReadOnlyShellCommandForSummary(command) {
+    const cmd = this.normalizeShellCommand(command).toLowerCase();
+    if (!cmd) return false;
+    // Block command chaining and potentially mutating constructs in this strict mode.
+    if (/[;&]|&&|\|\||\|/.test(cmd)) return false;
+    return (
+      /^git\s+status(\s+.*)?$/.test(cmd) ||
+      /^git\s+diff(\s+.*)?$/.test(cmd) ||
+      /^git\s+show(\s+.*)?$/.test(cmd) ||
+      /^git\s+log(\s+.*)?$/.test(cmd)
+    );
+  }
+
+  isAllowedShellCommandForCommitFlow(command) {
+    const cmd = this.normalizeShellCommand(command).toLowerCase();
+    if (!cmd) return false;
+    if (/[;&]|&&|\|\||\|/.test(cmd)) return false;
+    return /^git\s+(status|diff|add|commit)\b/.test(cmd);
   }
 
   buildToolSignature(action) {
@@ -470,6 +509,8 @@ export class Agent {
       let turnToolLimitReached = false;
       let postLimitToolRetryCount = 0;
       const pendingToolActions = [];
+      let commitAttemptedThisTurn = false;
+      let commitStatusCheckedThisTurn = false;
 
       // 对于简单任务，使用原有的循环方式
       let i = 0;
@@ -614,6 +655,51 @@ export class Agent {
             return msg;
           }
         }
+        if (action.tool === "shell" && turnPolicy?.readOnlyShellOnly) {
+          const cmd = String(action?.input?.command || "");
+          if (!this.isReadOnlyShellCommandForSummary(cmd)) {
+            const forced = await this.synthesizeFinalFromEvidence({
+              userMessage,
+              requireCommitMessage: Boolean(turnPolicy?.requireCommitMessage),
+              signal,
+            }).catch(() => "");
+            const msg =
+              String(forced || "").trim() ||
+              "Blocked non-read-only shell command for this summary request. I finalized from collected evidence instead.";
+            this.history.push({ role: "assistant", content: msg });
+            return msg;
+          }
+        }
+        if (action.tool === "shell" && turnPolicy?.allowCommitFlowShellOnly) {
+          const cmd = String(action?.input?.command || "");
+          if (!this.isAllowedShellCommandForCommitFlow(cmd)) {
+            const msg =
+              "For this commit request, only git status/diff/add/commit commands are allowed. Please provide a valid commit command.";
+            this.history.push({ role: "assistant", content: msg });
+            return msg;
+          }
+          const normalized = this.normalizeShellCommand(cmd).toLowerCase();
+          if (/^git\s+status\b/.test(normalized) && commitStatusCheckedThisTurn) {
+            if (pendingToolActions.length > 0) {
+              this.history.push({
+                role: "assistant",
+                content:
+                  "git status already checked in this turn. Skipping duplicate status and continuing with remaining actions.",
+              });
+              continue;
+            }
+            const forced = await this.synthesizeFinalFromEvidence({
+              userMessage,
+              requireCommitMessage: false,
+              signal,
+            }).catch(() => "");
+            const msg =
+              String(forced || "").trim() ||
+              "I already checked git status in this turn. Finalizing now to avoid repeating commit-prep checks.";
+            this.history.push({ role: "assistant", content: msg });
+            return msg;
+          }
+        }
 
         const toolSignature = this.buildToolSignature(action);
         if (toolSignature === lastToolSignature && repeatedNoProgressCount >= 2) {
@@ -709,6 +795,32 @@ export class Agent {
           content: JSON.stringify(toolResultMessage),
           ...(useNativeTools ? { toolResult: { toolCallId: callId, name: action.tool, result } } : {}),
         });
+
+        if (action.tool === "shell" && turnPolicy?.finalizeAfterFirstCommitAttempt) {
+          const normalizedCmd = this.normalizeShellCommand(String(action?.input?.command || "")).toLowerCase();
+          const outputLower = String(result || "").toLowerCase();
+          if (/^git\s+status\b/.test(normalizedCmd)) {
+            commitStatusCheckedThisTurn = true;
+          }
+          const isCommitCmd = /^git\s+commit\b/.test(normalizedCmd);
+          if (isCommitCmd) {
+            commitAttemptedThisTurn = true;
+            const message = this.formatToolResultForUser(action, result, toolError);
+            this.history.push({ role: "assistant", content: message });
+            return message;
+          }
+          if (outputLower.includes("nothing to commit") || outputLower.includes("working tree clean")) {
+            const msg =
+              "Repository is already clean. There is nothing new to commit. If you want another commit, make changes first.";
+            this.history.push({ role: "assistant", content: msg });
+            return msg;
+          }
+          if (commitAttemptedThisTurn) {
+            const msg = "A commit attempt already happened in this turn. Finalizing to avoid repeated commit attempts.";
+            this.history.push({ role: "assistant", content: msg });
+            return msg;
+          }
+        }
 
         if (
           Number.isFinite(turnPolicy?.maxToolCalls) &&

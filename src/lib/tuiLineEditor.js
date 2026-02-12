@@ -4,6 +4,7 @@ export class TuiLineEditor {
     history = [],
     historySize = 500,
     removeHistoryDuplicates = true,
+    shouldHandleKeypress = null,
   } = {}) {
     this.keypressSource = keypressSource;
     this.history = Array.isArray(history) ? [...history] : [];
@@ -16,6 +17,8 @@ export class TuiLineEditor {
     this.pending = null;
     this.historyIndex = -1;
     this.historyScratch = "";
+    this.shouldHandleKeypress =
+      typeof shouldHandleKeypress === "function" ? shouldHandleKeypress : null;
     this._onKeypress = this._onKeypress.bind(this);
     if (this.keypressSource && typeof this.keypressSource.on === "function") {
       this.keypressSource.on("keypress", this._onKeypress);
@@ -135,6 +138,7 @@ export class TuiLineEditor {
 
   _onKeypress(str, key = {}) {
     if (!this.pending || this.closed) return;
+    if (this.shouldHandleKeypress && this.shouldHandleKeypress(str, key) === false) return;
     const name = String(key?.name || "").toLowerCase();
     const ctrl = Boolean(key?.ctrl);
     const meta = Boolean(key?.meta);

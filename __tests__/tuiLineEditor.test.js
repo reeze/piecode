@@ -103,4 +103,30 @@ describe("tui line editor", () => {
     await expect(pending).resolves.toBe("abc");
     rl.close();
   });
+
+  test("ignores keypresses when shouldHandleKeypress blocks input", async () => {
+    const source = new EventEmitter();
+    let blocked = true;
+    const rl = new TuiLineEditor({
+      keypressSource: source,
+      shouldHandleKeypress: () => !blocked,
+    });
+    const pending = rl.question("");
+    emitKey(source, "x", { name: "x" });
+    emitKey(source, "\r", { name: "enter" });
+    expect(rl.line).toBe("");
+
+    const pendingState = await Promise.race([
+      pending.then(() => "resolved"),
+      new Promise((resolve) => setTimeout(() => resolve("pending"), 20)),
+    ]);
+    expect(pendingState).toBe("pending");
+
+    blocked = false;
+    emitKey(source, "o", { name: "o" });
+    emitKey(source, "k", { name: "k" });
+    emitKey(source, "\r", { name: "enter" });
+    await expect(pending).resolves.toBe("ok");
+    rl.close();
+  });
 });

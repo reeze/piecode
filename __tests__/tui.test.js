@@ -95,7 +95,7 @@ describe("tui usability", () => {
     expect(longLines.join("\n")).toContain("[trimmed ");
   });
 
-  test("LLM debug panel appears only in raw log view when CTRL+O is enabled", () => {
+  test("overlay renders section labels and hint text", () => {
     const out = createOut();
     const tui = new SimpleTui({
       out,
@@ -106,23 +106,46 @@ describe("tui usability", () => {
     });
 
     tui.start();
-    tui.setLlmDebugEnabled(true);
-    tui.setLlmRequest("[turn] request payload");
-    tui.setLlmResponse("[turn] response payload");
-
-    let frame = latestFrame(out);
-    expect(frame).not.toContain("LLM I/O DEBUG");
-
-    tui.toggleLogPanel();
-    frame = latestFrame(out);
-    expect(frame).toContain("LLM I/O DEBUG");
-    expect(frame).toContain("request:");
-    expect(frame).toContain("request payload");
-    expect(frame).toContain("response:");
-    expect(frame).toContain("response payload");
+    tui.openOverlay(
+      "LLM Debug 1/2",
+      "Request: stage=turn\nResponse: stage=turn\nThinking Output:\n```text\nabc\n```",
+      { mode: "llm-debug", hint: " n/p: switch entry  q: close " }
+    );
+    const frame = latestFrame(out);
+    expect(frame).toContain("LLM Debug 1/2");
+    expect(frame).toContain("Request:");
+    expect(frame).toContain("Response:");
+    expect(frame).toContain("Thinking Output:");
+    expect(frame).toContain("n/p: switch entry");
   });
 
-  test("cursor anchors to input row after toggling LLM debug", () => {
+  test("overlay slash search jumps to matching content", () => {
+    const out = createOut(80, 12);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    const content = [
+      ...Array.from({ length: 20 }, (_v, i) => `line-${i + 1}`),
+      "needle-target",
+      ...Array.from({ length: 10 }, (_v, i) => `tail-${i + 1}`),
+    ].join("\n");
+    tui.openOverlay("LLM Debug 1/1", content, { mode: "llm-debug" });
+    expect(tui.overlayScroll).toBe(0);
+    tui.startOverlaySearch();
+    tui.appendOverlaySearch("needle");
+    const found = tui.submitOverlaySearch();
+    expect(found).toBe(true);
+    expect(tui.overlayScroll).toBeGreaterThan(0);
+    expect(tui.isOverlaySearchActive()).toBe(false);
+  });
+
+  test("cursor anchors to input row after repeated renders", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
       out,
@@ -133,8 +156,8 @@ describe("tui usability", () => {
     });
 
     tui.start();
-    tui.setLlmDebugEnabled(true);
-    tui.setLlmDebugEnabled(false);
+    tui.render("", "ready");
+    tui.render("", "ready");
     tui.renderInput("abc");
 
     const lastWrite = out.writes[out.writes.length - 1] || "";
@@ -194,6 +217,24 @@ describe("tui usability", () => {
     expect(frame).not.toContain("llm:");
     expect(frame).not.toContain("view:");
     expect(frame).not.toContain("todos:");
+  });
+
+  test("bash input highlights leading bang and shows bash mode in status", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.renderInput("!git status");
+    const rawFrame = out.writes[out.writes.length - 1] || "";
+    const plainFrame = latestFrame(out);
+    expect(rawFrame).toContain("\x1b[31m!\x1b[0m");
+    expect(plainFrame).toContain("mode:bash");
   });
 
   test("project instructions status is rendered below input", () => {
