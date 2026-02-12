@@ -5,6 +5,7 @@ export function buildSystemPrompt({
   activePlan = null,
   projectInstructions = null,
   nativeTools = false,
+  turnPolicy = null,
 }) {
   const sections = [
     "You are PieCode, a command line coding agent designed to help with software engineering tasks.",
@@ -34,7 +35,8 @@ export function buildSystemPrompt({
 
     "CONVENTIONS:",
     "- Start multi-step work with a short plan",
-    "- Track multi-step progress via todo_write",
+    "- Use todo_write only for genuinely multi-step work (3+ actionable steps) or when user asks for todo tracking",
+    "- Do not repeat identical todo_write payloads",
     "- Keep todo states strict: pending, in_progress, completed",
     "- Keep at most one todo in_progress at a time",
     "- Update todos whenever meaningful progress happens",
@@ -125,6 +127,31 @@ export function buildSystemPrompt({
     if (projectText.trim()) {
       sections.push("", "PROJECT INSTRUCTIONS:", projectText);
     }
+  }
+
+  if (turnPolicy && typeof turnPolicy === "object") {
+    const lines = [];
+    lines.push("", "TURN EXECUTION CONTRACT:");
+    if (turnPolicy.name) lines.push(`- Intent: ${turnPolicy.name}`);
+    if (Number.isFinite(turnPolicy.maxToolCalls)) {
+      lines.push(`- Maximum tool calls this turn: ${turnPolicy.maxToolCalls}`);
+    }
+    if (turnPolicy.forceFinalizeAfterTool) {
+      lines.push("- After the final allowed tool result, provide final answer and stop.");
+    }
+    if (turnPolicy.disableTodos) {
+      lines.push("- Do not call todo_write/todowrite for this turn.");
+    }
+    if (Array.isArray(turnPolicy.allowedTools) && turnPolicy.allowedTools.length > 0) {
+      lines.push(`- Allowed tools for this turn: ${turnPolicy.allowedTools.join(", ")}`);
+    }
+    if (turnPolicy.note) {
+      lines.push(`- Note: ${turnPolicy.note}`);
+    }
+    if (turnPolicy.requireCommitMessage) {
+      lines.push("- Final answer must include a suggested commit message.");
+    }
+    sections.push(...lines);
   }
 
   return sections.join("\n");
@@ -539,21 +566,24 @@ export function parseNativeResponse(response, format = "anthropic") {
   const message = response.message || response;
   const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
   if (toolCalls.length > 0) {
-    const call = toolCalls[0];
-    let input = {};
-    try {
-      input = JSON.parse(call.function?.arguments || "{}");
-    } catch {
-      // keep empty
-    }
-    return {
-      type: "tool_use",
-      tool: call.function?.name || "",
-      input: input && typeof input === "object" ? input : {},
-      reason: typeof message.content === "string" ? message.content : "",
-      thought: "",
-      _callId: call.id || "",
-    };
+    const calls = toolCalls.map((call) => {
+      let input = {};
+      try {
+        input = JSON.parse(call.function?.arguments || "{}");
+      } catch {
+        // keep empty
+      }
+      return {
+        type: "tool_use",
+        tool: call.function?.name || "",
+        input: input && typeof input === "object" ? input : {},
+        reason: typeof message.content === "string" ? message.content : "",
+        thought: "",
+        _callId: call.id || "",
+      };
+    });
+    if (calls.length === 1) return calls[0];
+    return { type: "tool_uses", calls };
   }
   return {
     type: "final",

@@ -148,6 +148,116 @@ export class Agent {
     return Array.isArray(this.activeSkillsRef?.value) ? this.activeSkillsRef.value : [];
   }
 
+  stableStringify(value) {
+    const seen = new WeakSet();
+    const normalize = (input) => {
+      if (input === null || typeof input !== "object") return input;
+      if (seen.has(input)) return "[Circular]";
+      seen.add(input);
+      if (Array.isArray(input)) return input.map((item) => normalize(item));
+      const keys = Object.keys(input).sort();
+      const out = {};
+      for (const key of keys) out[key] = normalize(input[key]);
+      return out;
+    };
+    try {
+      return JSON.stringify(normalize(value));
+    } catch {
+      return String(value || "");
+    }
+  }
+
+  detectTurnPolicy(userMessage) {
+    const text = String(userMessage || "").trim();
+    const lower = text.toLowerCase();
+
+    const asksDiffSummary =
+      (/\b(summarize|summarise|summerize|explain|describe|tell)\b/.test(lower) &&
+        /\b(diff|changes|what happened|git diff)\b/.test(lower)) ||
+      /\b(summarize|summarise|summerize)\b.*\b(diff|changes)\b/.test(lower) ||
+      /\bwhat happened\b.*\b(diff|changes)\b/.test(lower);
+
+    if (asksDiffSummary) {
+      const asksCommitMessage =
+        /\bcommit\s+message\b/.test(lower) ||
+        /\bgenerate\b.*\bcommit\b/.test(lower) ||
+        /\bwrite\b.*\bcommit\b/.test(lower);
+      return {
+        name: "repo_diff_summary",
+        maxToolCalls: 2,
+        allowedTools: ["shell"],
+        forceFinalizeAfterTool: !asksCommitMessage,
+        requireCommitMessage: asksCommitMessage,
+        disableTodos: true,
+        note: asksCommitMessage
+          ? "Use at most two shell checks (prefer git diff/git status once each), then provide a concise summary and a commit message."
+          : "Use at most two shell checks (prefer git diff/git status once each), then provide a concise summary.",
+      };
+    }
+
+    const asksGitStatus =
+      /\bgit\s+status\b/.test(lower) ||
+      /\b(check|show|get)\b.*\b(status)\b.*\b(repo|repository)\b/.test(lower) ||
+      /\b(status)\b.*\b(repo|repository)\b/.test(lower);
+
+    if (asksGitStatus) {
+      return {
+        name: "repo_status_check",
+        maxToolCalls: 1,
+        allowedTools: ["shell"],
+        forceFinalizeAfterTool: true,
+        disableTodos: true,
+        note: "This is a single-check request; one shell command is sufficient.",
+      };
+    }
+
+    return null;
+  }
+
+  formatToolResultForUser(action, result, toolError = null) {
+    if (toolError) {
+      return `Tool ${action?.tool || "unknown"} failed: ${toolError}`;
+    }
+    if (action?.tool === "shell") {
+      const cmd = String(action?.input?.command || "").trim();
+      const output = String(result || "");
+      return cmd ? `Ran \`${cmd}\`.\n\n${output}` : output;
+    }
+    return String(result || "");
+  }
+
+  normalizeShellCommand(command) {
+    let cmd = String(command || "").trim();
+    if (!cmd) return cmd;
+    cmd = cmd.replace(/\s+/g, " ");
+
+    // Normalize common "cd <workspace> && <cmd>" wrappers that models often emit.
+    let previous = "";
+    while (cmd !== previous) {
+      previous = cmd;
+      const match = cmd.match(/^cd\s+("[^"]+"|'[^']+'|[^\s&;|]+)\s*&&\s*(.+)$/i);
+      if (!match) break;
+      const rawPath = String(match[1] || "").replace(/^['"]|['"]$/g, "");
+      const rest = String(match[2] || "").trim();
+      if (!rest) break;
+      if (rawPath === "." || rawPath === this.workspaceDir) {
+        cmd = rest;
+      } else {
+        break;
+      }
+    }
+
+    return cmd.trim();
+  }
+
+  buildToolSignature(action) {
+    const input = action?.input && typeof action.input === "object" ? { ...action.input } : {};
+    if (String(action?.tool || "") === "shell" && typeof input.command === "string") {
+      input.command = this.normalizeShellCommand(input.command);
+    }
+    return `${action?.tool || ""}:${this.stableStringify(input)}`;
+  }
+
   extractFirstJsonObject(text) {
     const source = String(text || "");
     const start = source.indexOf("{");
@@ -196,6 +306,67 @@ export class Agent {
       }
     }
     return null;
+  }
+
+  async synthesizeFinalFromEvidence({
+    userMessage,
+    requireCommitMessage = false,
+    signal = null,
+  } = {}) {
+    const evidence = [];
+    for (let i = this.history.length - 1; i >= 0; i -= 1) {
+      const msg = this.history[i];
+      if (msg?.role !== "user") continue;
+      let parsed = null;
+      try {
+        parsed = JSON.parse(String(msg.content || ""));
+      } catch {
+        parsed = null;
+      }
+      if (!parsed || parsed.type !== "tool_result") continue;
+      evidence.push({
+        tool: String(parsed.tool || "unknown"),
+        result: String(parsed.result || ""),
+      });
+      if (evidence.length >= 4) break;
+    }
+    const ordered = evidence.reverse();
+    const evidenceText =
+      ordered.length > 0
+        ? ordered
+            .map((e, idx) => `#${idx + 1} tool=${e.tool}\n${String(e.result || "").slice(0, 4000)}`)
+            .join("\n\n")
+        : "(no tool evidence available)";
+
+    const finalizeSystemPrompt = [
+      "You are finalizing a coding-agent response from already-collected tool outputs.",
+      "Do not request any more tools.",
+      "Return plain text only.",
+    ].join("\n");
+    const finalizePrompt = [
+      `User request:\n${String(userMessage || "")}`,
+      `Collected evidence:\n${evidenceText}`,
+      requireCommitMessage
+        ? "Provide: (1) concise summary of what changed, and (2) 'Suggested commit message:' line."
+        : "Provide a concise final answer based on the evidence.",
+    ].join("\n\n");
+
+    this.onEvent?.({ type: "model_call", provider: this.provider.kind, model: this.provider.model });
+    this.onEvent?.({
+      type: "llm_request",
+      stage: "turn_finalize",
+      payload: `SYSTEM:\n${finalizeSystemPrompt}\n\nUSER:\n${finalizePrompt}`,
+    });
+    const raw = await this.provider.complete({
+      systemPrompt: finalizeSystemPrompt,
+      prompt: finalizePrompt,
+      signal,
+    });
+    this.onEvent?.({ type: "llm_response", stage: "turn_finalize", payload: String(raw || "") });
+    const parsed = parseModelAction(String(raw || ""));
+    if (parsed?.type === "final" && parsed.message) return String(parsed.message);
+    if (parsed?.type === "thought" && parsed.content) return String(parsed.content);
+    return String(raw || "").trim();
   }
 
   async planTurn(userMessage, signal = null) {
@@ -272,6 +443,7 @@ export class Agent {
     const signal = this.activeAbortController.signal;
     this.history.push({ role: "user", content: userMessage });
     let activePlan = null;
+    const turnPolicy = this.detectTurnPolicy(userMessage);
 
     try {
       this.throwIfAborted(signal);
@@ -290,6 +462,14 @@ export class Agent {
       let toolCalls = 0;
       let budget = toolBudget;
       let didReplan = false;
+      let lastToolSignature = "";
+      let lastToolResultDigest = "";
+      let repeatedNoProgressCount = 0;
+      const seenOutcomeCounts = new Map();
+      let todoNoopCount = 0;
+      let turnToolLimitReached = false;
+      let postLimitToolRetryCount = 0;
+      const pendingToolActions = [];
 
       // 对于简单任务，使用原有的循环方式
       let i = 0;
@@ -307,63 +487,78 @@ export class Agent {
           }
         }
 
-        const useNativeTools = this.provider.supportsNativeTools === true;
-        const nativeFormat = this.provider.kind === "anthropic" ? "anthropic" : "openai";
-
-        const systemPrompt = buildSystemPrompt({
-          workspaceDir: this.workspaceDir,
-          autoApprove: this.autoApproveRef.value,
-          activeSkills: this.getActiveSkills(),
-          activePlan,
-          projectInstructions: this.projectInstructionsRef?.value?.content || null,
-          nativeTools: useNativeTools,
-        });
-
-        this.onEvent?.({ type: "model_call", provider: this.provider.kind, model: this.provider.model });
-
         let action;
-        if (useNativeTools) {
-          const messages = buildMessages({ history: this.history });
-          const tools = buildToolDefinitions(nativeFormat);
-          this.onEvent?.({
-            type: "llm_request",
-            stage: "turn",
-            payload: `SYSTEM:\n${systemPrompt}\n\nMESSAGES: ${messages.length} entries\nTOOLS: ${tools.length} definitions`,
-          });
-          const response =
-            typeof this.provider.completeStream === "function"
-              ? await this.provider.completeStream({
-                  systemPrompt,
-                  messages,
-                  tools,
-                  signal,
-                  onDelta: (delta) =>
-                    this.onEvent?.({ type: "llm_response_delta", stage: "turn", delta: String(delta || "") }),
-                })
-              : await this.provider.complete({ systemPrompt, messages, tools, signal });
-          this.throwIfAborted(signal);
-          this.onEvent?.({ type: "llm_response", stage: "turn", payload: String(JSON.stringify(response) || "") });
-          action = parseNativeResponse(response, nativeFormat);
+        const useNativeTools = this.provider.supportsNativeTools === true;
+        if (pendingToolActions.length > 0) {
+          action = pendingToolActions.shift();
         } else {
-          const prompt = formatHistory(this.history);
-          this.onEvent?.({
-            type: "llm_request",
-            stage: "turn",
-            payload: `SYSTEM:\n${systemPrompt}\n\nUSER:\n${prompt}`,
+          const nativeFormat = this.provider.kind === "anthropic" ? "anthropic" : "openai";
+          const systemPrompt = buildSystemPrompt({
+            workspaceDir: this.workspaceDir,
+            autoApprove: this.autoApproveRef.value,
+            activeSkills: this.getActiveSkills(),
+            activePlan,
+            projectInstructions: this.projectInstructionsRef?.value?.content || null,
+            nativeTools: useNativeTools,
+            turnPolicy,
           });
-          const raw =
-            typeof this.provider.completeStream === "function"
-              ? await this.provider.completeStream({
-                  systemPrompt,
-                  prompt,
-                  signal,
-                  onDelta: (delta) =>
-                    this.onEvent?.({ type: "llm_response_delta", stage: "turn", delta: String(delta || "") }),
-                })
-              : await this.provider.complete({ systemPrompt, prompt, signal });
-          this.throwIfAborted(signal);
-          this.onEvent?.({ type: "llm_response", stage: "turn", payload: String(raw || "") });
-          action = parseModelAction(raw);
+
+          this.onEvent?.({ type: "model_call", provider: this.provider.kind, model: this.provider.model });
+          if (useNativeTools) {
+            const messages = buildMessages({ history: this.history });
+            const tools = buildToolDefinitions(nativeFormat);
+            this.onEvent?.({
+              type: "llm_request",
+              stage: "turn",
+              payload: `SYSTEM:\n${systemPrompt}\n\nMESSAGES: ${messages.length} entries\nTOOLS: ${tools.length} definitions`,
+            });
+            const response =
+              typeof this.provider.completeStream === "function"
+                ? await this.provider.completeStream({
+                    systemPrompt,
+                    messages,
+                    tools,
+                    signal,
+                    onDelta: (delta) =>
+                      this.onEvent?.({ type: "llm_response_delta", stage: "turn", delta: String(delta || "") }),
+                  })
+                : await this.provider.complete({ systemPrompt, messages, tools, signal });
+            this.throwIfAborted(signal);
+            this.onEvent?.({ type: "llm_response", stage: "turn", payload: String(JSON.stringify(response) || "") });
+            action = parseNativeResponse(response, nativeFormat);
+          } else {
+            const prompt = formatHistory(this.history);
+            this.onEvent?.({
+              type: "llm_request",
+              stage: "turn",
+              payload: `SYSTEM:\n${systemPrompt}\n\nUSER:\n${prompt}`,
+            });
+            const raw =
+              typeof this.provider.completeStream === "function"
+                ? await this.provider.completeStream({
+                    systemPrompt,
+                    prompt,
+                    signal,
+                    onDelta: (delta) =>
+                      this.onEvent?.({ type: "llm_response_delta", stage: "turn", delta: String(delta || "") }),
+                  })
+                : await this.provider.complete({ systemPrompt, prompt, signal });
+            this.throwIfAborted(signal);
+            this.onEvent?.({ type: "llm_response", stage: "turn", payload: String(raw || "") });
+            action = parseModelAction(raw);
+          }
+        }
+
+        if (action.type === "tool_uses") {
+          const calls = Array.isArray(action.calls) ? action.calls : [];
+          if (calls.length === 0) {
+            const msg = "Model returned an empty tool call batch. Please retry with a final answer or a valid tool call.";
+            this.history.push({ role: "assistant", content: msg });
+            return msg;
+          }
+          const [first, ...rest] = calls;
+          if (rest.length > 0) pendingToolActions.push(...rest);
+          action = first;
         }
 
         if (action.type === "final") {
@@ -382,9 +577,48 @@ export class Agent {
           continue;
         }
 
+        if (
+          action.type === "tool_use" &&
+          turnToolLimitReached &&
+          Number.isFinite(turnPolicy?.maxToolCalls)
+        ) {
+          postLimitToolRetryCount += 1;
+          const forced = await this.synthesizeFinalFromEvidence({
+            userMessage,
+            requireCommitMessage: Boolean(turnPolicy?.requireCommitMessage),
+            signal,
+          }).catch(() => "");
+          const msg =
+            String(forced || "").trim() ||
+            "Tool budget reached for this turn. I collected enough evidence and stopped additional tools.";
+          this.history.push({ role: "assistant", content: msg });
+          return msg;
+        }
+
         const toolFn = this.tools[action.tool];
         if (!toolFn) {
           const msg = `Unknown tool: ${action.tool}`;
+          this.history.push({ role: "assistant", content: msg });
+          return msg;
+        }
+
+        if (turnPolicy?.disableTodos && (action.tool === "todo_write" || action.tool === "todowrite")) {
+          const msg = "This request does not need todo tracking. Provide the final answer directly.";
+          this.history.push({ role: "assistant", content: msg });
+          return msg;
+        }
+        if (Array.isArray(turnPolicy?.allowedTools) && turnPolicy.allowedTools.length > 0) {
+          if (!turnPolicy.allowedTools.includes(action.tool)) {
+            const msg = `Tool ${action.tool} is not allowed for this turn policy. Use ${turnPolicy.allowedTools.join(", ")} or finalize.`;
+            this.history.push({ role: "assistant", content: msg });
+            return msg;
+          }
+        }
+
+        const toolSignature = this.buildToolSignature(action);
+        if (toolSignature === lastToolSignature && repeatedNoProgressCount >= 2) {
+          const msg =
+            "I’m repeating the same tool call without progress. Stopping to avoid a loop. Please clarify the next step.";
           this.history.push({ role: "assistant", content: msg });
           return msg;
         }
@@ -429,6 +663,33 @@ export class Agent {
         }
         this.throwIfAborted(signal);
 
+        const resultDigest = String(result || "").slice(0, 1000);
+        const sameAsLastTurnStep = toolSignature === lastToolSignature && resultDigest === lastToolResultDigest;
+        if (sameAsLastTurnStep) repeatedNoProgressCount += 1;
+        else repeatedNoProgressCount = 0;
+        lastToolSignature = toolSignature;
+        lastToolResultDigest = resultDigest;
+
+        const outcomeKey = `${toolSignature}::${resultDigest}`;
+        const seenCount = (seenOutcomeCounts.get(outcomeKey) || 0) + 1;
+        seenOutcomeCounts.set(outcomeKey, seenCount);
+        if (seenCount >= 2) {
+          const msg =
+            "I’m repeating the same verified step result in this turn. Stopping to avoid a tool loop. Please refine the request or confirm next action.";
+          this.history.push({ role: "assistant", content: msg });
+          return msg;
+        }
+
+        if ((action.tool === "todo_write" || action.tool === "todowrite") && /^No-op:/i.test(String(result || ""))) {
+          todoNoopCount += 1;
+          if (todoNoopCount >= 1) {
+            const msg =
+              "Todo list is already up to date. I won’t keep calling todo_write. I can continue with concrete actions if you specify the next step.";
+            this.history.push({ role: "assistant", content: msg });
+            return msg;
+          }
+        }
+
         this.onEvent?.({
           type: "tool_end",
           tool: action.tool,
@@ -448,6 +709,34 @@ export class Agent {
           content: JSON.stringify(toolResultMessage),
           ...(useNativeTools ? { toolResult: { toolCallId: callId, name: action.tool, result } } : {}),
         });
+
+        if (
+          Number.isFinite(turnPolicy?.maxToolCalls) &&
+          toolCalls >= turnPolicy.maxToolCalls &&
+          !turnPolicy?.forceFinalizeAfterTool
+        ) {
+          turnToolLimitReached = true;
+          postLimitToolRetryCount = 0;
+          const commitRequirement = turnPolicy?.requireCommitMessage
+            ? " Include a clear 'Suggested commit message' line."
+            : "";
+          this.history.push({
+            role: "assistant",
+            content:
+              `Tool collection complete for this turn. Based on collected outputs only, provide the final user-facing answer now.${commitRequirement}`,
+          });
+          continue;
+        }
+
+        if (
+          turnPolicy?.forceFinalizeAfterTool &&
+          Number.isFinite(turnPolicy?.maxToolCalls) &&
+          toolCalls >= turnPolicy.maxToolCalls
+        ) {
+          const message = this.formatToolResultForUser(action, result, toolError);
+          this.history.push({ role: "assistant", content: message });
+          return message;
+        }
 
         if (activePlan && toolCalls >= budget && !didReplan) {
           const newPlan = await this.replanTurn({

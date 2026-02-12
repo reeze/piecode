@@ -26,6 +26,37 @@ const SAFE_COMMANDS = new Set([
   "npm",
   "pnpm",
   "bun",
+  "sed",
+  "awk",
+  "tr",
+  "xargs",
+  "basename",
+  "dirname",
+  "realpath",
+  "stat",
+  "du",
+  "df",
+  "ps",
+  "which",
+  "type",
+  "env",
+  "printenv",
+  "date",
+  "uname",
+  "id",
+  "whoami",
+  "jq",
+  "nl",
+  "file",
+  "md5sum",
+  "sha1sum",
+  "sha256sum",
+  "shasum",
+  "diff",
+  "comm",
+  "paste",
+  "column",
+  "strings",
 ]);
 
 const DANGEROUS_COMMANDS = new Set([
@@ -59,7 +90,26 @@ function extractCommandName(segment) {
     .replace(/^time\s+/, "")
     .trim();
   if (!cleaned) return "";
-  const first = cleaned.split(/\s+/)[0] || "";
+  const tokens = cleaned.split(/\s+/).filter(Boolean);
+  if (tokens.length === 0) return "";
+
+  let idx = 0;
+  while (idx < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(tokens[idx])) {
+    idx += 1;
+  }
+
+  if (idx < tokens.length && (tokens[idx] === "command" || tokens[idx] === "builtin" || tokens[idx] === "nohup")) {
+    idx += 1;
+  }
+
+  if (idx < tokens.length && tokens[idx] === "env") {
+    idx += 1;
+    while (idx < tokens.length && (tokens[idx].startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(tokens[idx]))) {
+      idx += 1;
+    }
+  }
+
+  const first = tokens[idx] || "";
   return first.replace(/^["']|["']$/g, "").toLowerCase();
 }
 
@@ -164,6 +214,8 @@ export function createToolset({
   onToolStart,
   onTodoWrite,
 }) {
+  let lastTodoSignature = "";
+
   const runShell = async ({ command } = {}) => {
     onToolStart?.("shell", { command });
     const cmd = String(command || "").trim();
@@ -238,6 +290,11 @@ export function createToolset({
     if (normalized.length === 0) {
       return "No valid todos were provided. Expected: { todos: [{ id?, content, status: pending|in_progress|completed }] }";
     }
+    const signature = JSON.stringify(normalized);
+    if (signature === lastTodoSignature) {
+      return "No-op: todo list unchanged.";
+    }
+    lastTodoSignature = signature;
     onTodoWrite?.(normalized);
     const summary = normalized.map((t) => `- [${t.status}] ${t.content}`).join("\n");
     return `Updated ${normalized.length} todos:\n${summary}`;

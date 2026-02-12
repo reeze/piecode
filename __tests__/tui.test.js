@@ -196,6 +196,55 @@ describe("tui usability", () => {
     expect(frame).not.toContain("todos:");
   });
 
+  test("project instructions status is rendered below input", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.setProjectInstructionsStatus({ source: "AGENTS.md", state: "loaded" });
+    let frame = latestFrame(out);
+    expect(frame).toContain("AGENTS.md: loaded");
+
+    tui.setProjectInstructionsStatus({ source: "AGENTS.md", state: "missing" });
+    frame = latestFrame(out);
+    expect(frame).toContain("AGENTS.md: not found");
+
+    tui.setProjectInstructionsStatus({ source: "AGENTS.md", state: "empty" });
+    frame = latestFrame(out);
+    expect(frame).toContain("AGENTS.md: empty");
+
+    tui.setProjectInstructionsStatus({ source: "AGENTS.md", state: "error", detail: "EACCES" });
+    frame = latestFrame(out);
+    expect(frame).toContain("AGENTS.md: unreadable");
+    expect(frame).toContain("EACCES");
+  });
+
+  test("project instructions status hides after task begins", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.setProjectInstructionsStatus({ source: "AGENTS.md", state: "loaded" });
+    let frame = latestFrame(out);
+    expect(frame).toContain("AGENTS.md: loaded");
+
+    tui.beginTurn();
+    frame = latestFrame(out);
+    expect(frame).not.toContain("AGENTS.md: loaded");
+  });
+
   test("running indicator is rendered in workspace while thinking", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({

@@ -46,6 +46,27 @@ describe("tools usability", () => {
     ]);
   });
 
+  test("todo_write skips duplicate payloads", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    const writes = [];
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      onTodoWrite: (todos) => writes.push(todos),
+    });
+
+    const payload = {
+      todos: [{ id: "x", content: "same", status: "pending" }],
+    };
+    const first = await tools.todo_write(payload);
+    const second = await tools.todo_write(payload);
+
+    expect(first).toContain("Updated 1 todos");
+    expect(second).toContain("No-op");
+    expect(writes).toHaveLength(1);
+  });
+
   test("todo_write returns helpful error when payload is invalid", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
     const tools = createToolset({
@@ -114,6 +135,38 @@ describe("tools usability", () => {
 
     const result = await tools.shell({ command: 'find . -name "package.json" 2>/dev/null' });
     expect(result).toContain("exit_code: 0");
+  });
+
+  test("command with env assignments is classified safe for approval", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    const seen = [];
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: false },
+      askApproval: async (_tool, info) => {
+        seen.push(info?.classification?.level);
+        return true;
+      },
+    });
+
+    await tools.shell({ command: "FOO=bar env | head -n 1" });
+    expect(seen).toContain("safe");
+  });
+
+  test("awk and sed are treated as safe commands", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    const seen = [];
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: false },
+      askApproval: async (_tool, info) => {
+        seen.push(info?.classification?.level);
+        return true;
+      },
+    });
+
+    await tools.shell({ command: "echo hello | sed 's/hello/hi/' | awk '{print $1}'" });
+    expect(seen).toEqual(["safe"]);
   });
 
   test("dangerous shell command always requires approval even when auto-approve is on", async () => {

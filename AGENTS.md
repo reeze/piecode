@@ -1,7 +1,7 @@
-# PieCode Agent
+# Pie Code Agent
 
 ## Project Overview
-PieCode is a Claude Code-like command-line coding agent designed to assist with software engineering tasks. It provides an interactive terminal interface for model-driven tool use, including shell commands, file operations, and task planning capabilities.
+Pie Code is a oding agent designed to assist with software engineering tasks. It provides an interactive terminal interface for model-driven tool use, including shell commands, file operations, and task planning capabilities.
 
 ## Key Features
 - Interactive terminal agent loop with TUI (Terminal User Interface)

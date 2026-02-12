@@ -207,6 +207,7 @@ function startTaskTrace(taskTraceRef, { input, kind }) {
     error: "",
     logs: [],
     events: [],
+    llm: [],
   };
   return id;
 }
@@ -231,6 +232,21 @@ function recordTaskEvent(taskTraceRef, evt) {
   });
 }
 
+function recordTaskLlm(taskTraceRef, entry) {
+  if (!taskTraceRef?.current || !entry || typeof entry !== "object") return;
+  taskTraceRef.current.llm.push({
+    at: new Date().toISOString(),
+    direction: String(entry.direction || ""),
+    stage: String(entry.stage || ""),
+    provider: String(entry.provider || ""),
+    model: String(entry.model || ""),
+    endpoint: String(entry.endpoint || ""),
+    chars: Number.isFinite(Number(entry.chars)) ? Number(entry.chars) : 0,
+    durationMs: Number.isFinite(Number(entry.durationMs)) ? Number(entry.durationMs) : 0,
+    payload: clipText(entry.payload, 32000),
+  });
+}
+
 async function finishTaskTrace(taskTraceRef, workspaceDir, { status = "done", error = "" } = {}) {
   const current = taskTraceRef?.current;
   if (!current) return null;
@@ -250,9 +266,28 @@ async function finishTaskTrace(taskTraceRef, workspaceDir, { status = "done", er
     const trajectoryPath = path.join(sessionDir, "trajectory.jsonl");
     const logsPath = path.join(sessionDir, "logs.log");
     const logsText = current.logs.map((entry) => `[${entry.at}] ${entry.line}`).join("\n");
+    const llmText = (Array.isArray(current.llm) ? current.llm : [])
+      .map((entry, idx) => {
+        const meta = [
+          `idx=${idx + 1}`,
+          `at=${entry.at}`,
+          `dir=${entry.direction || "-"}`,
+          `stage=${entry.stage || "-"}`,
+          `provider=${entry.provider || "-"}`,
+          `model=${entry.model || "-"}`,
+          `endpoint=${entry.endpoint || "-"}`,
+          `chars=${entry.chars || 0}`,
+          entry.durationMs > 0 ? `duration=${entry.durationMs}ms` : "",
+        ]
+          .filter(Boolean)
+          .join(" ");
+        return `[LLM] ${meta}\n${String(entry.payload || "")}`;
+      })
+      .join("\n\n");
     await fs.appendFile(trajectoryPath, `${JSON.stringify(current)}\n`, "utf8");
-    if (logsText) {
-      await fs.appendFile(logsPath, `\n[${current.id}] ${current.input}\n${logsText}\n`, "utf8");
+    if (logsText || llmText) {
+      const llmSection = llmText ? `\n\n[llm-transcript]\n${llmText}\n` : "";
+      await fs.appendFile(logsPath, `\n[${current.id}] ${current.input}\n${logsText}${llmSection}\n`, "utf8");
     }
     taskTraceRef.current = null;
     return {
@@ -277,16 +312,47 @@ async function loadProjectInstructions(workspaceDir) {
       const trimmed = String(content || "").trim();
       if (trimmed) {
         return {
-          source: name,
-          path: filePath,
-          content: trimmed,
+          instructions: {
+            source: name,
+            path: filePath,
+            content: trimmed,
+          },
+          status: {
+            source: name,
+            state: "loaded",
+            detail: "",
+          },
         };
       }
-    } catch {
-      // ignore missing/unreadable file and try next candidate
+      return {
+        instructions: null,
+        status: {
+          source: name,
+          state: "empty",
+          detail: "",
+        },
+      };
+    } catch (err) {
+      const code = String(err?.code || "").toUpperCase();
+      if (code === "ENOENT") continue;
+      return {
+        instructions: null,
+        status: {
+          source: name,
+          state: "error",
+          detail: String(err?.message || "unreadable"),
+        },
+      };
     }
   }
-  return null;
+  return {
+    instructions: null,
+    status: {
+      source: "AGENTS.md",
+      state: "missing",
+      detail: "",
+    },
+  };
 }
 
 async function loadHistory(filePath) {
@@ -1667,7 +1733,9 @@ async function main() {
   const providerOptionsRef = { value: resolveProviderOptions(args, settings) };
   const providerRef = { value: getProvider(providerOptionsRef.value) };
   const workspaceDir = process.cwd();
-  const projectInstructionsRef = { value: await loadProjectInstructions(workspaceDir) };
+  const projectInstructionsLoaded = await loadProjectInstructions(workspaceDir);
+  const projectInstructionsRef = { value: projectInstructionsLoaded.instructions };
+  const projectInstructionsStatusRef = { value: projectInstructionsLoaded.status };
   const startupAutoSkills = await autoLoadSkillsFromInstructions(
     projectInstructionsRef.value,
     activeSkillsRef,
@@ -1778,6 +1846,7 @@ async function main() {
       getSkillsLabel: () => formatSkillLabel(activeSkillsRef),
       getApprovalLabel: () => (autoApproveRef.value ? "on" : "off"),
     });
+    tui.setProjectInstructionsStatus(projectInstructionsStatusRef.value);
     tui.setLlmDebugEnabled(llmDebugRef.value);
     tui.setTodos(todosRef.value);
     onResize = () => {
@@ -2206,7 +2275,14 @@ async function main() {
     return nextProvider;
   };
 
-  const askApproval = async (q) => {
+  const askApproval = async (q, details = null) => {
+    if (q === "shell" && details && typeof details === "object") {
+      const classificationLevel = String(details?.classification?.level || "unclassified");
+      if (classificationLevel === "safe") return true;
+      const reason = String(details?.classification?.reason || "");
+      const cmdPreview = summarizeForLog(String(details?.command || ""), 220);
+      q = `shell: ${cmdPreview}${reason ? ` (${reason})` : ""}`;
+    }
     let ans = "";
     const defaultYes = false;
     if (tui) {
@@ -2287,10 +2363,22 @@ async function main() {
       }
       if (evt.type === "llm_request") {
         recordTaskEvent(taskTraceRef, evt);
+        const endpoint = inferEndpointForProvider(providerOptionsRef.value, providerRef.value);
+        const sentChars = String(evt.payload || "").length;
+        const requestProvider = providerPrefix(providerRef.value?.kind);
+        const requestModel = String(providerRef.value?.model || "");
+        recordTaskLlm(taskTraceRef, {
+          direction: "request",
+          stage: evt.stage,
+          provider: requestProvider,
+          model: requestModel,
+          endpoint,
+          chars: sentChars,
+          payload: evt.payload,
+        });
         if (traceRef.value) {
           traceStateRef.value.llmStageStart[evt.stage] = Date.now();
-          const chars = String(evt.payload || "").length;
-          logLine(`[trace] llm_request stage=${evt.stage} chars=${chars}`);
+          logLine(`[trace] llm_request stage=${evt.stage} chars=${sentChars}`);
         }
         if (tui) tui.onThinking(evt.stage);
         if (display) display.onThinking(evt.stage);
@@ -2300,7 +2388,6 @@ async function main() {
         if (tui && evt.stage === "turn") {
           tui.setLiveThought("Analyzing request...");
         }
-        const endpoint = inferEndpointForProvider(providerOptionsRef.value, providerRef.value);
         const sentTokens = estimateTokenCount(evt.payload);
         if (tui) {
           const used = sentTokens;
@@ -2329,11 +2416,26 @@ async function main() {
       }
       if (evt.type === "llm_response") {
         recordTaskEvent(taskTraceRef, evt);
+        const responseProvider = providerPrefix(providerRef.value?.kind);
+        const responseModel = String(providerRef.value?.model || "");
+        const responseEndpoint = inferEndpointForProvider(providerOptionsRef.value, providerRef.value);
+        const responseChars = String(evt.payload || "").length;
+        const startedAt = Number(traceStateRef.value.llmStageStart[evt.stage] || 0);
+        const responseDurationMs = startedAt > 0 ? Date.now() - startedAt : 0;
+        recordTaskLlm(taskTraceRef, {
+          direction: "response",
+          stage: evt.stage,
+          provider: responseProvider,
+          model: responseModel,
+          endpoint: responseEndpoint,
+          chars: responseChars,
+          durationMs: responseDurationMs,
+          payload: evt.payload,
+        });
         if (traceRef.value) {
-          const startedAt = Number(traceStateRef.value.llmStageStart[evt.stage] || 0);
-          const durationMs = startedAt > 0 ? Date.now() - startedAt : 0;
-          const chars = String(evt.payload || "").length;
-          logLine(`[trace] llm_response stage=${evt.stage} chars=${chars} duration=${durationMs}ms`);
+          logLine(
+            `[trace] llm_response stage=${evt.stage} chars=${responseChars} duration=${responseDurationMs}ms`
+          );
         }
         if (llmStreamRef.value && Object.prototype.hasOwnProperty.call(llmStreamRef.value, evt.stage)) {
           llmStreamRef.value[evt.stage] = String(evt.payload || "");
@@ -2430,6 +2532,7 @@ async function main() {
 
   if (args.prompt !== null) {
     startTaskTrace(taskTraceRef, { input: args.prompt, kind: "agent" });
+    if (tui) tui.setProjectInstructionsVisible(false);
     if (startupAutoSkills.enabled.length > 0) {
       console.log(`auto-loaded skills: ${startupAutoSkills.enabled.join(", ")}`);
     }
@@ -2468,9 +2571,6 @@ async function main() {
   if (tui) {
     tui.start();
     emitStartupLogo(tui, providerRef.value, workspaceDir, stdout.columns || 100);
-    if (projectInstructionsRef.value?.source) {
-      tui.event(`loaded project instructions: ${projectInstructionsRef.value.source}`);
-    }
     if (activeSkillsRef.value.length > 0) {
       tui.event(`skills: ${activeSkillsRef.value.map((s) => s.name).join(", ")}`);
     }
@@ -2575,6 +2675,7 @@ async function main() {
     if (finalInput.startsWith("!")) {
       startTaskTrace(taskTraceRef, { input: finalInput, kind: "shell" });
       currentInputRef.value = "";
+      if (tui) tui.setProjectInstructionsVisible(false);
       if (tui) tui.render(currentInputRef.value, "running shell command");
       const shellResult = await runDirectShellCommand(finalInput.slice(1), {
         workspaceDir,
@@ -2593,6 +2694,7 @@ async function main() {
     if (!isSlash) {
       startTaskTrace(taskTraceRef, { input: finalInput, kind: "agent" });
       logLine(`[task] ${finalInput}`);
+      if (tui) tui.setProjectInstructionsVisible(false);
     }
     currentInputRef.value = "";
     if (tui) tui.render(currentInputRef.value, isSlash ? "handling command" : "processing task");

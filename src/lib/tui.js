@@ -235,6 +235,12 @@ export class SimpleTui {
     this.scrollOffset = 0;
     this.thoughtStreamText = "";
     this.thoughtStreamVisible = false;
+    this.projectInstructionsStatus = {
+      state: "unknown",
+      source: "AGENTS.md",
+      detail: "",
+    };
+    this.showProjectInstructionsStatus = true;
   }
 
   start() {
@@ -342,6 +348,7 @@ export class SimpleTui {
   }
 
   beginTurn() {
+    this.showProjectInstructionsStatus = false;
     this.turnTokensSent = 0;
     this.turnTokensReceived = 0;
     this.turnStartedAt = Date.now();
@@ -421,6 +428,21 @@ export class SimpleTui {
     if (!this.thoughtStreamVisible && !this.thoughtStreamText) return;
     this.thoughtStreamVisible = false;
     this.thoughtStreamText = "";
+    this.render();
+  }
+
+  setProjectInstructionsStatus(status = null) {
+    const source = String(status?.source || "AGENTS.md").trim() || "AGENTS.md";
+    const stateRaw = String(status?.state || "").trim().toLowerCase();
+    const allowedStates = new Set(["loaded", "missing", "empty", "error", "unknown"]);
+    const state = allowedStates.has(stateRaw) ? stateRaw : "unknown";
+    const detail = String(status?.detail || "").trim();
+    this.projectInstructionsStatus = { source, state, detail };
+    this.render();
+  }
+
+  setProjectInstructionsVisible(visible) {
+    this.showProjectInstructionsStatus = Boolean(visible);
     this.render();
   }
 
@@ -791,6 +813,26 @@ export class SimpleTui {
     return truncateLine(text, width);
   }
 
+  formatProjectInstructionsLabel() {
+    if (!this.showProjectInstructionsStatus) return "";
+    const status = this.projectInstructionsStatus || {};
+    const source = String(status.source || "AGENTS.md");
+    if (status.state === "loaded") {
+      return `${source}: loaded`;
+    }
+    if (status.state === "missing") {
+      return `${source}: not found`;
+    }
+    if (status.state === "empty") {
+      return `${source}: empty`;
+    }
+    if (status.state === "error") {
+      const reason = status.detail ? ` (${status.detail})` : "";
+      return `${source}: unreadable${reason}`;
+    }
+    return "";
+  }
+
   render(input = this.currentInput, status = "", cursorIndex = null) {
     if (!this.active) return;
     this.currentInput = String(input || "");
@@ -848,7 +890,6 @@ export class SimpleTui {
     this.scrollOffset = Math.min(Math.max(0, this.scrollOffset), maxScroll);
     const start = Math.max(0, sourceLines.length - maxLogLines - this.scrollOffset);
     const visibleLogs = sourceLines.slice(start, start + maxLogLines);
-
     const scrollLabel = this.scrollOffset > 0 ? ` | scroll:+${this.scrollOffset}` : "";
     const ctxStatus =
       this.contextLimit > 0
@@ -859,10 +900,21 @@ export class SimpleTui {
         ? ` | session tok:↑${formatCompactNumber(this.sessionTokensSent)} ↓${formatCompactNumber(this.sessionTokensReceived)}`
         : "";
     const promptStatusRaw = `status: ${status || this.lastStatus || "idle"}${ctxStatus}${tokStatus}${scrollLabel}`;
-    const promptStatus =
-      promptStatusRaw.length >= width
-        ? truncateLine(promptStatusRaw, width)
-        : `${" ".repeat(Math.max(0, width - promptStatusRaw.length))}${promptStatusRaw}`;
+    const projectLabel = this.formatProjectInstructionsLabel();
+    let promptStatus = "";
+    if (projectLabel) {
+      const left = truncateLine(` ${projectLabel}`, width);
+      const fixedLeft = stringDisplayWidth(left);
+      const rightBudget = Math.max(0, width - fixedLeft - 1);
+      const right = truncateLine(promptStatusRaw, rightBudget);
+      const pad = Math.max(1, width - fixedLeft - stringDisplayWidth(right));
+      promptStatus = `${left}${" ".repeat(pad)}${right}`;
+    } else {
+      promptStatus =
+        promptStatusRaw.length >= width
+          ? truncateLine(promptStatusRaw, width)
+          : `${" ".repeat(Math.max(0, width - promptStatusRaw.length))}${promptStatusRaw}`;
+    }
     const approvalBlock = this.approvalPrompt ? [sep, ...approvalContentLines] : [];
     const thinkingColors = ["82", "118", "154", "190", "201"];
     const thinkingColor = thinkingColors[this.thinkingTick % thinkingColors.length];
