@@ -838,6 +838,10 @@ export class SimpleTui {
       return padAll([color(`Thought: ${details || "<empty>"}`, "35"), ""]);
     }
     if (line.startsWith("[run] shell")) {
+      if (/command=("[^"]*"|\S+)/.test(line)) {
+        // Structured shell runs from tool_start duplicate the `[tool] shell ...` entry.
+        return [];
+      }
       const m = line.match(/command=("[^"]*"|\\S+)/);
       const approvalMatch = line.match(/approval=("[^"]*"|\\S+)/);
       const shortMatch = line.match(/^\[run\]\s+shell\s+(.+)$/);
@@ -871,7 +875,8 @@ export class SimpleTui {
       return padAll([color(`Bash(${safeDisplay})`, "36") + (tag ? ` ${tag}` : ""), color("L Running...", "2;37"), ""]);
     }
     if (line.startsWith("[tool] ")) {
-      return padAll([color(`Tool: ${line.slice(7).trim()}`, "36")]);
+      const body = line.slice(7).trim();
+      return padAll([color(`Tool: ${body}`, "36")]);
     }
     if (line.startsWith("[response] ")) {
       const text = trimWorkspaceText(line.slice(11).trim(), 8000).text;
@@ -951,9 +956,6 @@ export class SimpleTui {
         ? Math.min(normalizedSource.length, Math.max(0, Math.floor(Number(cursorIndex))))
         : normalizedSource.length;
     const beforeCursor = normalizedSource.slice(0, safeCursorIndex);
-    const cursorParts = beforeCursor.split("\n");
-    const cursorRowOffset = Math.max(0, cursorParts.length - 1);
-    const cursorLineRaw = cursorParts[cursorParts.length - 1] || "";
 
     const promptGlyph = "❯";
     const firstPrefix = ` ${promptGlyph} `;
@@ -961,24 +963,75 @@ export class SimpleTui {
     const placeholder = 'Try "fix lint errors"';
     const hasContent = normalizedSource.length > 0;
     const logicalLines = hasContent ? normalizedSource.split("\n") : [""];
-
-    const visibleLines = logicalLines.map((lineText, idx) => {
-      const prefix = idx === 0 ? firstPrefix : contPrefix;
-      const maxLineWidth = Math.max(0, width - stringDisplayWidth(prefix));
-      const clipped = truncateLine(lineText, maxLineWidth);
-      if (idx === 0 && clipped.startsWith("!")) {
-        return `${prefix}${color("!", "31")}${clipped.slice(1)}`;
+    const wrapInputLine = (lineText, firstWidth, continuationWidth) => {
+      const source = String(lineText || "");
+      const firstLimit = Math.max(1, firstWidth);
+      const continuationLimit = Math.max(1, continuationWidth);
+      if (!source) return [""];
+      const chunks = [];
+      let chunk = "";
+      let chunkWidth = 0;
+      let widthLimit = firstLimit;
+      for (const ch of source) {
+        const w = charDisplayWidth(ch);
+        if (chunk && chunkWidth + w > widthLimit) {
+          chunks.push(chunk);
+          chunk = "";
+          chunkWidth = 0;
+          widthLimit = continuationLimit;
+        }
+        if (!chunk && w > widthLimit) {
+          chunks.push(ch);
+          widthLimit = continuationLimit;
+          continue;
+        }
+        chunk += ch;
+        chunkWidth += w;
       }
-      return `${prefix}${clipped}`;
-    });
+      chunks.push(chunk);
+      return chunks;
+    };
+
+    const visibleLines = [];
+    for (let lineIdx = 0; lineIdx < logicalLines.length; lineIdx += 1) {
+      const lineText = logicalLines[lineIdx];
+      const rowPrefix = lineIdx === 0 ? firstPrefix : contPrefix;
+      const firstWidth = Math.max(1, width - stringDisplayWidth(rowPrefix));
+      const continuationWidth = Math.max(1, width - stringDisplayWidth(contPrefix));
+      const chunks = wrapInputLine(lineText, firstWidth, continuationWidth);
+      for (let chunkIdx = 0; chunkIdx < chunks.length; chunkIdx += 1) {
+        const prefix = lineIdx === 0 && chunkIdx === 0 ? firstPrefix : contPrefix;
+        const chunk = chunks[chunkIdx];
+        if (lineIdx === 0 && chunkIdx === 0 && chunk.startsWith("!")) {
+          visibleLines.push(`${prefix}${color("!", "31")}${chunk.slice(1)}`);
+        } else {
+          visibleLines.push(`${prefix}${chunk}`);
+        }
+      }
+    }
     if (!hasContent) {
       const maxLineWidth = Math.max(0, width - stringDisplayWidth(firstPrefix));
       visibleLines[0] = `${firstPrefix}\x1b[2m${truncateLine(placeholder, maxLineWidth)}\x1b[0m`;
     }
 
-    const cursorPrefix = cursorRowOffset === 0 ? firstPrefix : contPrefix;
-    const maxCursorWidth = Math.max(0, width - stringDisplayWidth(cursorPrefix));
-    const cursorShown = truncateLine(cursorLineRaw, maxCursorWidth);
+    let wrappedCursorRowOffset = 0;
+    let cursorShown = "";
+    const cursorLogicalLines = beforeCursor.split("\n");
+    for (let lineIdx = 0; lineIdx < cursorLogicalLines.length; lineIdx += 1) {
+      const lineText = cursorLogicalLines[lineIdx];
+      const rowPrefix = lineIdx === 0 ? firstPrefix : contPrefix;
+      const firstWidth = Math.max(1, width - stringDisplayWidth(rowPrefix));
+      const continuationWidth = Math.max(1, width - stringDisplayWidth(contPrefix));
+      const chunks = wrapInputLine(lineText, firstWidth, continuationWidth);
+      if (lineIdx < cursorLogicalLines.length - 1) {
+        wrappedCursorRowOffset += chunks.length;
+      } else {
+        wrappedCursorRowOffset += Math.max(0, chunks.length - 1);
+        cursorShown = chunks[chunks.length - 1] || "";
+      }
+    }
+
+    const cursorPrefix = wrappedCursorRowOffset === 0 ? firstPrefix : contPrefix;
     const cursorCol = Math.max(
       1,
       Math.min(Math.max(1, width), 1 + stringDisplayWidth(cursorPrefix) + stringDisplayWidth(cursorShown))
@@ -987,7 +1040,7 @@ export class SimpleTui {
     return {
       lines: visibleLines,
       cursorCol,
-      cursorRowOffset,
+      cursorRowOffset: wrappedCursorRowOffset,
     };
   }
 
@@ -1122,10 +1175,10 @@ export class SimpleTui {
     const wrappedLogs = this.logs.flatMap((line) => wrapText(line, width));
     const wrappedTimeline = this.timeline.flatMap((line) => wrapText(line, width));
     const sourceLines = this.showRawLogs ? wrappedLogs : wrappedTimeline;
-    // Keep layout in natural flow: do not force-fill the terminal height.
-    // This keeps input/status attached to content instead of sticky at screen bottom.
-    const viewportLogCap = Math.max(8, Math.min(120, Math.floor(height * 0.6)));
-    const maxLogLines = Math.max(1, Math.min(Math.max(1, sourceLines.length || 1), viewportLogCap));
+    // Keep layout in natural flow (not sticky), but adapt visible workspace lines
+    // to the actual terminal space left after input/status blocks.
+    const viewportLogBudget = Math.max(1, height - reservedLines);
+    const maxLogLines = Math.max(1, Math.min(Math.max(1, sourceLines.length || 1), viewportLogBudget));
     const maxScroll = Math.max(0, sourceLines.length - maxLogLines);
     this.scrollOffset = Math.min(Math.max(0, this.scrollOffset), maxScroll);
     const start = Math.max(0, sourceLines.length - maxLogLines - this.scrollOffset);

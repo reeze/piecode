@@ -70,7 +70,10 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines("[task] simplify repo")[0])).toContain("Task: simplify repo");
     expect(tui.formatTimelineLines("[model] seed-openai-compatible:doubao")).toEqual([]);
     expect(tui.formatTimelineLines("[plan] budget=3 - scoped plan")).toEqual([]);
-    expect(stripAnsi(tui.formatTimelineLines('[run] shell command="echo hi"')[0])).toContain("Bash(echo hi)");
+    expect(tui.formatTimelineLines('[run] shell command="echo hi"')).toEqual([]);
+    expect(stripAnsi(tui.formatTimelineLines("[tool] shell (echo hi)")[0])).toContain("Tool: shell (echo hi)");
+    expect(stripAnsi(tui.formatTimelineLines("[run] shell echo hi")[0])).toContain("Bash(echo hi)");
+    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("Tool: read_file");
     expect(stripAnsi(tui.formatTimelineLines("[result] done")[0])).toContain("✓ done");
     expect(stripAnsi(tui.formatTimelineLines("[banner-1] ██████")[0])).toContain("██████");
     expect(stripAnsi(tui.formatTimelineLines("[banner-meta] model: seed:model")[0])).toContain("model: seed:model");
@@ -322,6 +325,48 @@ describe("tui usability", () => {
     const lastWrite = stripAnsi(out.writes[out.writes.length - 1] || "");
     expect(lastWrite).toContain("line1");
     expect(lastWrite).toContain("line2");
+  });
+
+  test("renderInput grows to wrapped lines as input expands", () => {
+    const out = createOut(26, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    const longInput = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    tui.renderInput(longInput, longInput.length);
+    const lastWrite = out.writes[out.writes.length - 1] || "";
+    const plain = stripAnsi(lastWrite);
+    expect(tui.lastInputLine.split("\n").length).toBeGreaterThan(1);
+    expect(lastWrite).toContain(`\x1b[${tui.lastInputRow + 1};`);
+    expect(plain).toContain("abcdef");
+    expect(plain).toContain("0123456789");
+  });
+
+  test("input row moves lower as workspace content grows", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    const baseRow = tui.lastInputRow;
+    for (let i = 0; i < 60; i += 1) tui.event(`line-${i + 1}`);
+    tui.renderInput("x", 1);
+    const expandedRow = tui.lastInputRow;
+
+    expect(expandedRow).toBeGreaterThan(baseRow);
+    expect(expandedRow).toBeGreaterThanOrEqual(22);
+    expect(expandedRow).toBeLessThanOrEqual(out.rows);
   });
 
   test("renderInput honors explicit cursor position (CTRL+A/CTRL+E behavior)", () => {
