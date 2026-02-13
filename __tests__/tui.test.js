@@ -369,6 +369,25 @@ describe("tui usability", () => {
     expect(expandedRow).toBeLessThanOrEqual(out.rows);
   });
 
+  test("new task event resets scroll to bottom", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    for (let i = 0; i < 80; i += 1) tui.event(`old-line-${i + 1}`);
+    tui.scrollToTop();
+    expect(tui.scrollOffset).toBeGreaterThan(0);
+
+    tui.event("[task] run new request");
+    expect(tui.scrollOffset).toBe(0);
+  });
+
   test("renderInput honors explicit cursor position (CTRL+A/CTRL+E behavior)", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({

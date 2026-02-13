@@ -311,6 +311,7 @@ export class SimpleTui {
   event(line) {
     if (String(line || "").startsWith("[task] ")) {
       this.currentTaskText = String(line).slice(7).trim();
+      this.scrollOffset = 0;
     }
     const timestamp = new Date().toLocaleTimeString();
     const entry = `[${timestamp}] ${line}`;
