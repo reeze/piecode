@@ -45,7 +45,7 @@ Pie Code is a oding agent designed to assist with software engineering tasks. It
 ├── IMPROVEMENTS.md            # Project improvement ideas
 ├── README.md                  # Project documentation
 ├── package.json               # Dependencies and scripts
-└── AGENT.md                   # This file
+└── AGENTS.md                  # This file
 ```
 
 ## Setup Instructions

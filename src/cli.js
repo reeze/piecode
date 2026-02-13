@@ -2034,7 +2034,6 @@ async function main() {
   const pendingCommandSubmitRef = { value: "" };
   const modelPickerRef = { active: false, query: "", options: [], index: 0 };
   const commandPickerRef = { active: false, mode: "command", options: [], index: 0 };
-  const swallowNextEnterRef = { value: false };
   const taskRunningRef = { value: false };
   const escAbortArmedRef = { value: false };
   const readlineOutput = useTui ? createMutedTtyOutput(stdout) : stdout;
@@ -2082,13 +2081,6 @@ async function main() {
           const tabLike = name === "tab" || str === "\t";
           const navLike = name === "up" || name === "down";
           const enterLike = name === "return" || name === "enter" || str === "\r" || str === "\n";
-          if (swallowNextEnterRef.value) {
-            if (enterLike) {
-              swallowNextEnterRef.value = false;
-              return false;
-            }
-            swallowNextEnterRef.value = false;
-          }
           if ((modelPickerRef.active || commandPickerRef.active) && (tabLike || navLike || enterLike)) {
             return false;
           }
@@ -2195,15 +2187,6 @@ async function main() {
     onKeypress = (str, key = {}) => {
       if (isReadlineClosed()) return;
       if (approvalActiveRef.value) return;
-      const rawKeyName = String(key?.name || "").toLowerCase();
-      const isEnterKey = rawKeyName === "return" || rawKeyName === "enter" || str === "\r" || str === "\n";
-      if (swallowNextEnterRef.value) {
-        if (isEnterKey) {
-          swallowNextEnterRef.value = false;
-          return;
-        }
-        swallowNextEnterRef.value = false;
-      }
       const currentLineRaw = String(rl.line || "");
       const currentLine = stripMouseInputNoise(currentLineRaw);
       if (currentLine !== currentLineRaw) {
@@ -2564,7 +2547,6 @@ async function main() {
             modelPickerRef.index = 0;
             tui.clearModelSuggestions();
             writeLineWithCursor(`/model ${selectedModel}`);
-            swallowNextEnterRef.value = true;
             return;
           }
         }
@@ -2616,7 +2598,6 @@ async function main() {
               commandPickerRef.options = [];
               commandPickerRef.index = 0;
               tui.clearCommandSuggestions();
-              swallowNextEnterRef.value = true;
               return;
             }
             commandPickerRef.active = false;
@@ -2625,7 +2606,6 @@ async function main() {
             commandPickerRef.index = 0;
             tui.clearCommandSuggestions();
             writeLineWithCursor(selectedItem);
-            swallowNextEnterRef.value = true;
             return;
           }
         }
