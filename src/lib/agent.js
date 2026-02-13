@@ -546,7 +546,7 @@ export class Agent {
 
           this.onEvent?.({ type: "model_call", provider: this.provider.kind, model: this.provider.model });
           if (useNativeTools) {
-            const messages = buildMessages({ history: this.history });
+            const messages = buildMessages({ history: this.history, format: nativeFormat });
             const tools = buildToolDefinitions(nativeFormat);
             const messagesDump = JSON.stringify(messages, null, 2);
             const toolsDump = JSON.stringify(tools, null, 2);

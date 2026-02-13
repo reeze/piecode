@@ -267,6 +267,7 @@ export class SimpleTui {
     this.commandSuggestionsVisible = false;
     this.commandSuggestions = [];
     this.commandSuggestionIndex = 0;
+    this.commandSuggestionLabel = "commands";
     this.scrollOffset = 0;
     this.thoughtStreamText = "";
     this.thoughtStreamVisible = false;
@@ -757,9 +758,10 @@ export class SimpleTui {
     this.render();
   }
 
-  setCommandSuggestions(options, selectedIndex = 0) {
+  setCommandSuggestions(options, selectedIndex = 0, label = "commands") {
     const list = Array.isArray(options) ? options.map((item) => String(item || "")).filter(Boolean) : [];
     this.commandSuggestions = list.slice(0, 8);
+    this.commandSuggestionLabel = String(label || "commands");
     this.commandSuggestionsVisible = this.commandSuggestions.length > 0;
     if (!this.commandSuggestionsVisible) {
       this.commandSuggestionIndex = 0;
@@ -775,6 +777,7 @@ export class SimpleTui {
     this.commandSuggestionsVisible = false;
     this.commandSuggestions = [];
     this.commandSuggestionIndex = 0;
+    this.commandSuggestionLabel = "commands";
     this.render();
   }
 
@@ -1185,7 +1188,7 @@ export class SimpleTui {
 
     const commandSuggestionBlock = this.commandSuggestionsVisible
       ? [
-          color(" commands", "2;37"),
+          color(` ${this.commandSuggestionLabel}`, "2;37"),
           ...this.commandSuggestions.map((command, idx) => {
             const selected = idx === this.commandSuggestionIndex;
             const text = selected ? color(`> ${command}`, "1;32") : color(`  ${command}`, "2;37");

@@ -369,6 +369,62 @@ describe("agent context controls", () => {
     expect(payload).toContain("test prompt content");
   });
 
+  test("openai-native mode sends tool results as role=tool messages", async () => {
+    const seenMessages = [];
+    let calls = 0;
+    const agent = new Agent({
+      provider: {
+        kind: "openrouter-compatible",
+        model: "moonshotai/kimi-k2.5",
+        supportsNativeTools: true,
+        async complete(args = {}) {
+          calls += 1;
+          if (Array.isArray(args.messages)) {
+            seenMessages.push(args.messages);
+          }
+          if (calls === 1) {
+            return {
+              message: {
+                role: "assistant",
+                content: "",
+                tool_calls: [
+                  {
+                    id: "read_file:0",
+                    type: "function",
+                    function: { name: "read_file", arguments: "{\"path\":\"AGENTS.md\"}" },
+                  },
+                ],
+              },
+              finishReason: "tool_calls",
+            };
+          }
+          return {
+            message: {
+              role: "assistant",
+              content: "done",
+            },
+            finishReason: "stop",
+          };
+        },
+      },
+      workspaceDir: process.cwd(),
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      activeSkillsRef: { value: [] },
+      projectInstructionsRef: { value: null },
+    });
+
+    const result = await agent.runTurn("take a look at AGENTS.md");
+    expect(result).toContain("done");
+    expect(seenMessages.length).toBeGreaterThanOrEqual(2);
+
+    const second = seenMessages[1];
+    const toolResultMessage = second.find((m) => m.role === "tool");
+    expect(toolResultMessage).toBeTruthy();
+    expect(toolResultMessage.tool_call_id).toBe("read_file:0");
+    expect(String(toolResultMessage.content || "")).toContain("# Pie Code Agent");
+  });
+
   test("forces final synthesis when model keeps asking tools after tool budget", async () => {
     let nativeTurns = 0;
     let finalizeTurns = 0;

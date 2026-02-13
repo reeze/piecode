@@ -26,10 +26,13 @@ import { SimpleTui } from "./lib/tui.js";
 import { Display } from "./lib/display.js";
 import { consumeMouseWheelDeltas, stripMouseInputNoise } from "./lib/mouse.js";
 import { TuiLineEditor } from "./lib/tuiLineEditor.js";
+import { applyFileMentionSelection, getFileMentionSuggestions, isGitRelatedPath } from "./lib/fileMentions.js";
 
 const HISTORY_MAX = 500;
 const execAsync = promisify(execCb);
 const DIRECT_SHELL_MAX_OUTPUT = 12000;
+const FILE_MENTION_INDEX_MAX = 15000;
+const FILE_MENTION_REFRESH_MS = 15000;
 const SLASH_COMMANDS = [
   "/help",
   "/exit",
@@ -496,6 +499,7 @@ Slash commands in interactive mode:
   CTRL+A / CTRL+E      Move cursor to start/end of input (TUI mode)
   ESC (twice)          Abort current running task (TUI mode)
   SHIFT+ENTER / CTRL+J Insert newline in prompt (TUI mode)
+  @<file>              Fuzzy-search project files for context (git metadata ignored)
 
 Skill invocation:
   Mention $skill-name in a prompt to auto-enable that skill.
@@ -1495,6 +1499,40 @@ function getSuggestionsForInput(line, getSkillIndex) {
   return filterByPrefix(SLASH_COMMANDS, trimmed);
 }
 
+async function collectWorkspaceFilesForMentions(workspaceDir, maxEntries = FILE_MENTION_INDEX_MAX) {
+  const root = String(workspaceDir || "");
+  if (!root) return [];
+  const files = [];
+  const stack = [""];
+  while (stack.length > 0 && files.length < maxEntries) {
+    const relDir = stack.pop() || "";
+    const absDir = path.join(root, relDir);
+    let entries = [];
+    try {
+      entries = await fs.readdir(absDir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    entries.sort((a, b) => String(a.name || "").localeCompare(String(b.name || "")));
+    for (const entry of entries) {
+      const name = String(entry?.name || "");
+      if (!name) continue;
+      const relPath = relDir ? `${relDir}/${name}` : name;
+      if (isGitRelatedPath(relPath)) continue;
+      const lower = name.toLowerCase();
+      if (entry.isDirectory()) {
+        if (lower === "node_modules") continue;
+        stack.push(relPath);
+        continue;
+      }
+      if (!entry.isFile()) continue;
+      files.push(relPath);
+      if (files.length >= maxEntries) break;
+    }
+  }
+  return files;
+}
+
 async function enableSkillByName(target, activeSkillsRef, skillIndex, logLine) {
   const result = await addSkillByName(activeSkillsRef.value, skillIndex, target);
   if (result.added) {
@@ -1989,6 +2027,16 @@ async function main() {
   const currentInputRef = { value: "" };
   const todosRef = { value: [] };
   const todoAutoTrackRef = { value: false };
+  const fileMentionIndexRef = { files: [], loading: false, lastLoadedAt: 0 };
+  const exitArmedRef = { value: false };
+  const approvalActiveRef = { value: false };
+  const suppressNextSubmitRef = { value: false };
+  const pendingCommandSubmitRef = { value: "" };
+  const modelPickerRef = { active: false, query: "", options: [], index: 0 };
+  const commandPickerRef = { active: false, mode: "command", options: [], index: 0 };
+  const swallowNextEnterRef = { value: false };
+  const taskRunningRef = { value: false };
+  const escAbortArmedRef = { value: false };
   const readlineOutput = useTui ? createMutedTtyOutput(stdout) : stdout;
 
   // Filter stdin through a Transform that converts terminal-specific Shift+Enter
@@ -2028,7 +2076,24 @@ async function main() {
         history,
         historySize: HISTORY_MAX,
         removeHistoryDuplicates: true,
-        shouldHandleKeypress: () => !(tui && tui.isOverlayOpen && tui.isOverlayOpen()),
+        shouldHandleKeypress: (str, key = {}) => {
+          if (tui && tui.isOverlayOpen && tui.isOverlayOpen()) return false;
+          const name = String(key?.name || "").toLowerCase();
+          const tabLike = name === "tab" || str === "\t";
+          const navLike = name === "up" || name === "down";
+          const enterLike = name === "return" || name === "enter" || str === "\r" || str === "\n";
+          if (swallowNextEnterRef.value) {
+            if (enterLike) {
+              swallowNextEnterRef.value = false;
+              return false;
+            }
+            swallowNextEnterRef.value = false;
+          }
+          if ((modelPickerRef.active || commandPickerRef.active) && (tabLike || navLike || enterLike)) {
+            return false;
+          }
+          return true;
+        },
       });
     }
     const next = createInterface({
@@ -2061,6 +2126,19 @@ async function main() {
       throw err;
     }
   };
+  const refreshFileMentionIndex = async (force = false) => {
+    if (fileMentionIndexRef.loading) return;
+    const staleMs = Date.now() - Number(fileMentionIndexRef.lastLoadedAt || 0);
+    if (!force && fileMentionIndexRef.files.length > 0 && staleMs < FILE_MENTION_REFRESH_MS) return;
+    fileMentionIndexRef.loading = true;
+    try {
+      fileMentionIndexRef.files = await collectWorkspaceFilesForMentions(workspaceDir);
+      fileMentionIndexRef.lastLoadedAt = Date.now();
+    } finally {
+      fileMentionIndexRef.loading = false;
+    }
+  };
+  refreshFileMentionIndex().catch(() => {});
 
   let tui = null;
   let onResize = null;
@@ -2084,14 +2162,6 @@ async function main() {
   const logLine = createLogger(tui, display, () => currentInputRef.value, (line) =>
     recordTaskLog(taskTraceRef, line)
   );
-  const exitArmedRef = { value: false };
-  const approvalActiveRef = { value: false };
-  const suppressNextSubmitRef = { value: false };
-  const pendingCommandSubmitRef = { value: "" };
-  const modelPickerRef = { active: false, query: "", options: [], index: 0 };
-  const commandPickerRef = { active: false, options: [], index: 0 };
-  const taskRunningRef = { value: false };
-  const escAbortArmedRef = { value: false };
   let escAbortTimer = null;
   let onKeypress = null;
   let onMouseData = null;
@@ -2112,9 +2182,28 @@ async function main() {
       currentInputRef.value = inputNow;
       tui.renderInput(inputNow, safeCursor);
     };
+    const writeLineWithCursor = (nextLine, targetCursor = null) => {
+      const text = String(nextLine || "");
+      const cursor = Number.isFinite(targetCursor) ? Math.max(0, Math.min(text.length, targetCursor)) : text.length;
+      safeRlWrite(null, { ctrl: true, name: "u" });
+      if (text) safeRlWrite(text);
+      const movesLeft = text.length - cursor;
+      for (let i = 0; i < movesLeft; i += 1) safeRlWrite(null, { ctrl: true, name: "b" });
+      currentInputRef.value = text;
+      if (tui) tui.renderInput(text, cursor);
+    };
     onKeypress = (str, key = {}) => {
       if (isReadlineClosed()) return;
       if (approvalActiveRef.value) return;
+      const rawKeyName = String(key?.name || "").toLowerCase();
+      const isEnterKey = rawKeyName === "return" || rawKeyName === "enter" || str === "\r" || str === "\n";
+      if (swallowNextEnterRef.value) {
+        if (isEnterKey) {
+          swallowNextEnterRef.value = false;
+          return;
+        }
+        swallowNextEnterRef.value = false;
+      }
       const currentLineRaw = String(rl.line || "");
       const currentLine = stripMouseInputNoise(currentLineRaw);
       if (currentLine !== currentLineRaw) {
@@ -2271,6 +2360,20 @@ async function main() {
           }, 1200);
           return;
         }
+        if (!key.ctrl && !key.meta && key.name === "escape" && (modelPickerRef.active || commandPickerRef.active)) {
+          modelPickerRef.active = false;
+          modelPickerRef.query = "";
+          modelPickerRef.options = [];
+          modelPickerRef.index = 0;
+          commandPickerRef.active = false;
+          commandPickerRef.mode = "command";
+          commandPickerRef.options = [];
+          commandPickerRef.index = 0;
+          tui.clearModelSuggestions();
+          tui.clearCommandSuggestions();
+          setImmediate(renderLiveInput);
+          return;
+        }
         if (key.ctrl && key.name === "c") {
           exitArmedRef.value = false;
           suppressNextSubmitRef.value = false;
@@ -2280,6 +2383,7 @@ async function main() {
           modelPickerRef.options = [];
           modelPickerRef.index = 0;
           commandPickerRef.active = false;
+          commandPickerRef.mode = "command";
           commandPickerRef.options = [];
           commandPickerRef.index = 0;
           tui.clearModelSuggestions();
@@ -2341,57 +2445,93 @@ async function main() {
           return;
         }
 
-        const pickerQuery = getModelQueryFromInput(currentLine);
-        if (pickerQuery !== null) {
-          const nextOptions = getFilteredModelSuggestions(pickerQuery, modelCatalogRef.value);
-          if (nextOptions.length > 0) {
-            modelPickerRef.active = true;
-            commandPickerRef.active = false;
-            commandPickerRef.options = [];
-            commandPickerRef.index = 0;
-            tui.clearCommandSuggestions();
-            if (modelPickerRef.query !== pickerQuery) {
-              modelPickerRef.query = pickerQuery;
-              modelPickerRef.options = nextOptions;
-              modelPickerRef.index = 0;
-            } else {
-              modelPickerRef.options = nextOptions;
-              if (modelPickerRef.index >= modelPickerRef.options.length) modelPickerRef.index = 0;
-            }
-            tui.setModelSuggestions(modelPickerRef.options, modelPickerRef.index);
-          } else {
-            modelPickerRef.active = false;
-            modelPickerRef.options = [];
-            modelPickerRef.index = 0;
-            tui.clearModelSuggestions();
-          }
-        } else {
-          if (modelPickerRef.active) {
-            modelPickerRef.active = false;
-            modelPickerRef.query = "";
-            modelPickerRef.options = [];
-            modelPickerRef.index = 0;
-            tui.clearModelSuggestions();
-          }
-          const trimmed = currentLine.trimStart();
-          if (trimmed.startsWith("/")) {
-            const commandOptions = getSuggestionsForInput(currentLine, () => skillIndex).slice(0, 8);
-            if (commandOptions.length > 0) {
-              commandPickerRef.active = true;
-              commandPickerRef.options = commandOptions;
-              if (commandPickerRef.index >= commandOptions.length) commandPickerRef.index = 0;
-              tui.setCommandSuggestions(commandPickerRef.options, commandPickerRef.index);
-            } else {
+        const keyName = String(key?.name || "").toLowerCase();
+        const isPickerNavigationKey =
+          keyName === "tab" || keyName === "up" || keyName === "down" || keyName === "return" || keyName === "enter";
+
+        if (!(isPickerNavigationKey && (modelPickerRef.active || commandPickerRef.active))) {
+          const pickerQuery = getModelQueryFromInput(currentLine);
+          if (pickerQuery !== null) {
+            const nextOptions = getFilteredModelSuggestions(pickerQuery, modelCatalogRef.value);
+            if (nextOptions.length > 0) {
+              modelPickerRef.active = true;
               commandPickerRef.active = false;
+              commandPickerRef.mode = "command";
               commandPickerRef.options = [];
               commandPickerRef.index = 0;
               tui.clearCommandSuggestions();
+              if (modelPickerRef.query !== pickerQuery) {
+                modelPickerRef.query = pickerQuery;
+                modelPickerRef.options = nextOptions;
+                modelPickerRef.index = 0;
+              } else {
+                modelPickerRef.options = nextOptions;
+                if (modelPickerRef.index >= modelPickerRef.options.length) modelPickerRef.index = 0;
+              }
+              tui.setModelSuggestions(modelPickerRef.options, modelPickerRef.index);
+            } else {
+              modelPickerRef.active = false;
+              modelPickerRef.options = [];
+              modelPickerRef.index = 0;
+              tui.clearModelSuggestions();
             }
-          } else if (commandPickerRef.active) {
-            commandPickerRef.active = false;
-            commandPickerRef.options = [];
-            commandPickerRef.index = 0;
-            tui.clearCommandSuggestions();
+          } else {
+            if (modelPickerRef.active) {
+              modelPickerRef.active = false;
+              modelPickerRef.query = "";
+              modelPickerRef.options = [];
+              modelPickerRef.index = 0;
+              tui.clearModelSuggestions();
+            }
+            const trimmed = currentLine.trimStart();
+            if (trimmed.startsWith("/")) {
+              const commandOptions = getSuggestionsForInput(currentLine, () => skillIndex).slice(0, 8);
+              if (commandOptions.length > 0) {
+                commandPickerRef.active = true;
+                commandPickerRef.mode = "command";
+                commandPickerRef.options = commandOptions;
+                if (commandPickerRef.index >= commandOptions.length) commandPickerRef.index = 0;
+                tui.setCommandSuggestions(commandPickerRef.options, commandPickerRef.index, "commands");
+              } else {
+                commandPickerRef.active = false;
+                commandPickerRef.mode = "command";
+                commandPickerRef.options = [];
+                commandPickerRef.index = 0;
+                tui.clearCommandSuggestions();
+              }
+            } else {
+              const cursorNow = Number.isFinite(rl.cursor) ? Math.max(0, Math.floor(rl.cursor)) : currentLine.length;
+              const mentionState = getFileMentionSuggestions(
+                currentLine,
+                cursorNow,
+                fileMentionIndexRef.files,
+                8
+              );
+              if (
+                mentionState.mention &&
+                mentionState.suggestions.length === 0 &&
+                !fileMentionIndexRef.loading
+              ) {
+                refreshFileMentionIndex(true).catch(() => {});
+              }
+              if (mentionState.mention && mentionState.suggestions.length > 0) {
+                commandPickerRef.active = true;
+                commandPickerRef.mode = "file";
+                commandPickerRef.options = mentionState.suggestions;
+                if (commandPickerRef.index >= commandPickerRef.options.length) commandPickerRef.index = 0;
+                tui.setCommandSuggestions(
+                  commandPickerRef.options.map((item) => `@${item}`),
+                  commandPickerRef.index,
+                  "files"
+                );
+              } else if (commandPickerRef.active) {
+                commandPickerRef.active = false;
+                commandPickerRef.mode = "command";
+                commandPickerRef.options = [];
+                commandPickerRef.index = 0;
+                tui.clearCommandSuggestions();
+              }
+            }
           }
         }
 
@@ -2418,17 +2558,13 @@ async function main() {
           }
           if (key.name === "return" || key.name === "enter") {
             const selectedModel = modelPickerRef.options[modelPickerRef.index];
-            suppressNextSubmitRef.value = true;
-            pendingCommandSubmitRef.value = `/model ${selectedModel}`;
             modelPickerRef.active = false;
             modelPickerRef.query = "";
             modelPickerRef.options = [];
             modelPickerRef.index = 0;
             tui.clearModelSuggestions();
-            safeRlWrite(null, { ctrl: true, name: "u" });
-            safeRlWrite(`/model ${selectedModel}`);
-            currentInputRef.value = `/model ${selectedModel}`;
-            tui.renderInput(currentInputRef.value);
+            writeLineWithCursor(`/model ${selectedModel}`);
+            swallowNextEnterRef.value = true;
             return;
           }
         }
@@ -2438,33 +2574,58 @@ async function main() {
             const delta = key.shift ? -1 : 1;
             const len = commandPickerRef.options.length;
             commandPickerRef.index = (commandPickerRef.index + delta + len) % len;
-            const selectedCommand = commandPickerRef.options[commandPickerRef.index];
-            safeRlWrite(null, { ctrl: true, name: "u" });
-            safeRlWrite(selectedCommand);
-            currentInputRef.value = selectedCommand;
-            tui.setCommandSuggestions(commandPickerRef.options, commandPickerRef.index);
-            tui.renderInput(currentInputRef.value);
+            const selectedItem = commandPickerRef.options[commandPickerRef.index];
+            if (commandPickerRef.mode === "file") {
+              const cursorNow = Number.isFinite(rl.cursor) ? Math.max(0, Math.floor(rl.cursor)) : currentLine.length;
+              const applied = applyFileMentionSelection(currentLine, cursorNow, selectedItem);
+              if (applied) writeLineWithCursor(applied.line, applied.cursor);
+              tui.setCommandSuggestions(
+                commandPickerRef.options.map((item) => `@${item}`),
+                commandPickerRef.index,
+                "files"
+              );
+            } else {
+              writeLineWithCursor(selectedItem);
+              tui.setCommandSuggestions(commandPickerRef.options, commandPickerRef.index, "commands");
+            }
             return;
           }
           if (key.name === "up" || key.name === "down") {
             const delta = key.name === "up" ? -1 : 1;
             const len = commandPickerRef.options.length;
             commandPickerRef.index = (commandPickerRef.index + delta + len) % len;
-            tui.setCommandSuggestions(commandPickerRef.options, commandPickerRef.index);
+            if (commandPickerRef.mode === "file") {
+              tui.setCommandSuggestions(
+                commandPickerRef.options.map((item) => `@${item}`),
+                commandPickerRef.index,
+                "files"
+              );
+            } else {
+              tui.setCommandSuggestions(commandPickerRef.options, commandPickerRef.index, "commands");
+            }
             return;
           }
           if (key.name === "return" || key.name === "enter") {
-            const selectedCommand = commandPickerRef.options[commandPickerRef.index];
-            suppressNextSubmitRef.value = true;
-            pendingCommandSubmitRef.value = selectedCommand;
+            const selectedItem = commandPickerRef.options[commandPickerRef.index];
+            if (commandPickerRef.mode === "file") {
+              const cursorNow = Number.isFinite(rl.cursor) ? Math.max(0, Math.floor(rl.cursor)) : currentLine.length;
+              const applied = applyFileMentionSelection(currentLine, cursorNow, selectedItem);
+              if (applied) writeLineWithCursor(applied.line, applied.cursor);
+              commandPickerRef.active = false;
+              commandPickerRef.mode = "command";
+              commandPickerRef.options = [];
+              commandPickerRef.index = 0;
+              tui.clearCommandSuggestions();
+              swallowNextEnterRef.value = true;
+              return;
+            }
             commandPickerRef.active = false;
+            commandPickerRef.mode = "command";
             commandPickerRef.options = [];
             commandPickerRef.index = 0;
             tui.clearCommandSuggestions();
-            safeRlWrite(null, { ctrl: true, name: "u" });
-            safeRlWrite(selectedCommand);
-            currentInputRef.value = selectedCommand;
-            tui.renderInput(currentInputRef.value);
+            writeLineWithCursor(selectedItem);
+            swallowNextEnterRef.value = true;
             return;
           }
         }
@@ -2473,6 +2634,18 @@ async function main() {
       }
 
       if (tui) return;
+
+      const cursorNow = Number.isFinite(rl.cursor) ? Math.max(0, Math.floor(rl.cursor)) : currentLine.length;
+      const mentionState = getFileMentionSuggestions(currentLine, cursorNow, fileMentionIndexRef.files, 8);
+      if (mentionState.mention) {
+        if (mentionState.suggestions.length === 0 && !fileMentionIndexRef.loading) {
+          refreshFileMentionIndex(true).catch(() => {});
+        }
+        if (mentionState.suggestions.length > 0) {
+          if (display) display.showSuggestions(mentionState.suggestions.map((item) => `@${item}`));
+          return;
+        }
+      }
 
       if (!currentLine.trimStart().startsWith("/")) {
         if (display) display.clearSuggestions();
@@ -3001,6 +3174,7 @@ async function main() {
         modelPickerRef.options = [];
         modelPickerRef.index = 0;
         commandPickerRef.active = false;
+        commandPickerRef.mode = "command";
         commandPickerRef.options = [];
         commandPickerRef.index = 0;
         if (tui) {
