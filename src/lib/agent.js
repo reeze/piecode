@@ -548,10 +548,12 @@ export class Agent {
           if (useNativeTools) {
             const messages = buildMessages({ history: this.history });
             const tools = buildToolDefinitions(nativeFormat);
+            const messagesDump = JSON.stringify(messages, null, 2);
+            const toolsDump = JSON.stringify(tools, null, 2);
             this.onEvent?.({
               type: "llm_request",
               stage: "turn",
-              payload: `SYSTEM:\n${systemPrompt}\n\nMESSAGES: ${messages.length} entries\nTOOLS: ${tools.length} definitions`,
+              payload: `SYSTEM:\n${systemPrompt}\n\nMESSAGES:\n${messagesDump}\n\nTOOLS:\n${toolsDump}`,
             });
             const response =
               typeof this.provider.completeStream === "function"
@@ -795,6 +797,18 @@ export class Agent {
           content: JSON.stringify(toolResultMessage),
           ...(useNativeTools ? { toolResult: { toolCallId: callId, name: action.tool, result } } : {}),
         });
+
+        // Always stop after an executed git commit in the current turn.
+        // This prevents repeated commit attempts when follow-up prompts like "yes"
+        // don't match commit-intent policy detection.
+        if (action.tool === "shell") {
+          const normalizedCmd = this.normalizeShellCommand(String(action?.input?.command || "")).toLowerCase();
+          if (/^git\s+commit\b/.test(normalizedCmd)) {
+            const message = this.formatToolResultForUser(action, result, toolError);
+            this.history.push({ role: "assistant", content: message });
+            return message;
+          }
+        }
 
         if (action.tool === "shell" && turnPolicy?.finalizeAfterFirstCommitAttempt) {
           const normalizedCmd = this.normalizeShellCommand(String(action?.input?.command || "")).toLowerCase();

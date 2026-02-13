@@ -332,6 +332,43 @@ describe("agent context controls", () => {
     expect(result).toContain("done");
   });
 
+  test("native llm_request logs full messages including user prompt", async () => {
+    const llmRequests = [];
+    const agent = new Agent({
+      provider: {
+        kind: "openrouter-compatible",
+        model: "moonshotai/kimi-k2.5",
+        supportsNativeTools: true,
+        async complete() {
+          return {
+            message: {
+              role: "assistant",
+              content: "done",
+            },
+            finishReason: "stop",
+          };
+        },
+      },
+      workspaceDir: process.cwd(),
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      activeSkillsRef: { value: [] },
+      projectInstructionsRef: { value: null },
+      onEvent: (evt) => {
+        if (evt?.type === "llm_request" && evt?.stage === "turn") {
+          llmRequests.push(String(evt.payload || ""));
+        }
+      },
+    });
+
+    await agent.runTurn("test prompt content");
+    expect(llmRequests.length).toBeGreaterThan(0);
+    const payload = llmRequests[0];
+    expect(payload).toContain("MESSAGES:");
+    expect(payload).toContain("TOOLS:");
+    expect(payload).toContain("test prompt content");
+  });
+
   test("forces final synthesis when model keeps asking tools after tool budget", async () => {
     let nativeTurns = 0;
     let finalizeTurns = 0;
@@ -475,6 +512,42 @@ describe("agent context controls", () => {
     });
 
     const result = await agent.runTurn("please help me commit them with the generated message");
+    expect(calls).toBe(1);
+    expect(result.toLowerCase()).toContain("git commit --dry-run -m \"test\"");
+  });
+
+  test("finalizes immediately after git commit even without commit-intent policy", async () => {
+    let calls = 0;
+    const agent = new Agent({
+      provider: {
+        kind: "test-provider",
+        model: "test-model",
+        async complete() {
+          calls += 1;
+          if (calls === 1) {
+            return JSON.stringify({
+              type: "tool_use",
+              tool: "shell",
+              input: { command: "git commit --dry-run -m \"test\"" },
+              reason: "commit changes",
+            });
+          }
+          return JSON.stringify({
+            type: "tool_use",
+            tool: "shell",
+            input: { command: "git status" },
+            reason: "post-commit check",
+          });
+        },
+      },
+      workspaceDir: process.cwd(),
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      activeSkillsRef: { value: [] },
+      projectInstructionsRef: { value: null },
+    });
+
+    const result = await agent.runTurn("yes");
     expect(calls).toBe(1);
     expect(result.toLowerCase()).toContain("git commit --dry-run -m \"test\"");
   });

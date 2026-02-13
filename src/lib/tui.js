@@ -116,6 +116,18 @@ function renderMarkdownLines(text) {
 
 function highlightOverlaySectionLine(line) {
   const text = String(line || "");
+  if (/^\s*SYSTEM:/i.test(text)) {
+    return text.replace(/^\s*SYSTEM:/i, (m) => color(m.trim(), "1;30;46"));
+  }
+  if (/^\s*USER:/i.test(text)) {
+    return text.replace(/^\s*USER:/i, (m) => color(m.trim(), "1;30;42"));
+  }
+  if (/^\s*MESSAGES:/i.test(text)) {
+    return text.replace(/^\s*MESSAGES:/i, (m) => color(m.trim(), "1;30;44"));
+  }
+  if (/^\s*TOOLS:/i.test(text)) {
+    return text.replace(/^\s*TOOLS:/i, (m) => color(m.trim(), "1;30;45"));
+  }
   if (/^\s*Request:/i.test(text)) {
     return text.replace(/^\s*Request:/i, (m) => color(m.trim(), "1;36"));
   }
@@ -130,6 +142,9 @@ function highlightOverlaySectionLine(line) {
   }
   if (/^\s*Thinking Output:/i.test(text)) {
     return text.replace(/^\s*Thinking Output:/i, (m) => color(m.trim(), "1;32"));
+  }
+  if (/"role"\s*:\s*"user"/i.test(text)) {
+    return color(text, "30;102");
   }
   return text;
 }
