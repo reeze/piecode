@@ -608,7 +608,7 @@ describe("agent context controls", () => {
     expect(result.toLowerCase()).toContain("git commit --dry-run -m \"test\"");
   });
 
-  test("commit request does not loop on repeated git status and finalizes from evidence", async () => {
+  test("repeated git status without commit progression is stopped by generic loop guard", async () => {
     let normalTurns = 0;
     let finalizeTurns = 0;
     const agent = new Agent({
@@ -638,9 +638,8 @@ describe("agent context controls", () => {
 
     const result = await agent.runTurn("please help me commit them with the generated message");
     expect(normalTurns).toBe(2);
-    expect(finalizeTurns).toBe(1);
-    expect(result.toLowerCase()).toContain("git commit");
-    expect(result.toLowerCase()).not.toContain("same verified step result");
+    expect(finalizeTurns).toBe(0);
+    expect(result.toLowerCase()).toContain("same verified step result");
   });
 
   test("commit request with batched duplicate status continues to diff and commit", async () => {
@@ -745,6 +744,139 @@ describe("agent context controls", () => {
     );
     expect(sawDiffStat).toBe(true);
     expect(sawCommit).toBe(true);
+  });
+
+  test("commit request can still commit after prep reaches tool cap once", async () => {
+    let calls = 0;
+    const agent = new Agent({
+      provider: {
+        kind: "openrouter-compatible",
+        model: "moonshotai/kimi-k2.5",
+        supportsNativeTools: true,
+        async complete() {
+          calls += 1;
+          if (calls === 1) {
+            return {
+              message: {
+                role: "assistant",
+                content: "",
+                tool_calls: [
+                  {
+                    id: "shell:0",
+                    type: "function",
+                    function: { name: "shell", arguments: "{\"command\":\"git status\"}" },
+                  },
+                ],
+              },
+              finishReason: "tool_calls",
+            };
+          }
+          if (calls === 2) {
+            return {
+              message: {
+                role: "assistant",
+                content: "",
+                tool_calls: [
+                  {
+                    id: "shell:1",
+                    type: "function",
+                    function: { name: "shell", arguments: "{\"command\":\"git diff --stat\"}" },
+                  },
+                ],
+              },
+              finishReason: "tool_calls",
+            };
+          }
+          if (calls === 3) {
+            return {
+              message: {
+                role: "assistant",
+                content: "",
+                tool_calls: [
+                  {
+                    id: "shell:2",
+                    type: "function",
+                    function: { name: "shell", arguments: "{\"command\":\"git diff --cached --stat\"}" },
+                  },
+                ],
+              },
+              finishReason: "tool_calls",
+            };
+          }
+          if (calls === 4) {
+            return {
+              message: {
+                role: "assistant",
+                content: "",
+                tool_calls: [
+                  {
+                    id: "shell:3",
+                    type: "function",
+                    function: { name: "shell", arguments: "{\"command\":\"git add -A\"}" },
+                  },
+                ],
+              },
+              finishReason: "tool_calls",
+            };
+          }
+          return {
+            message: {
+              role: "assistant",
+              content: "",
+              tool_calls: [
+                {
+                  id: "shell:4",
+                  type: "function",
+                  function: { name: "shell", arguments: "{\"command\":\"git commit --dry-run -m \\\"chore: commit\\\"\"}" },
+                },
+              ],
+            },
+            finishReason: "tool_calls",
+          };
+        },
+      },
+      workspaceDir: process.cwd(),
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      activeSkillsRef: { value: [] },
+      projectInstructionsRef: { value: null },
+    });
+
+    const result = await agent.runTurn("please commit the current changes with generated commit message");
+    expect(result.toLowerCase()).toContain("git commit --dry-run -m \"chore: commit\"");
+  });
+
+  test("commit explanation question should not trigger commit-request turn contract", async () => {
+    const llmRequests = [];
+    const agent = new Agent({
+      provider: {
+        kind: "openrouter-compatible",
+        model: "moonshotai/kimi-k2.5",
+        supportsNativeTools: true,
+        async complete() {
+          return {
+            message: {
+              role: "assistant",
+              content: "I should explain first.",
+            },
+            finishReason: "stop",
+          };
+        },
+      },
+      workspaceDir: process.cwd(),
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      activeSkillsRef: { value: [] },
+      projectInstructionsRef: { value: null },
+      onEvent: (evt) => {
+        if (evt?.type === "llm_request" && evt?.stage === "turn") llmRequests.push(String(evt.payload || ""));
+      },
+    });
+
+    await agent.runTurn("why don't you call git commit, which prompt disallow you?");
+    expect(llmRequests.length).toBeGreaterThan(0);
+    expect(llmRequests[0]).not.toContain("TURN EXECUTION CONTRACT:");
+    expect(llmRequests[0]).not.toContain("Intent: repo_commit_request");
   });
 
   test("stops alternating tools when a verified outcome repeats", async () => {

@@ -201,24 +201,6 @@ export class Agent {
       /\b(check|show|get)\b.*\b(status)\b.*\b(repo|repository)\b/.test(lower) ||
       /\b(status)\b.*\b(repo|repository)\b/.test(lower);
 
-    const asksCommitAction =
-      /\bcommit\b/.test(lower) &&
-      (/\b(help|please|can you|do it|them|changes|generated message|message)\b/.test(lower) ||
-        /\bgit\s+commit\b/.test(lower));
-
-    if (asksCommitAction) {
-      return {
-        name: "repo_commit_request",
-        maxToolCalls: 4,
-        allowedTools: ["shell"],
-        forceFinalizeAfterTool: false,
-        disableTodos: true,
-        allowCommitFlowShellOnly: true,
-        finalizeAfterFirstCommitAttempt: true,
-        note: "For commit requests, use git status/diff/add/commit commands and stop after one commit attempt or when repo is already clean.",
-      };
-    }
-
     if (asksGitStatus) {
       return {
         name: "repo_status_check",
@@ -509,8 +491,16 @@ export class Agent {
       let turnToolLimitReached = false;
       let postLimitToolRetryCount = 0;
       const pendingToolActions = [];
+      const hasFixedTurnToolCap = Number.isFinite(turnPolicy?.maxToolCalls);
+      const fixedTurnToolCap = hasFixedTurnToolCap ? turnPolicy.maxToolCalls : NaN;
+      const dynamicCommitFlowToolCap = 4;
+      let commitFlowSignalCount = 0;
+      let lastCommitFlowSignal = "";
+      let commitFlowActive = false;
       let commitAttemptedThisTurn = false;
       let commitStatusCheckedThisTurn = false;
+      let commitFinalizeNudgeGiven = false;
+      let commitCommandRequired = false;
 
       // 对于简单任务，使用原有的循环方式
       let i = 0;
@@ -620,11 +610,14 @@ export class Agent {
           continue;
         }
 
-        if (
-          action.type === "tool_use" &&
-          turnToolLimitReached &&
-          Number.isFinite(turnPolicy?.maxToolCalls)
-        ) {
+        const currentCommitFlowMode = !hasFixedTurnToolCap && commitFlowActive;
+        const currentTurnMaxToolCalls = hasFixedTurnToolCap
+          ? fixedTurnToolCap
+          : currentCommitFlowMode
+            ? dynamicCommitFlowToolCap
+            : NaN;
+
+        if (action.type === "tool_use" && turnToolLimitReached && Number.isFinite(currentTurnMaxToolCalls)) {
           postLimitToolRetryCount += 1;
           const forced = await this.synthesizeFinalFromEvidence({
             userMessage,
@@ -672,16 +665,48 @@ export class Agent {
             return msg;
           }
         }
-        if (action.tool === "shell" && turnPolicy?.allowCommitFlowShellOnly) {
+        let normalizedShellCmd = "";
+        let shellIsCommitFlowCommand = false;
+        let shellIsCommitCommand = false;
+        let shellIsStatusCommand = false;
+        if (action.tool === "shell") {
           const cmd = String(action?.input?.command || "");
-          if (!this.isAllowedShellCommandForCommitFlow(cmd)) {
+          normalizedShellCmd = this.normalizeShellCommand(cmd).toLowerCase();
+          shellIsCommitFlowCommand = this.isAllowedShellCommandForCommitFlow(cmd);
+          shellIsCommitCommand = /^git\s+commit\b/.test(normalizedShellCmd);
+          shellIsStatusCommand = /^git\s+status\b/.test(normalizedShellCmd);
+
+          if (!hasFixedTurnToolCap && shellIsCommitFlowCommand) {
+            const hasPriorCommitSignal = commitFlowSignalCount >= 1;
+            const isDifferentCommitSignal = Boolean(lastCommitFlowSignal && lastCommitFlowSignal !== normalizedShellCmd);
+            const isStrongCommitSignal = /^git\s+(add|commit)\b/.test(normalizedShellCmd);
+            if (isStrongCommitSignal || (hasPriorCommitSignal && (isDifferentCommitSignal || pendingToolActions.length > 0))) {
+              commitFlowActive = true;
+            }
+            commitFlowSignalCount += 1;
+            lastCommitFlowSignal = normalizedShellCmd;
+          }
+
+          const commitFlowMode = !hasFixedTurnToolCap && commitFlowActive;
+          if (commitFlowMode && !shellIsCommitFlowCommand) {
             const msg =
-              "For this commit request, only git status/diff/add/commit commands are allowed. Please provide a valid commit command.";
+              "Commit flow is active for this turn. Only git status/diff/add/commit commands are allowed before finalizing.";
             this.history.push({ role: "assistant", content: msg });
             return msg;
           }
-          const normalized = this.normalizeShellCommand(cmd).toLowerCase();
-          if (/^git\s+status\b/.test(normalized) && commitStatusCheckedThisTurn) {
+          if (commitFlowMode && commitCommandRequired && !shellIsCommitCommand) {
+            const forced = await this.synthesizeFinalFromEvidence({
+              userMessage,
+              requireCommitMessage: false,
+              signal,
+            }).catch(() => "");
+            const msg =
+              String(forced || "").trim() ||
+              "I collected enough prep context for this commit flow. The next step must be a git commit command; I stopped to avoid extra prep loops.";
+            this.history.push({ role: "assistant", content: msg });
+            return msg;
+          }
+          if (commitFlowMode && shellIsStatusCommand && commitStatusCheckedThisTurn) {
             if (pendingToolActions.length > 0) {
               this.history.push({
                 role: "assistant",
@@ -798,49 +823,48 @@ export class Agent {
           ...(useNativeTools ? { toolResult: { toolCallId: callId, name: action.tool, result } } : {}),
         });
 
-        // Always stop after an executed git commit in the current turn.
-        // This prevents repeated commit attempts when follow-up prompts like "yes"
-        // don't match commit-intent policy detection.
         if (action.tool === "shell") {
-          const normalizedCmd = this.normalizeShellCommand(String(action?.input?.command || "")).toLowerCase();
-          if (/^git\s+commit\b/.test(normalizedCmd)) {
-            const message = this.formatToolResultForUser(action, result, toolError);
-            this.history.push({ role: "assistant", content: message });
-            return message;
+          if (!hasFixedTurnToolCap && shellIsCommitFlowCommand) {
+            if (shellIsStatusCommand) {
+              commitStatusCheckedThisTurn = true;
+            }
+            const outputLower = String(result || "").toLowerCase();
+            if (commitFlowActive && (outputLower.includes("nothing to commit") || outputLower.includes("working tree clean"))) {
+              const msg =
+                "Repository is already clean. There is nothing new to commit. If you want another commit, make changes first.";
+              this.history.push({ role: "assistant", content: msg });
+              return msg;
+            }
           }
-        }
 
-        if (action.tool === "shell" && turnPolicy?.finalizeAfterFirstCommitAttempt) {
-          const normalizedCmd = this.normalizeShellCommand(String(action?.input?.command || "")).toLowerCase();
-          const outputLower = String(result || "").toLowerCase();
-          if (/^git\s+status\b/.test(normalizedCmd)) {
-            commitStatusCheckedThisTurn = true;
-          }
-          const isCommitCmd = /^git\s+commit\b/.test(normalizedCmd);
-          if (isCommitCmd) {
+          // Always stop after an executed git commit in the current turn.
+          // This avoids repeated commit attempts from follow-up tool loops.
+          if (shellIsCommitCommand) {
             commitAttemptedThisTurn = true;
             const message = this.formatToolResultForUser(action, result, toolError);
             this.history.push({ role: "assistant", content: message });
             return message;
           }
-          if (outputLower.includes("nothing to commit") || outputLower.includes("working tree clean")) {
-            const msg =
-              "Repository is already clean. There is nothing new to commit. If you want another commit, make changes first.";
-            this.history.push({ role: "assistant", content: msg });
-            return msg;
-          }
-          if (commitAttemptedThisTurn) {
-            const msg = "A commit attempt already happened in this turn. Finalizing to avoid repeated commit attempts.";
-            this.history.push({ role: "assistant", content: msg });
-            return msg;
-          }
         }
 
-        if (
-          Number.isFinite(turnPolicy?.maxToolCalls) &&
-          toolCalls >= turnPolicy.maxToolCalls &&
-          !turnPolicy?.forceFinalizeAfterTool
-        ) {
+        const commitFlowMode = !hasFixedTurnToolCap && commitFlowActive;
+        const effectiveTurnMaxToolCalls = hasFixedTurnToolCap
+          ? fixedTurnToolCap
+          : commitFlowMode
+            ? dynamicCommitFlowToolCap
+            : NaN;
+
+        if (Number.isFinite(effectiveTurnMaxToolCalls) && toolCalls >= effectiveTurnMaxToolCalls && !turnPolicy?.forceFinalizeAfterTool) {
+          if (commitFlowMode && !commitAttemptedThisTurn && !commitFinalizeNudgeGiven) {
+            commitFinalizeNudgeGiven = true;
+            commitCommandRequired = true;
+            this.history.push({
+              role: "assistant",
+              content:
+                "Commit flow is still pending. Do not run more prep checks. Next tool call must be `git commit ...` (or finalize with why commit cannot proceed).",
+            });
+            continue;
+          }
           turnToolLimitReached = true;
           postLimitToolRetryCount = 0;
           const commitRequirement = turnPolicy?.requireCommitMessage
@@ -854,11 +878,7 @@ export class Agent {
           continue;
         }
 
-        if (
-          turnPolicy?.forceFinalizeAfterTool &&
-          Number.isFinite(turnPolicy?.maxToolCalls) &&
-          toolCalls >= turnPolicy.maxToolCalls
-        ) {
+        if (turnPolicy?.forceFinalizeAfterTool && Number.isFinite(effectiveTurnMaxToolCalls) && toolCalls >= effectiveTurnMaxToolCalls) {
           const message = this.formatToolResultForUser(action, result, toolError);
           this.history.push({ role: "assistant", content: message });
           return message;
