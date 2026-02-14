@@ -120,11 +120,17 @@ async function postJsonStream(url, headers, body, onChunk, options = {}) {
       throw err;
     }
 
-    if (!res.body) return "";
+    if (!res.body) {
+      return {
+        text: "",
+        usage: null,
+      };
+    }
     const reader = res.body.getReader();
     const decoder = new TextDecoder();
     let buffer = "";
     let combined = "";
+    let usage = null;
 
     while (true) {
       let packet;
@@ -154,6 +160,10 @@ async function postJsonStream(url, headers, body, onChunk, options = {}) {
         if (!data || data === "[DONE]") continue;
         try {
           const parsed = JSON.parse(data);
+          if (parsed?.usage && typeof parsed.usage === "object") {
+            const normalized = normalizeUsage(parsed.usage);
+            if (normalized) usage = normalized;
+          }
           const delta = parsed?.choices?.[0]?.delta?.content;
           if (typeof delta === "string" && delta.length > 0) {
             combined += delta;
@@ -165,7 +175,10 @@ async function postJsonStream(url, headers, body, onChunk, options = {}) {
       }
     }
 
-    return combined.trim();
+    return {
+      text: combined.trim(),
+      usage,
+    };
   } finally {
     clearTimeout(timeout);
     if (externalSignal && abortListener) {
@@ -216,6 +229,27 @@ function extractDeltaReasoning(delta) {
   return "";
 }
 
+function toFiniteNumber(value) {
+  const n = Number(value);
+  return Number.isFinite(n) ? Math.max(0, Math.round(n)) : null;
+}
+
+function normalizeUsage(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const inputTokens = toFiniteNumber(raw.input_tokens ?? raw.prompt_tokens ?? raw.inputTokens);
+  const outputTokens = toFiniteNumber(raw.output_tokens ?? raw.completion_tokens ?? raw.outputTokens);
+  const totalTokens = toFiniteNumber(raw.total_tokens ?? raw.totalTokens);
+  const out = {};
+  if (inputTokens != null) out.input_tokens = inputTokens;
+  if (outputTokens != null) out.output_tokens = outputTokens;
+  if (totalTokens != null) out.total_tokens = totalTokens;
+  if (Object.keys(out).length === 0) return null;
+  if (out.total_tokens == null && out.input_tokens != null && out.output_tokens != null) {
+    out.total_tokens = out.input_tokens + out.output_tokens;
+  }
+  return out;
+}
+
 async function postJsonStreamOpenAINative(url, headers, body, onChunk, options = {}) {
   const controller = new AbortController();
   const externalSignal = options?.signal;
@@ -261,6 +295,7 @@ async function postJsonStreamOpenAINative(url, headers, body, onChunk, options =
       return {
         message: { role: "assistant", content: "" },
         finishReason: "",
+        usage: null,
       };
     }
 
@@ -270,6 +305,7 @@ async function postJsonStreamOpenAINative(url, headers, body, onChunk, options =
     let content = "";
     let finishReason = "";
     const toolCallsByIndex = new Map();
+    let usage = null;
 
     while (true) {
       let packet;
@@ -300,6 +336,10 @@ async function postJsonStreamOpenAINative(url, headers, body, onChunk, options =
 
         try {
           const parsed = JSON.parse(data);
+          if (parsed?.usage && typeof parsed.usage === "object") {
+            const normalized = normalizeUsage(parsed.usage);
+            if (normalized) usage = normalized;
+          }
           const choice = parsed?.choices?.[0];
           if (!choice) continue;
           if (typeof choice.finish_reason === "string" && choice.finish_reason) {
@@ -355,7 +395,7 @@ async function postJsonStreamOpenAINative(url, headers, body, onChunk, options =
       ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
     };
 
-    return { message, finishReason };
+    return { message, finishReason, usage };
   } finally {
     clearTimeout(timeout);
     if (externalSignal && abortListener) {
@@ -462,7 +502,12 @@ function createOpenAICompatibleProvider({ kind, model, apiKey, baseUrl, extraHea
     kind,
     model,
     supportsNativeTools: true,
+    _lastUsage: null,
+    getLastUsage() {
+      return this._lastUsage || null;
+    },
     async complete({ systemPrompt, prompt, messages, tools, signal }) {
+      this._lastUsage = null;
       const useNative = Array.isArray(messages) && Array.isArray(tools);
       const body = useNative
         ? {
@@ -485,16 +530,24 @@ function createOpenAICompatibleProvider({ kind, model, apiKey, baseUrl, extraHea
         body,
         { signal }
       );
+      this._lastUsage = normalizeUsage(data?.usage);
       if (useNative) {
         const msg = data?.choices?.[0]?.message;
         if (!msg) throw new Error("OpenAI-compatible response did not contain message.");
-        return { type: "native", format: "openai", message: msg, finishReason: data?.choices?.[0]?.finish_reason };
+        return {
+          type: "native",
+          format: "openai",
+          message: msg,
+          finishReason: data?.choices?.[0]?.finish_reason,
+          usage: this._lastUsage || null,
+        };
       }
       const text = data?.choices?.[0]?.message?.content;
       if (!text) throw new Error("OpenAI-compatible response did not contain message content.");
       return text;
     },
     async completeStream({ systemPrompt, prompt, messages, tools, onDelta, signal }) {
+      this._lastUsage = null;
       if (Array.isArray(messages) && Array.isArray(tools)) {
         const streamed = await postJsonStreamOpenAINative(
           chatUrl,
@@ -509,14 +562,16 @@ function createOpenAICompatibleProvider({ kind, model, apiKey, baseUrl, extraHea
           onDelta,
           { signal }
         );
+        this._lastUsage = streamed.usage || null;
         return {
           type: "native",
           format: "openai",
           message: streamed.message,
           finishReason: streamed.finishReason,
+          usage: this._lastUsage || null,
         };
       }
-      const text = await postJsonStream(
+      const streamed = await postJsonStream(
         chatUrl,
         { Authorization: `Bearer ${apiKey}`, ...extraHeaders },
         {
@@ -531,6 +586,8 @@ function createOpenAICompatibleProvider({ kind, model, apiKey, baseUrl, extraHea
         onDelta,
         { signal }
       );
+      this._lastUsage = streamed?.usage || null;
+      const text = String(streamed?.text || "");
       if (!text) throw new Error("OpenAI-compatible stream did not contain message content.");
       return text;
     },
@@ -571,7 +628,12 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
     kind: "seed-openai-compatible",
     model: resolvedModel,
     supportsNativeTools: true,
+    _lastUsage: null,
+    getLastUsage() {
+      return this._lastUsage || null;
+    },
     async completeStream({ systemPrompt, prompt, messages, tools, onDelta, signal }) {
+      this._lastUsage = null;
       if (Array.isArray(messages) && Array.isArray(tools)) {
         const nativeBody = {
           model: resolvedModel,
@@ -590,11 +652,13 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
               onDelta,
               { signal }
             );
+            this._lastUsage = streamed.usage || null;
             return {
               type: "native",
               format: "openai",
               message: streamed.message,
               finishReason: streamed.finishReason,
+              usage: this._lastUsage || null,
             };
           } catch (err) {
             lastErr = err;
@@ -621,13 +685,15 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
       let lastErr = null;
       for (const url of chatUrls) {
         try {
-          const text = await postJsonStream(
+          const streamed = await postJsonStream(
             url,
             { Authorization: `Bearer ${apiKey}` },
             openaiBody,
             onDelta,
             { signal }
           );
+          this._lastUsage = streamed?.usage || null;
+          const text = String(streamed?.text || "");
           if (text) return text;
         } catch (err) {
           lastErr = err;
@@ -645,6 +711,7 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
       });
     },
     async complete({ systemPrompt, prompt, messages, tools, signal }) {
+      this._lastUsage = null;
       const useNative = Array.isArray(messages) && Array.isArray(tools);
       const chatUrls = buildSeedChatUrls(resolvedBase);
       const openaiBody = useNative
@@ -667,9 +734,18 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
       for (const url of chatUrls) {
         try {
           const data = await postJson(url, { Authorization: `Bearer ${apiKey}` }, openaiBody, { signal });
+          this._lastUsage = normalizeUsage(data?.usage);
           if (useNative) {
             const msg = data?.choices?.[0]?.message;
-            if (msg) return { type: "native", format: "openai", message: msg, finishReason: data?.choices?.[0]?.finish_reason };
+            if (msg) {
+              return {
+                type: "native",
+                format: "openai",
+                message: msg,
+                finishReason: data?.choices?.[0]?.finish_reason,
+                usage: this._lastUsage || null,
+              };
+            }
           }
           const text = data?.choices?.[0]?.message?.content;
           if (text) return text;
@@ -705,6 +781,7 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
       for (const headers of anthHeaders) {
         try {
           const data = await postJson(anthropicUrl, headers, anthropicBody, { signal });
+          this._lastUsage = normalizeUsage(data?.usage);
           const text = extractAnthropicText(data);
           if (text) return text;
         } catch (err) {
@@ -747,7 +824,12 @@ function createCodexCliProvider(customModel = null) {
     kind: "codex-cli-session",
     model,
     supportsNativeTools: false,
+    _lastUsage: null,
+    getLastUsage() {
+      return this._lastUsage || null;
+    },
     async complete({ systemPrompt, prompt, signal }) {
+      this._lastUsage = null;
       const tmpFile = path.join(
         os.tmpdir(),
         `piecode-last-message-${process.pid}-${Date.now()}-${Math.random().toString(36).slice(2)}.txt`
@@ -804,7 +886,12 @@ function createCodexTokenProvider({ configuredModel, configuredBaseUrl, codexAut
     kind: "codex-auth-token",
     model: configuredModel || codexAuth.model,
     supportsNativeTools: true,
+    _lastUsage: null,
+    getLastUsage() {
+      return this._lastUsage || null;
+    },
     async complete({ systemPrompt, prompt, signal }) {
+      this._lastUsage = null;
       const base = (
         configuredBaseUrl ||
         process.env.OPENAI_BASE_URL ||
@@ -823,6 +910,7 @@ function createCodexTokenProvider({ configuredModel, configuredBaseUrl, codexAut
           },
           { signal }
         );
+        this._lastUsage = normalizeUsage(data?.usage);
 
         const text = extractResponsesText(data);
         if (!text) throw new Error("Codex auth response did not contain text output.");
@@ -847,6 +935,7 @@ function createCodexTokenProvider({ configuredModel, configuredBaseUrl, codexAut
             },
             { signal }
           );
+          this._lastUsage = normalizeUsage(data?.usage);
           const text = data?.choices?.[0]?.message?.content;
           if (!text) throw new Error("Codex token fallback did not return chat message content.");
           return text;
@@ -865,7 +954,12 @@ function createAnthropicProvider({ apiKey, model }) {
     kind: "anthropic",
     model,
     supportsNativeTools: true,
+    _lastUsage: null,
+    getLastUsage() {
+      return this._lastUsage || null;
+    },
     async complete({ systemPrompt, prompt, messages, tools, signal }) {
+      this._lastUsage = null;
       const useNative = Array.isArray(messages) && Array.isArray(tools);
       const body = useNative
         ? {
@@ -890,12 +984,14 @@ function createAnthropicProvider({ apiKey, model }) {
         body,
         { signal }
       );
+      this._lastUsage = normalizeUsage(data?.usage);
       if (useNative) {
         return {
           type: "native",
           format: "anthropic",
           content: Array.isArray(data?.content) ? data.content : [],
           stopReason: data?.stop_reason || "",
+          usage: this._lastUsage || null,
         };
       }
       const text = data?.content?.find((c) => c?.type === "text")?.text;

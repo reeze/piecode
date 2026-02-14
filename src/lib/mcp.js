@@ -7,6 +7,9 @@ const DEFAULT_REQUEST_TIMEOUT_MS = 30000;
 const DEFAULT_INIT_TIMEOUT_MS = 15000;
 const DEFAULT_PROTOCOL_VERSION = "2024-11-05";
 const CLIENT_INFO = { name: "piecode", version: "0.1.0" };
+const STDIO_PROTOCOL_CONTENT_LENGTH = "content-length";
+const STDIO_PROTOCOL_LINE = "line";
+const STDIO_PROTOCOL_AUTO = "auto";
 
 function isRecord(value) {
   return Boolean(value) && typeof value === "object" && !Array.isArray(value);
@@ -60,6 +63,31 @@ function toStringMap(value) {
   return out;
 }
 
+function normalizeStdioProtocol(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw || raw === STDIO_PROTOCOL_AUTO) return STDIO_PROTOCOL_AUTO;
+  if (
+    raw === STDIO_PROTOCOL_CONTENT_LENGTH ||
+    raw === "content_length" ||
+    raw === "framed" ||
+    raw === "jsonrpc" ||
+    raw === "stdio"
+  ) {
+    return STDIO_PROTOCOL_CONTENT_LENGTH;
+  }
+  if (
+    raw === STDIO_PROTOCOL_LINE ||
+    raw === "line-json" ||
+    raw === "json-line" ||
+    raw === "jsonl" ||
+    raw === "ndjson" ||
+    raw === "jsonrpc-line"
+  ) {
+    return STDIO_PROTOCOL_LINE;
+  }
+  return STDIO_PROTOCOL_AUTO;
+}
+
 function normalizeServerConfig(name, raw, workspaceDir) {
   if (!isRecord(raw)) return null;
   if (raw.disabled === true) return null;
@@ -69,12 +97,16 @@ function normalizeServerConfig(name, raw, workspaceDir) {
   const env = toStringMap(raw.env);
   const cwdRaw = String(raw.cwd || "").trim();
   const cwd = cwdRaw ? (path.isAbsolute(cwdRaw) ? cwdRaw : path.resolve(workspaceDir, cwdRaw)) : workspaceDir;
+  const stdioProtocol = normalizeStdioProtocol(
+    raw.stdioProtocol || raw.stdio_protocol || raw.transport || raw.protocol
+  );
   return {
     name,
     command,
     args,
     env,
     cwd,
+    stdioProtocol,
   };
 }
 
@@ -192,13 +224,18 @@ export async function mergeCommonMcpServers(
 }
 
 class JsonRpcStdioPeer {
-  constructor(child, { serverName = "mcp", onLog = null } = {}) {
+  constructor(
+    child,
+    { serverName = "mcp", onLog = null, stdioProtocol = STDIO_PROTOCOL_CONTENT_LENGTH } = {}
+  ) {
     this.child = child;
     this.serverName = String(serverName || "mcp");
     this.onLog = typeof onLog === "function" ? onLog : null;
+    this.stdioProtocol = normalizeStdioProtocol(stdioProtocol || STDIO_PROTOCOL_CONTENT_LENGTH);
     this.pending = new Map();
     this.nextId = 1;
     this.buffer = Buffer.alloc(0);
+    this.lineBuffer = "";
     this.closed = false;
     this.onNotification = null;
 
@@ -210,6 +247,13 @@ class JsonRpcStdioPeer {
         const text = String(chunk || "").trim();
         if (!text || !this.onLog) return;
         this.onLog(`[mcp:${this.serverName}] ${text}`);
+        if (
+          this.stdioProtocol === STDIO_PROTOCOL_CONTENT_LENGTH &&
+          /invalid json/i.test(text) &&
+          /content-length/i.test(text)
+        ) {
+          this.rejectAll(new Error("MCP stdio protocol mismatch: server rejected Content-Length framing"));
+        }
       });
     }
     this.child?.on("error", (err) => {
@@ -243,6 +287,11 @@ class JsonRpcStdioPeer {
 
   handleStdout(chunk) {
     if (!chunk || this.closed) return;
+    if (this.stdioProtocol === STDIO_PROTOCOL_LINE) {
+      this.lineBuffer += Buffer.from(chunk).toString("utf8");
+      this.drainLines();
+      return;
+    }
     this.buffer = Buffer.concat([this.buffer, Buffer.from(chunk)]);
     this.drainBuffer();
   }
@@ -282,6 +331,17 @@ class JsonRpcStdioPeer {
     }
   }
 
+  drainLines() {
+    while (true) {
+      const idx = this.lineBuffer.indexOf("\n");
+      if (idx < 0) return;
+      const line = this.lineBuffer.slice(0, idx).replace(/\r$/, "").trim();
+      this.lineBuffer = this.lineBuffer.slice(idx + 1);
+      if (!line) continue;
+      this.handleMessage(line);
+    }
+  }
+
   handleMessage(payload) {
     let msg = null;
     try {
@@ -314,6 +374,10 @@ class JsonRpcStdioPeer {
   writeMessage(message) {
     if (this.closed) throw new Error(`MCP server "${this.serverName}" is not available`);
     const payload = JSON.stringify(message);
+    if (this.stdioProtocol === STDIO_PROTOCOL_LINE) {
+      this.child.stdin.write(`${payload}\n`, "utf8");
+      return;
+    }
     const bytes = Buffer.byteLength(payload, "utf8");
     const framed = `Content-Length: ${bytes}\r\n\r\n${payload}`;
     this.child.stdin.write(framed, "utf8");
@@ -361,6 +425,7 @@ class McpServerClient {
     this.initPromise = null;
     this.serverInfo = null;
     this.capabilities = {};
+    this.activeStdioProtocol = null;
   }
 
   async ensureReady() {
@@ -375,8 +440,14 @@ class McpServerClient {
     }
   }
 
-  async start() {
-    if (this.ready) return;
+  getProtocolAttempts() {
+    const configured = normalizeStdioProtocol(this.config?.stdioProtocol || STDIO_PROTOCOL_AUTO);
+    if (configured === STDIO_PROTOCOL_CONTENT_LENGTH) return [STDIO_PROTOCOL_CONTENT_LENGTH];
+    if (configured === STDIO_PROTOCOL_LINE) return [STDIO_PROTOCOL_LINE];
+    return [STDIO_PROTOCOL_CONTENT_LENGTH, STDIO_PROTOCOL_LINE];
+  }
+
+  createProcessAndPeer(stdioProtocol) {
     const child = spawn(this.config.command, this.config.args, {
       cwd: this.config.cwd,
       env: {
@@ -385,26 +456,89 @@ class McpServerClient {
       },
       stdio: ["pipe", "pipe", "pipe"],
     });
-    this.process = child;
-    this.peer = new JsonRpcStdioPeer(child, {
+    const peer = new JsonRpcStdioPeer(child, {
       serverName: this.config.name,
       onLog: this.onLog,
+      stdioProtocol,
     });
+    this.process = child;
+    this.peer = peer;
+    this.activeStdioProtocol = stdioProtocol;
+    return { child, peer };
+  }
 
-    const initializeResult = await this.peer.request(
-      "initialize",
-      {
-        protocolVersion: DEFAULT_PROTOCOL_VERSION,
-        capabilities: {},
-        clientInfo: CLIENT_INFO,
-      },
-      { timeoutMs: DEFAULT_INIT_TIMEOUT_MS }
-    );
+  async closeActiveProcess() {
+    try {
+      this.peer?.close();
+    } catch {
+      // no-op
+    }
+    const proc = this.process;
+    this.peer = null;
+    this.process = null;
+    this.activeStdioProtocol = null;
+    if (!proc) return;
+    await new Promise((resolve) => {
+      let settled = false;
+      const timer = setTimeout(() => {
+        done();
+      }, 1000);
+      if (typeof timer.unref === "function") timer.unref();
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve();
+      };
+      proc.once("close", done);
+      proc.once("exit", done);
+      try {
+        proc.kill();
+      } catch {
+        done();
+      }
+    });
+  }
 
-    this.serverInfo = isRecord(initializeResult?.serverInfo) ? initializeResult.serverInfo : null;
-    this.capabilities = isRecord(initializeResult?.capabilities) ? initializeResult.capabilities : {};
-    this.peer.notify("notifications/initialized", {});
-    this.ready = true;
+  async start() {
+    if (this.ready) return;
+    const attempts = this.getProtocolAttempts();
+    let lastError = null;
+
+    for (let index = 0; index < attempts.length; index += 1) {
+      const stdioProtocol = attempts[index];
+      try {
+        const { peer } = this.createProcessAndPeer(stdioProtocol);
+        const initializeResult = await peer.request(
+          "initialize",
+          {
+            protocolVersion: DEFAULT_PROTOCOL_VERSION,
+            capabilities: {},
+            clientInfo: CLIENT_INFO,
+          },
+          { timeoutMs: DEFAULT_INIT_TIMEOUT_MS }
+        );
+
+        this.serverInfo = isRecord(initializeResult?.serverInfo) ? initializeResult.serverInfo : null;
+        this.capabilities = isRecord(initializeResult?.capabilities) ? initializeResult.capabilities : {};
+        this.peer.notify("notifications/initialized", {});
+        this.ready = true;
+        if (attempts.length > 1 && index > 0 && typeof this.onLog === "function") {
+          this.onLog(`[mcp:${this.config.name}] using stdio protocol: ${stdioProtocol}`);
+        }
+        return;
+      } catch (err) {
+        lastError = err || new Error("MCP initialization failed");
+        if (attempts.length > 1 && index < attempts.length - 1 && typeof this.onLog === "function") {
+          this.onLog(
+            `[mcp:${this.config.name}] protocol ${stdioProtocol} failed (${String(lastError?.message || "error")}); retrying`
+          );
+        }
+        await this.closeActiveProcess();
+      }
+    }
+
+    throw lastError || new Error(`MCP server "${this.config.name}" failed to initialize`);
   }
 
   async request(method, params = {}, options = {}) {
@@ -445,20 +579,7 @@ class McpServerClient {
   async close() {
     this.ready = false;
     this.initPromise = null;
-    try {
-      this.peer?.close();
-    } catch {
-      // no-op
-    }
-    const proc = this.process;
-    this.peer = null;
-    this.process = null;
-    if (!proc) return;
-    try {
-      proc.kill();
-    } catch {
-      // no-op
-    }
+    await this.closeActiveProcess();
   }
 }
 

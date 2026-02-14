@@ -1002,6 +1002,7 @@ export class SimpleTui {
       const raw = String(line.slice(22) || "");
       let rendered = raw;
       rendered = rendered.replace(" Pie Code ", color(" Pie Code ", "1;30;42"));
+      rendered = rendered.replace("let's cook", color("let's cook", "2;37"));
       rendered = rendered.replace("simple like pie", color("simple like pie", "2;37"));
       return padAll([rendered]);
     }

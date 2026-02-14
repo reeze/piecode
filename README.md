@@ -135,6 +135,13 @@ node src/cli.js --prompt "inspect this repo and suggest next steps"
 - `/plan on|off` toggle plan mode (generate plans, allow safe read-only tools, no file changes)
 - `/approve on|off` toggle shell auto approval
 - `/model` show active provider/model
+- `/mcp` show MCP status/usage
+- `/mcp list` list active MCP servers
+- `/mcp show <name>` show server config
+- `/mcp add <name> <command> [args...]` add/update local MCP server
+- `/mcp remove <name>` remove local MCP server (or mask imported server)
+- `/mcp reload` reload MCP settings from disk
+- `/mcp import on|off` toggle shared MCP config import
 - `/skills` show active skills
 - `/skills list` list discovered skills
 - `/skills use <name>` enable a skill
@@ -154,6 +161,7 @@ You can also mention `$skill-name` in a prompt to auto-enable that skill for the
 - Local `~/.piecode/settings.json` MCP entries override imported server entries with the same name.
 - Set `PIECODE_MCP_IMPORT=0` to disable shared MCP import.
 - Set `PIECODE_MCP_CONFIG_PATHS` for extra JSON config files (comma-separated).
+- Stdio protocol is auto-detected per server (tries `content-length` then `line`); you can force with `stdioProtocol: "content-length"` or `stdioProtocol: "line"`.
 - MCP helper tools available to the model when configured:
   - `list_mcp_servers`
   - `list_mcp_tools`

@@ -43,7 +43,7 @@ describe("provider selection", () => {
       const chunks = [
         'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"src/"}}]}}]}\n',
         'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"cli.js\\"}"}}]}}]}\n',
-        'data: {"choices":[{"finish_reason":"tool_calls"}]}\n',
+        'data: {"choices":[{"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":123,"completion_tokens":17,"total_tokens":140}}\n',
         "data: [DONE]\n",
       ];
       const stream = new ReadableStream({
@@ -90,7 +90,53 @@ describe("provider selection", () => {
       expect(response?.finishReason).toBe("tool_calls");
       expect(response?.message?.tool_calls?.[0]?.function?.name).toBe("read_file");
       expect(response?.message?.tool_calls?.[0]?.function?.arguments).toBe('{"path":"src/cli.js"}');
+      expect(response?.usage).toEqual({
+        input_tokens: 123,
+        output_tokens: 17,
+        total_tokens: 140,
+      });
+      expect(provider.getLastUsage()).toEqual({
+        input_tokens: 123,
+        output_tokens: 17,
+        total_tokens: 140,
+      });
       expect(deltas.join("")).toContain('"path":"src/cli.js"');
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  test("openrouter complete stores normalized usage metadata", async () => {
+    const originalFetch = global.fetch;
+    global.fetch = async () =>
+      new Response(
+        JSON.stringify({
+          choices: [{ message: { role: "assistant", content: "done" }, finish_reason: "stop" }],
+          usage: { prompt_tokens: 21, completion_tokens: 9, total_tokens: 30 },
+        }),
+        {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        }
+      );
+
+    try {
+      const provider = getProvider({
+        provider: "openrouter",
+        apiKey: "or-test-key",
+        model: "anthropic/claude-sonnet-4.5",
+        baseUrl: "https://openrouter.ai/api/v1",
+      });
+      const text = await provider.complete({
+        systemPrompt: "sys",
+        prompt: "say done",
+      });
+      expect(text).toBe("done");
+      expect(provider.getLastUsage()).toEqual({
+        input_tokens: 21,
+        output_tokens: 9,
+        total_tokens: 30,
+      });
     } finally {
       global.fetch = originalFetch;
     }

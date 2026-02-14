@@ -19,18 +19,12 @@ export class Agent {
     this.autoApproveRef = autoApproveRef;
     this.askApproval = askApproval;
     this.onEvent = onEvent;
+    this.onTodoWrite = onTodoWrite;
     this.activeSkillsRef = activeSkillsRef || { value: [] };
     this.projectInstructionsRef = projectInstructionsRef || { value: null };
     this.mcpHub = mcpHub && typeof mcpHub.hasServers === "function" ? mcpHub : null;
     this.history = [];
-    this.tools = createToolset({
-      workspaceDir,
-      autoApproveRef,
-      askApproval,
-      onToolStart: (tool, input) => this.onEvent?.({ type: "tool_start", tool, input }),
-      onTodoWrite,
-      mcpHub: this.mcpHub,
-    });
+    this.rebuildToolset();
     this.enablePlanner = process.env.PIECODE_ENABLE_PLANNER === "1";
     this.taskPlanner = this.enablePlanner ? new TaskPlanner(this) : null;
     this.planFirstEnabled = process.env.PIECODE_PLAN_FIRST === "1";
@@ -43,6 +37,22 @@ export class Agent {
       Number.parseInt(process.env.PIECODE_ITERATION_CHECKPOINT || "20", 10) || 20
     );
     this.activeAbortController = null;
+  }
+
+  rebuildToolset() {
+    this.tools = createToolset({
+      workspaceDir: this.workspaceDir,
+      autoApproveRef: this.autoApproveRef,
+      askApproval: this.askApproval,
+      onToolStart: (tool, input) => this.onEvent?.({ type: "tool_start", tool, input }),
+      onTodoWrite: this.onTodoWrite,
+      mcpHub: this.mcpHub,
+    });
+  }
+
+  setMcpHub(mcpHub = null) {
+    this.mcpHub = mcpHub && typeof mcpHub.hasServers === "function" ? mcpHub : null;
+    this.rebuildToolset();
   }
 
   clearHistory() {
@@ -63,6 +73,43 @@ export class Agent {
       err.code = "TASK_ABORTED";
       throw err;
     }
+  }
+
+  normalizeUsageSnapshot(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const toInt = (v) => {
+      const n = Number(v);
+      return Number.isFinite(n) ? Math.max(0, Math.round(n)) : null;
+    };
+    const input = toInt(raw.input_tokens ?? raw.prompt_tokens);
+    const output = toInt(raw.output_tokens ?? raw.completion_tokens);
+    const total = toInt(raw.total_tokens);
+    const usage = {};
+    if (input != null) usage.input_tokens = input;
+    if (output != null) usage.output_tokens = output;
+    if (total != null) usage.total_tokens = total;
+    if (usage.total_tokens == null && usage.input_tokens != null && usage.output_tokens != null) {
+      usage.total_tokens = usage.input_tokens + usage.output_tokens;
+    }
+    return Object.keys(usage).length > 0 ? usage : null;
+  }
+
+  getProviderUsageSnapshot() {
+    try {
+      if (!this.provider || typeof this.provider.getLastUsage !== "function") return null;
+      return this.normalizeUsageSnapshot(this.provider.getLastUsage());
+    } catch {
+      return null;
+    }
+  }
+
+  emitLlmResponse(stage, payload) {
+    this.onEvent?.({
+      type: "llm_response",
+      stage,
+      payload: String(payload || ""),
+      usage: this.getProviderUsageSnapshot(),
+    });
   }
 
   async compactHistory({ preserveRecent = 12 } = {}) {
@@ -104,7 +151,7 @@ export class Agent {
       });
       const text = String(raw || "").trim();
       if (text) summary = text.slice(0, 4000);
-      this.onEvent?.({ type: "llm_response", stage: "planning", payload: String(raw || "") });
+      this.emitLlmResponse("planning", raw);
     } catch {
       // fall back to deterministic summary without failing user command
     }
@@ -386,7 +433,7 @@ export class Agent {
       prompt: finalizePrompt,
       signal,
     });
-    this.onEvent?.({ type: "llm_response", stage: "turn_finalize", payload: String(raw || "") });
+    this.emitLlmResponse("turn_finalize", raw);
     const parsed = parseModelAction(String(raw || ""));
     if (parsed?.type === "final" && parsed.message) return String(parsed.message);
     if (parsed?.type === "thought" && parsed.content) return String(parsed.content);
@@ -414,7 +461,7 @@ export class Agent {
         payload: `SYSTEM:\n${planSystemPrompt}\n\nUSER:\n${planPrompt}`,
       });
       const raw = await this.provider.complete({ systemPrompt: planSystemPrompt, prompt: planPrompt, signal });
-      this.onEvent?.({ type: "llm_response", stage: "planning", payload: String(raw || "") });
+      this.emitLlmResponse("planning", raw);
       const plan = this.parsePlan(raw);
       if (!plan) return null;
       this.onEvent?.({ type: "plan", plan });
@@ -452,7 +499,7 @@ export class Agent {
         payload: `SYSTEM:\n${replanSystemPrompt}\n\nUSER:\n${replanPrompt}`,
       });
       const raw = await this.provider.complete({ systemPrompt: replanSystemPrompt, prompt: replanPrompt, signal });
-      this.onEvent?.({ type: "llm_response", stage: "replanning", payload: String(raw || "") });
+      this.emitLlmResponse("replanning", raw);
       const plan = this.parsePlan(raw);
       if (!plan) return null;
       this.onEvent?.({ type: "replan", plan });
@@ -608,7 +655,7 @@ export class Agent {
                   })
                 : await this.provider.complete({ systemPrompt, messages, tools, signal });
             this.throwIfAborted(signal);
-            this.onEvent?.({ type: "llm_response", stage: "turn", payload: String(JSON.stringify(response) || "") });
+            this.emitLlmResponse("turn", JSON.stringify(response));
             action = parseNativeResponse(response, nativeFormat);
           } else {
             const prompt = formatHistory(this.history);
@@ -628,7 +675,7 @@ export class Agent {
                   })
                 : await this.provider.complete({ systemPrompt, prompt, signal });
             this.throwIfAborted(signal);
-            this.onEvent?.({ type: "llm_response", stage: "turn", payload: String(raw || "") });
+            this.emitLlmResponse("turn", raw);
             action = parseModelAction(raw);
           }
         }

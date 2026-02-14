@@ -26,7 +26,7 @@ import { SimpleTui } from "./lib/tui.js";
 import { Display } from "./lib/display.js";
 import { consumeMouseWheelDeltas, stripMouseInputNoise } from "./lib/mouse.js";
 import { TuiLineEditor } from "./lib/tuiLineEditor.js";
-import { McpHub, mergeCommonMcpServers } from "./lib/mcp.js";
+import { McpHub, mergeCommonMcpServers, resolveMcpServerConfigs } from "./lib/mcp.js";
 import { classifyShellCommand } from "./lib/tools.js";
 import { applyFileMentionSelection, getFileMentionSuggestions, isGitRelatedPath } from "./lib/fileMentions.js";
 
@@ -46,6 +46,13 @@ const SLASH_COMMANDS = [
   "/trace",
   "/debug llm",
   "/model",
+  "/mcp",
+  "/mcp list",
+  "/mcp show",
+  "/mcp add",
+  "/mcp remove",
+  "/mcp reload",
+  "/mcp import",
   "/skills",
   "/skills list",
   "/skills use",
@@ -55,6 +62,8 @@ const SLASH_COMMANDS = [
   "/skill-creator",
   "/workspace",
 ];
+
+const DEFAULT_CONTEXT_WINDOW = 128000;
 
 const MODEL_SUGGESTIONS = [
   "codex:gpt-5.3-codex",
@@ -118,12 +127,12 @@ function getSettingsFilePath() {
   return path.join(os.homedir(), ".piecode", "settings.json");
 }
 
-async function loadSettings(filePath, { workspaceDir = process.cwd() } = {}) {
+async function loadSettings(filePath) {
   try {
     const raw = await fs.readFile(filePath, "utf8");
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    return mergeCommonMcpServers(parsed, { workspaceDir });
+    return parsed;
   } catch {
     return {};
   }
@@ -241,6 +250,7 @@ function recordTaskEvent(taskTraceRef, evt) {
 
 function recordTaskLlm(taskTraceRef, entry) {
   if (!taskTraceRef?.current || !entry || typeof entry !== "object") return;
+  const usage = normalizeTokenUsage(entry.usage);
   taskTraceRef.current.llm.push({
     at: new Date().toISOString(),
     direction: String(entry.direction || ""),
@@ -250,6 +260,7 @@ function recordTaskLlm(taskTraceRef, entry) {
     endpoint: String(entry.endpoint || ""),
     chars: Number.isFinite(Number(entry.chars)) ? Number(entry.chars) : 0,
     durationMs: Number.isFinite(Number(entry.durationMs)) ? Number(entry.durationMs) : 0,
+    ...(usage ? { usage } : {}),
     payload: clipText(entry.payload, 32000),
   });
 }
@@ -284,6 +295,9 @@ async function finishTaskTrace(taskTraceRef, workspaceDir, { status = "done", er
           `model=${entry.model || "-"}`,
           `endpoint=${entry.endpoint || "-"}`,
           `chars=${entry.chars || 0}`,
+          entry?.usage?.input_tokens != null ? `in_tok=${entry.usage.input_tokens}` : "",
+          entry?.usage?.output_tokens != null ? `out_tok=${entry.usage.output_tokens}` : "",
+          entry?.usage?.total_tokens != null ? `total_tok=${entry.usage.total_tokens}` : "",
           entry.durationMs > 0 ? `duration=${entry.durationMs}ms` : "",
         ]
           .filter(Boolean)
@@ -488,6 +502,14 @@ Slash commands in interactive mode:
   /debug llm           Dump latest LLM request/response payloads
   /model               Show active provider/model
                        Tip: use /model codex:gpt-5.3-codex to force Codex provider
+  /mcp                 Show MCP status and usage
+  /mcp list            List active MCP servers
+  /mcp show <name>     Show one MCP server config
+  /mcp add <name> <command> [args...]
+                       Add/update local MCP server config
+  /mcp remove <name>   Remove local MCP server (or mask imported server)
+  /mcp reload          Reload MCP settings from disk
+  /mcp import on|off   Toggle shared MCP config import
   /skills              Show active skills
   /skills list         List discovered skills
   /skills use <name>   Enable a skill
@@ -589,18 +611,18 @@ function collectContentParts(value) {
   return out;
 }
 
-function summarizeResponsePayload(parsed) {
-  if (!parsed || typeof parsed !== "object") return [];
+function summarizeResponsePayload(parsed, fallbackUsage = null) {
+  const parsedObj = parsed && typeof parsed === "object" ? parsed : null;
   const lines = [];
   const finishReason =
-    parsed.stop_reason ||
-    parsed.finish_reason ||
-    parsed?.choices?.[0]?.finish_reason ||
-    parsed?.response?.stop_reason ||
+    parsedObj?.stop_reason ||
+    parsedObj?.finish_reason ||
+    parsedObj?.choices?.[0]?.finish_reason ||
+    parsedObj?.response?.stop_reason ||
     "";
   if (finishReason) lines.push(`- finish_reason: ${finishReason}`);
 
-  const usage = parsed.usage || parsed?.response?.usage || null;
+  const usage = parsedObj?.usage || parsedObj?.response?.usage || fallbackUsage || null;
   if (usage && typeof usage === "object") {
     const inTok = usage.input_tokens ?? usage.prompt_tokens ?? usage.tokens_in;
     const outTok = usage.output_tokens ?? usage.completion_tokens ?? usage.tokens_out;
@@ -610,7 +632,7 @@ function summarizeResponsePayload(parsed) {
     }
   }
 
-  const parts = collectContentParts(parsed).filter(Boolean);
+  const parts = collectContentParts(parsedObj).filter(Boolean);
   if (parts.length > 0) {
     const merged = parts.join("\n").trim();
     lines.push("- content:");
@@ -709,7 +731,7 @@ function renderLlmDebugEntry(entry, position, total) {
   }
   if (res) {
     const formattedRes = formatJsonMaybe(String(res.payload || ""));
-    const keySummary = summarizeResponsePayload(formattedRes.parsed);
+    const keySummary = summarizeResponsePayload(formattedRes.parsed, res.usage || null);
     lines.push(
       "",
       `Response: stage=${res.stage || "-"} provider=${res.provider || "-"} model=${res.model || "-"} endpoint=${res.endpoint || "-"}`
@@ -849,6 +871,21 @@ function estimateTokenCount(text) {
   if (!s) return 0;
   // Heuristic: average ~4 chars/token for mixed code + English prompts.
   return Math.max(1, Math.round(s.length / 4));
+}
+
+function normalizeTokenUsage(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const input = toPositiveInt(raw.input_tokens ?? raw.prompt_tokens ?? raw.tokens_in);
+  const output = toPositiveInt(raw.output_tokens ?? raw.completion_tokens ?? raw.tokens_out);
+  const total = toPositiveInt(raw.total_tokens ?? raw.tokens);
+  const usage = {};
+  if (input != null) usage.input_tokens = input;
+  if (output != null) usage.output_tokens = output;
+  if (total != null) usage.total_tokens = total;
+  if (usage.total_tokens == null && usage.input_tokens != null && usage.output_tokens != null) {
+    usage.total_tokens = usage.input_tokens + usage.output_tokens;
+  }
+  return Object.keys(usage).length > 0 ? usage : null;
 }
 
 function formatReadableDuration(ms) {
@@ -1076,9 +1113,18 @@ function formatCompactNumber(n) {
   return String(Math.round(value));
 }
 
+function toPositiveInt(value) {
+  const n = Number(value);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : null;
+}
+
+function normalizeModelKey(value) {
+  return String(value || "").trim().toLowerCase();
+}
+
 function inferContextWindow(modelName) {
-  const model = String(modelName || "").toLowerCase();
-  if (!model) return 128000;
+  const model = normalizeModelKey(modelName);
+  if (!model) return DEFAULT_CONTEXT_WINDOW;
   if (model.includes("gpt-5")) return 256000;
   if (model.includes("gpt-4.1")) return 128000;
   if (model.includes("gpt-4o")) return 128000;
@@ -1087,7 +1133,185 @@ function inferContextWindow(modelName) {
   if (model.includes("claude-3")) return 200000;
   if (model.includes("doubao-seed")) return 128000;
   if (model.includes("deepseek")) return 128000;
-  return 128000;
+  return DEFAULT_CONTEXT_WINDOW;
+}
+
+function extractContextWindowValue(input) {
+  const direct = toPositiveInt(input);
+  if (direct != null) return direct;
+  if (!input || typeof input !== "object") return null;
+  const keys = [
+    "contextWindow",
+    "context_window",
+    "contextLength",
+    "context_length",
+    "maxContextLength",
+    "max_context_length",
+    "maxInputTokens",
+    "max_input_tokens",
+    "inputTokenLimit",
+    "input_token_limit",
+  ];
+  for (const key of keys) {
+    const value = toPositiveInt(input?.[key]);
+    if (value != null) return value;
+  }
+  return null;
+}
+
+function registerContextWindow(targetMap, modelId, value) {
+  if (!(targetMap instanceof Map)) return;
+  const contextWindow = extractContextWindowValue(value);
+  if (contextWindow == null) return;
+  const raw = normalizeModelKey(modelId);
+  if (!raw) return;
+  const parsed = parseModelTarget(raw);
+  const bare = normalizeModelKey(parsed.model || raw);
+  targetMap.set(raw, contextWindow);
+  if (bare && bare !== raw) targetMap.set(bare, contextWindow);
+  if (parsed.provider && bare) {
+    targetMap.set(`${parsed.provider}:${bare}`, contextWindow);
+  }
+}
+
+function registerProviderContextWindow(targetMap, providerName, value) {
+  if (!(targetMap instanceof Map)) return;
+  const contextWindow = extractContextWindowValue(value);
+  if (contextWindow == null) return;
+  const provider = normalizeModelKey(providerName);
+  if (!provider) return;
+  targetMap.set(provider, contextWindow);
+}
+
+function registerContextWindowCandidates(targetMap, candidate, providerHint = "") {
+  if (!candidate || typeof candidate !== "object") return;
+  if (Array.isArray(candidate)) {
+    for (const item of candidate) {
+      if (!item || typeof item !== "object") continue;
+      const modelId = String(item.id || item.model || item.name || item.slug || "").trim();
+      if (!modelId) continue;
+      if (providerHint) {
+        registerContextWindow(targetMap, `${providerHint}:${modelId}`, item);
+      }
+      registerContextWindow(targetMap, modelId, item);
+    }
+    return;
+  }
+  for (const [modelId, value] of Object.entries(candidate)) {
+    if (providerHint) {
+      registerContextWindow(targetMap, `${providerHint}:${modelId}`, value);
+    }
+    registerContextWindow(targetMap, modelId, value);
+  }
+}
+
+function collectContextWindowHints(settings = {}) {
+  const byModel = new Map();
+  const byProvider = new Map();
+  const globalCandidates = [
+    settings?.contextWindowByModel,
+    settings?.contextWindows,
+    settings?.modelContextWindows,
+    settings?.models,
+  ];
+  for (const candidate of globalCandidates) {
+    registerContextWindowCandidates(byModel, candidate);
+  }
+  if (settings?.model && settings?.contextWindow != null) {
+    registerContextWindow(byModel, settings.model, settings.contextWindow);
+  }
+
+  const providers =
+    settings?.providers && typeof settings.providers === "object" && !Array.isArray(settings.providers)
+      ? settings.providers
+      : {};
+  for (const [providerName, providerSettings] of Object.entries(providers)) {
+    if (!providerSettings || typeof providerSettings !== "object") continue;
+    registerProviderContextWindow(byProvider, providerName, providerSettings.contextWindow);
+    registerProviderContextWindow(byProvider, providerName, providerSettings.context_length);
+    if (providerSettings.model && providerSettings.contextWindow != null) {
+      registerContextWindow(byModel, `${providerName}:${providerSettings.model}`, providerSettings.contextWindow);
+      registerContextWindow(byModel, providerSettings.model, providerSettings.contextWindow);
+    }
+    const providerCandidates = [
+      providerSettings.contextWindowByModel,
+      providerSettings.contextWindows,
+      providerSettings.modelContextWindows,
+      providerSettings.models,
+    ];
+    for (const candidate of providerCandidates) {
+      registerContextWindowCandidates(byModel, candidate, providerName);
+    }
+  }
+
+  return { byModel, byProvider };
+}
+
+function applyContextWindowMetadata(targetMap, contextByModel = {}, providerHint = "") {
+  if (!(targetMap instanceof Map) || !contextByModel || typeof contextByModel !== "object") return;
+  for (const [modelId, value] of Object.entries(contextByModel)) {
+    if (providerHint) {
+      registerContextWindow(targetMap, `${providerHint}:${modelId}`, value);
+    }
+    registerContextWindow(targetMap, modelId, value);
+  }
+}
+
+function resolveContextWindow({ modelName, providerName = "", settings = {}, dynamicByModel = null } = {}) {
+  const fallback = inferContextWindow(modelName);
+  const normalizedModel = normalizeModelKey(modelName);
+  if (!normalizedModel) return fallback;
+
+  const parsed = parseModelTarget(normalizedModel);
+  const bareModel = normalizeModelKey(parsed.model || normalizedModel);
+  const parsedProvider = normalizeModelKey(parsed.provider || "");
+  const hintedProvider = normalizeModelKey(providerName || "");
+  const candidates = [];
+  const pushCandidate = (value) => {
+    const key = normalizeModelKey(value);
+    if (!key || candidates.includes(key)) return;
+    candidates.push(key);
+  };
+
+  pushCandidate(normalizedModel);
+  pushCandidate(bareModel);
+  if (parsedProvider && bareModel) pushCandidate(`${parsedProvider}:${bareModel}`);
+  if (hintedProvider && bareModel) pushCandidate(`${hintedProvider}:${bareModel}`);
+  if (hintedProvider && normalizedModel && !normalizedModel.includes(":")) {
+    pushCandidate(`${hintedProvider}:${normalizedModel}`);
+  }
+
+  const lookupModelMap = (map) => {
+    if (!(map instanceof Map)) return null;
+    for (const key of candidates) {
+      const value = toPositiveInt(map.get(key));
+      if (value != null) return value;
+    }
+    return null;
+  };
+
+  const dynamicMap = dynamicByModel instanceof Map ? dynamicByModel : null;
+  const dynamicHit = lookupModelMap(dynamicMap);
+  if (dynamicHit != null) return dynamicHit;
+
+  const hints = collectContextWindowHints(settings);
+  const settingsHit = lookupModelMap(hints.byModel);
+  if (settingsHit != null) return settingsHit;
+
+  const providerCandidates = [];
+  const pushProvider = (value) => {
+    const key = normalizeModelKey(value);
+    if (!key || providerCandidates.includes(key)) return;
+    providerCandidates.push(key);
+  };
+  pushProvider(hintedProvider);
+  pushProvider(parsedProvider);
+  for (const key of providerCandidates) {
+    const value = toPositiveInt(hints.byProvider.get(key));
+    if (value != null) return value;
+  }
+
+  return fallback;
 }
 
 function isTaskAbortError(err) {
@@ -1351,7 +1575,7 @@ function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
   };
   const shortWorkspace = workspaceDir.length > 64 ? `...${workspaceDir.slice(-61)}` : workspaceDir;
   const logoLines = [
-    `[banner-title-inline] ${center(" Pie Code  simple like pie")}`,
+    `[banner-title-inline] ${center(" Pie Code  let's cook")}`,
     `[banner-meta] ${center(`model: ${formatProviderModel(provider)}`)}`,
     `[banner-meta] ${center(`workspace: ${shortWorkspace}`)}`,
     `[banner-hint] ${center("keys: CTRL+L logs | CTRL+O llm debug | CTRL+T todos")}`,
@@ -1361,7 +1585,7 @@ function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
   }
 }
 
-function createCompleter(getSkillIndex) {
+function createCompleter(getSkillIndex, getModelCatalog = null, getMcpServerNames = null) {
   return (line, callback) => {
     const input = String(line || "");
     const trimmed = input.trimStart();
@@ -1373,6 +1597,19 @@ function createCompleter(getSkillIndex) {
 
     const skillIndex = typeof getSkillIndex === "function" ? getSkillIndex() : getSkillIndex;
     const skillNames = [...skillIndex.keys()].sort((a, b) => a.localeCompare(b));
+    const modelCatalog =
+      typeof getModelCatalog === "function"
+        ? getModelCatalog()
+        : getModelCatalog;
+    const modelNames =
+      Array.isArray(modelCatalog) && modelCatalog.length > 0 ? modelCatalog : MODEL_SUGGESTIONS;
+    const mcpNamesRaw =
+      typeof getMcpServerNames === "function"
+        ? getMcpServerNames()
+        : getMcpServerNames;
+    const mcpNames = Array.isArray(mcpNamesRaw)
+      ? mcpNamesRaw.map((name) => String(name || "").trim()).filter(Boolean).sort((a, b) => a.localeCompare(b))
+      : [];
     const tryComplete = (candidates, fragment) => {
       const hits = candidates.filter((item) => item.startsWith(fragment));
       callback(null, [hits.length ? hits : candidates, fragment]);
@@ -1394,6 +1631,48 @@ function createCompleter(getSkillIndex) {
       const match = trimmed.match(/^\/use(?:\s+(.*))?$/i);
       const fragment = (match?.[1] || "").trim();
       tryComplete(skillNames, fragment);
+      return;
+    }
+    if (/^\/model(?:\s+.*)?$/i.test(trimmed)) {
+      const fragment = trimmed.replace(/^\/model\s*/i, "");
+      const candidates = ["/model", "/model list", ...modelNames];
+      if (!fragment) {
+        callback(null, [candidates, fragment]);
+      } else {
+        tryComplete(candidates, fragment);
+      }
+      return;
+    }
+    if (/^\/mcp\s+show(?:\s+.*)?$/i.test(trimmed)) {
+      const match = trimmed.match(/^\/mcp\s+show(?:\s+(.*))?$/i);
+      const fragment = (match?.[1] || "").trim();
+      tryComplete(mcpNames, fragment);
+      return;
+    }
+    if (/^\/mcp\s+(?:remove|rm)(?:\s+.*)?$/i.test(trimmed)) {
+      const match = trimmed.match(/^\/mcp\s+(?:remove|rm)(?:\s+(.*))?$/i);
+      const fragment = (match?.[1] || "").trim();
+      tryComplete(mcpNames, fragment);
+      return;
+    }
+    if (/^\/mcp\s+import(?:\s+.*)?$/i.test(trimmed)) {
+      const fragment = trimmed.replace(/^\/mcp\s+import\s*/i, "");
+      const candidates = ["/mcp import", "on", "off"];
+      if (!fragment) {
+        callback(null, [candidates, fragment]);
+      } else {
+        tryComplete(candidates, fragment);
+      }
+      return;
+    }
+    if (/^\/mcp(?:\s+.*)?$/i.test(trimmed)) {
+      const fragment = trimmed.replace(/^\/mcp\s*/i, "");
+      const candidates = ["/mcp", "/mcp list", "/mcp show", "/mcp add", "/mcp remove", "/mcp reload", "/mcp import"];
+      if (!fragment) {
+        callback(null, [candidates, fragment]);
+      } else {
+        tryComplete(candidates, fragment);
+      }
       return;
     }
 
@@ -1479,13 +1758,20 @@ function isMultilineShortcut(str, key = {}) {
   return false;
 }
 
-function getSuggestionsForInput(line, getSkillIndex, getModelCatalog = null) {
+function getSuggestionsForInput(line, getSkillIndex, getModelCatalog = null, getMcpServerNames = null) {
   const input = String(line || "");
   const trimmed = input.trimStart();
   if (!trimmed.startsWith("/")) return [];
 
   const skillIndex = typeof getSkillIndex === "function" ? getSkillIndex() : getSkillIndex;
   const skillNames = [...skillIndex.keys()].sort((a, b) => a.localeCompare(b));
+  const mcpNamesRaw =
+    typeof getMcpServerNames === "function"
+      ? getMcpServerNames()
+      : getMcpServerNames;
+  const mcpNames = Array.isArray(mcpNamesRaw)
+    ? mcpNamesRaw.map((name) => String(name || "").trim()).filter(Boolean).sort((a, b) => a.localeCompare(b))
+    : [];
 
   const filterByPrefix = (candidates, fragment) => {
     const hits = candidates.filter((item) => item.startsWith(fragment));
@@ -1517,6 +1803,28 @@ function getSuggestionsForInput(line, getSkillIndex, getModelCatalog = null) {
     const modelCandidates =
       Array.isArray(modelCatalog) && modelCatalog.length > 0 ? modelCatalog : MODEL_SUGGESTIONS;
     const candidates = ["/model", "/model list", ...modelCandidates];
+    if (!fragment) return candidates;
+    return filterByPrefix(candidates, fragment);
+  }
+  if (/^\/mcp\s+show(?:\s+.*)?$/i.test(trimmed)) {
+    const match = trimmed.match(/^\/mcp\s+show(?:\s+(.*))?$/i);
+    const fragment = (match?.[1] || "").trim();
+    return filterByPrefix(mcpNames, fragment);
+  }
+  if (/^\/mcp\s+(?:remove|rm)(?:\s+.*)?$/i.test(trimmed)) {
+    const match = trimmed.match(/^\/mcp\s+(?:remove|rm)(?:\s+(.*))?$/i);
+    const fragment = (match?.[1] || "").trim();
+    return filterByPrefix(mcpNames, fragment);
+  }
+  if (/^\/mcp\s+import(?:\s+.*)?$/i.test(trimmed)) {
+    const fragment = trimmed.replace(/^\/mcp\s+import\s*/i, "");
+    const candidates = ["/mcp import", "on", "off"];
+    if (!fragment) return candidates;
+    return filterByPrefix(candidates, fragment);
+  }
+  if (/^\/mcp(?:\s+.*)?$/i.test(trimmed)) {
+    const fragment = trimmed.replace(/^\/mcp\s*/i, "");
+    const candidates = ["/mcp", "/mcp list", "/mcp show", "/mcp add", "/mcp remove", "/mcp reload", "/mcp import"];
     if (!fragment) return candidates;
     return filterByPrefix(candidates, fragment);
   }
@@ -1687,7 +1995,13 @@ async function handleSlashCommand(input, ctx) {
     setStatusBar,
     planModeRef,
     settings,
+    settingsFile,
+    workspaceDir,
+    mcpHubRef,
+    refreshMcpHub,
     modelCatalogRef,
+    modelContextWindowsRef,
+    modelContextMetadataRef,
     llmLastRef,
     llmHistoryRef,
   } = ctx;
@@ -1698,13 +2012,95 @@ async function handleSlashCommand(input, ctx) {
   const lower = normalized.toLowerCase();
   const formatModelStatus = (provider, prefix = "current model") => {
     const modelLabel = formatProviderModel(provider);
-    const contextWindow = formatCompactNumber(inferContextWindow(provider?.model));
+    const contextWindow = formatCompactNumber(
+      resolveContextWindow({
+        modelName: provider?.model,
+        providerName: providerPrefix(provider?.kind),
+        settings,
+        dynamicByModel: modelContextWindowsRef?.value,
+      })
+    );
     return `${prefix}: ${modelLabel} | context window: ${contextWindow}`;
   };
   const formatPlanModeStatus = (prefix = "plan mode", enabled = planModeRef?.value) =>
-    enabled
-      ? `${prefix}: on | planning with safe read-only tools (no file changes)`
-      : `${prefix}: off | normal execution enabled`;
+    enabled ? `${prefix}: on` : `${prefix}: off`;
+  const mcpImportEnvEnabled = String(process.env.PIECODE_MCP_IMPORT || "1") !== "0";
+  const getActiveMcpHub = () =>
+    mcpHubRef?.value && typeof mcpHubRef.value.hasServers === "function" ? mcpHubRef.value : null;
+  const getLocalMcpKeys = () => [...getLocalMcpServerKeySet(settings)].sort((a, b) => a.localeCompare(b));
+  const getEffectiveMcpNames = () => {
+    const hub = getActiveMcpHub();
+    if (hub && hub.hasServers()) return hub.getServerNames();
+    return [];
+  };
+  const printMcpSummary = () => {
+    const localKeys = getLocalMcpKeys();
+    const effectiveNames = getEffectiveMcpNames();
+    const localSet = new Set(localKeys);
+    const importEnabled = getMcpImportEnabled(settings);
+    const importStatus = mcpImportEnvEnabled && importEnabled ? "on" : "off";
+    logLine(`mcp: ${effectiveNames.length} active server(s) | local=${localKeys.length} | import=${importStatus}`);
+    if (effectiveNames.length === 0) {
+      logLine("no mcp servers configured");
+    } else {
+      for (const name of effectiveNames) {
+        const source = localSet.has(name) ? "local" : "imported";
+        logLine(`- ${name} (${source})`);
+      }
+    }
+  };
+  const saveSettingsAndRefreshMcp = async (announce = true) => {
+    await saveSettings(settingsFile, settings);
+    if (typeof refreshMcpHub === "function") {
+      await refreshMcpHub({ announce });
+    }
+  };
+  const hasModelContextMetadata = (source) => {
+    const key = String(source || "").trim().toLowerCase();
+    if (!key) return false;
+    return modelContextMetadataRef?.value instanceof Set && modelContextMetadataRef.value.has(key);
+  };
+  const markModelContextMetadataLoaded = (source) => {
+    const key = String(source || "").trim().toLowerCase();
+    if (!key) return;
+    if (!(modelContextMetadataRef?.value instanceof Set)) {
+      if (modelContextMetadataRef) modelContextMetadataRef.value = new Set();
+      else return;
+    }
+    modelContextMetadataRef.value.add(key);
+  };
+  const loadOpenRouterContextMetadata = async ({ force = false, logErrors = false } = {}) => {
+    if (!force && hasModelContextMetadata("openrouter")) return null;
+    try {
+      const groups = await fetchOpenRouterModelGroups({ settings });
+      if (groups.contextByModel && typeof groups.contextByModel === "object") {
+        applyContextWindowMetadata(modelContextWindowsRef.value, groups.contextByModel, "openrouter");
+      }
+      markModelContextMetadataLoaded("openrouter");
+      return groups;
+    } catch (err) {
+      if (logErrors) {
+        logLine(`openrouter metadata unavailable: ${String(err?.message || err)}`);
+      }
+      return null;
+    }
+  };
+  const loadSeedContextMetadata = async ({ force = false, logErrors = false } = {}) => {
+    if (!force && hasModelContextMetadata("seed")) return null;
+    try {
+      const metadata = await fetchSeedModelMetadata({ settings });
+      if (metadata?.contextByModel && typeof metadata.contextByModel === "object") {
+        applyContextWindowMetadata(modelContextWindowsRef.value, metadata.contextByModel, "seed");
+      }
+      markModelContextMetadataLoaded("seed");
+      return metadata;
+    } catch (err) {
+      if (logErrors) {
+        logLine(`seed metadata unavailable: ${String(err?.message || err)}`);
+      }
+      return null;
+    }
+  };
 
   if (lower === "/exit" || lower === "/quit") return { done: true, handled: true };
   if (lower === "/help") {
@@ -1720,6 +2116,13 @@ async function handleSlashCommand(input, ctx) {
         "/trace on|off",
         "/debug llm",
         "/model",
+        "/mcp",
+        "/mcp list",
+        "/mcp show <name>",
+        "/mcp add <name> <command> [args...]",
+        "/mcp remove <name>",
+        "/mcp reload",
+        "/mcp import on|off",
         "/skills",
         "/skills list",
         "/skills use <name>",
@@ -1811,6 +2214,12 @@ async function handleSlashCommand(input, ctx) {
     return { done: false, handled: true };
   }
   if (lower === "/model") {
+    const providerName = providerPrefix(providerRef.value?.kind);
+    if (providerName === "seed") {
+      await loadSeedContextMetadata({ force: false, logErrors: false });
+    } else if (providerName === "openrouter") {
+      await loadOpenRouterContextMetadata({ force: false, logErrors: false });
+    }
     const p = providerRef.value;
     if (tui && typeof setStatusBar === "function") {
       setStatusBar(formatModelStatus(p, "current model"));
@@ -1827,27 +2236,49 @@ async function handleSlashCommand(input, ctx) {
       logLine(formatModelStatus(providerRef.value, "current model"));
     }
     let listed = false;
-    try {
-      const groups = await fetchOpenRouterModelGroups({ settings });
-      if (groups.popular.length > 0) {
+    let openRouterPopular = [];
+    let openRouterLatest = [];
+    const extraSettingsModels = [];
+
+    const groups = await loadOpenRouterContextMetadata({ force: true, logErrors: false });
+    if (groups) {
+      openRouterPopular = Array.isArray(groups.popular) ? groups.popular : [];
+      openRouterLatest = Array.isArray(groups.latest) ? groups.latest : [];
+      if (openRouterPopular.length > 0) {
         listed = true;
         logLine("popular (openrouter):");
-        for (const id of groups.popular) logLine(`- openrouter:${id}`);
+        for (const id of openRouterPopular) logLine(`- openrouter:${id}`);
       }
-      if (groups.latest.length > 0) {
+      if (openRouterLatest.length > 0) {
         listed = true;
         logLine("latest (openrouter):");
-        for (const id of groups.latest) logLine(`- openrouter:${id}`);
+        for (const id of openRouterLatest) logLine(`- openrouter:${id}`);
       }
-      modelCatalogRef.value = mergeModelCatalog(
-        MODEL_SUGGESTIONS,
-        groups.popular,
-        groups.latest,
-        collectModelsFromSettings(settings)
-      );
-    } catch {
-      // keep static fallback catalog
     }
+
+    const seedMetadata = await loadSeedContextMetadata({ force: true, logErrors: true });
+    if (Array.isArray(seedMetadata?.models) && seedMetadata.models.length > 0) {
+      listed = true;
+      logLine("available (seed):");
+      if (seedMetadata?.sourceUrl) {
+        logLine(`seed metadata source: ${seedMetadata.sourceUrl}`);
+      }
+      const preview = seedMetadata.models.slice(0, 20);
+      for (const id of preview) logLine(`- seed:${id}`);
+      if (seedMetadata.models.length > preview.length) {
+        logLine(`- ... ${seedMetadata.models.length - preview.length} more`);
+      }
+      for (const id of seedMetadata.models) {
+        extraSettingsModels.push(`seed:${id}`);
+      }
+    }
+
+    modelCatalogRef.value = mergeModelCatalog(
+      MODEL_SUGGESTIONS,
+      openRouterPopular,
+      openRouterLatest,
+      [...collectModelsFromSettings(settings), ...extraSettingsModels]
+    );
     if (!listed) {
       for (const modelId of modelCatalogRef.value) logLine(`- ${modelId}`);
     }
@@ -1861,6 +2292,23 @@ async function handleSlashCommand(input, ctx) {
     }
     try {
       const nextProvider = await setModel(targetModel);
+      const nextProviderName = providerPrefix(nextProvider?.kind);
+      if (nextProviderName === "seed") {
+        await loadSeedContextMetadata({ force: false, logErrors: false });
+      } else if (nextProviderName === "openrouter") {
+        await loadOpenRouterContextMetadata({ force: false, logErrors: false });
+      }
+      if (tui) {
+        tui.setContextUsage(
+          0,
+          resolveContextWindow({
+            modelName: nextProvider?.model,
+            providerName: providerPrefix(nextProvider?.kind),
+            settings,
+            dynamicByModel: modelContextWindowsRef?.value,
+          })
+        );
+      }
       if (tui && typeof setStatusBar === "function") {
         setStatusBar(formatModelStatus(nextProvider, "model switched"));
       } else {
@@ -1875,6 +2323,181 @@ async function handleSlashCommand(input, ctx) {
         logLine("hint: set OPENROUTER_API_KEY or add providers.openrouter.apiKey in ~/.piecode/settings.json");
       }
     }
+    return { done: false, handled: true };
+  }
+  if (lower === "/mcp") {
+    printMcpSummary();
+    logLine("usage: /mcp list | /mcp show <name> | /mcp add <name> <command> [args...]");
+    logLine("       /mcp remove <name> | /mcp reload | /mcp import on|off");
+    return { done: false, handled: true };
+  }
+  if (lower === "/mcp list") {
+    const effectiveNames = getEffectiveMcpNames();
+    const localSet = new Set(getLocalMcpKeys());
+    const hub = getActiveMcpHub();
+    if (effectiveNames.length === 0) {
+      if (localSet.size > 0) {
+        logLine(`no active mcp servers (local entries: ${[...localSet].join(", ")})`);
+      } else {
+        logLine("no mcp servers configured");
+      }
+      return { done: false, handled: true };
+    }
+    logLine("## MCP Servers");
+    for (const name of effectiveNames) {
+      let commandSummary = "";
+      try {
+        const config = hub ? hub.getConfig(name) : null;
+        if (config && config.command) {
+          const argsText = Array.isArray(config.args) && config.args.length > 0 ? ` ${config.args.join(" ")}` : "";
+          commandSummary = ` -> ${config.command}${argsText}`;
+        }
+      } catch {
+        // keep listing even if one config read fails
+      }
+      const source = localSet.has(name) ? "local" : "imported";
+      logLine(`- ${name} (${source})${commandSummary}`);
+    }
+    return { done: false, handled: true };
+  }
+  if (lower.startsWith("/mcp show ")) {
+    const name = normalized.slice("/mcp show ".length).trim();
+    if (!name) {
+      logLine("usage: /mcp show <name>");
+      return { done: false, handled: true };
+    }
+    const hub = getActiveMcpHub();
+    if (!hub || !hub.hasServers()) {
+      logLine("no mcp servers configured");
+      return { done: false, handled: true };
+    }
+    try {
+      const config = hub.getConfig(name);
+      const localSet = new Set(getLocalMcpKeys());
+      const source = localSet.has(name) ? "local" : "imported";
+      logLine(`mcp server: ${name} (${source})`);
+      logLine(`command: ${config.command || "-"}`);
+      const argsText = Array.isArray(config.args) && config.args.length > 0 ? config.args.join(" ") : "";
+      logLine(`args: ${argsText || "-"}`);
+      logLine(`stdio protocol: ${String(config.stdioProtocol || "auto")}`);
+      logLine(`cwd: ${config.cwd || workspaceDir}`);
+      const envKeys = isRecord(config.env) ? Object.keys(config.env).sort((a, b) => a.localeCompare(b)) : [];
+      logLine(`env keys: ${envKeys.length > 0 ? envKeys.join(", ") : "-"}`);
+    } catch (err) {
+      logLine(`unknown mcp server: ${name}`);
+      logLine(`details: ${String(err?.message || "not found")}`);
+    }
+    return { done: false, handled: true };
+  }
+  if (lower.startsWith("/mcp add ")) {
+    const payload = raw.replace(/^\/mcp\s+add\s+/i, "").trim();
+    const parsed = splitCommandArgs(payload);
+    if (parsed.error) {
+      logLine(`unable to parse command: ${parsed.error}`);
+      logLine('usage: /mcp add <name> <command> [args...]');
+      logLine('example: /mcp add filesystem npx -y @modelcontextprotocol/server-filesystem .');
+      return { done: false, handled: true };
+    }
+    const [name, command, ...args] = parsed.args;
+    if (!name || !command) {
+      logLine("usage: /mcp add <name> <command> [args...]");
+      return { done: false, handled: true };
+    }
+    const localServers = ensureLocalMcpServers(settings);
+    const existing = isRecord(localServers[name]) ? localServers[name] : {};
+    setLocalMcpServer(settings, name, {
+      ...existing,
+      command,
+      args,
+      disabled: false,
+    });
+    try {
+      await saveSettingsAndRefreshMcp(false);
+      logLine(`saved mcp server: ${name}`);
+      printMcpSummary();
+    } catch (err) {
+      logLine(`failed to save mcp config: ${String(err?.message || "unknown error")}`);
+    }
+    return { done: false, handled: true };
+  }
+  if (lower.startsWith("/mcp remove ") || lower.startsWith("/mcp rm ")) {
+    const name = lower.startsWith("/mcp remove ")
+      ? normalized.slice("/mcp remove ".length).trim()
+      : normalized.slice("/mcp rm ".length).trim();
+    if (!name) {
+      logLine("usage: /mcp remove <name>");
+      return { done: false, handled: true };
+    }
+    const localSet = new Set(getLocalMcpKeys());
+    const effectiveSet = new Set(getEffectiveMcpNames());
+    let action = "";
+    if (localSet.has(name)) {
+      removeLocalMcpServer(settings, name);
+      action = `removed local mcp server: ${name}`;
+    } else if (effectiveSet.has(name)) {
+      setLocalMcpServer(settings, name, { disabled: true });
+      action = `masked imported mcp server: ${name}`;
+    } else {
+      logLine(`mcp server not found: ${name}`);
+      return { done: false, handled: true };
+    }
+    try {
+      await saveSettingsAndRefreshMcp(false);
+      logLine(action);
+      printMcpSummary();
+    } catch (err) {
+      logLine(`failed to save mcp config: ${String(err?.message || "unknown error")}`);
+    }
+    return { done: false, handled: true };
+  }
+  if (lower === "/mcp reload") {
+    try {
+      const latest = await loadSettings(settingsFile);
+      applySettingsSnapshot(settings, latest);
+      if (typeof refreshMcpHub === "function") {
+        await refreshMcpHub({ announce: true });
+      }
+      logLine(`reloaded mcp settings from ${settingsFile}`);
+      printMcpSummary();
+    } catch (err) {
+      logLine(`unable to reload mcp settings: ${String(err?.message || "unknown error")}`);
+    }
+    return { done: false, handled: true };
+  }
+  if (lower === "/mcp import") {
+    const localEnabled = getMcpImportEnabled(settings);
+    const effectiveEnabled = localEnabled && mcpImportEnvEnabled;
+    logLine(`mcp import: ${effectiveEnabled ? "on" : "off"} (local=${localEnabled ? "on" : "off"})`);
+    if (!mcpImportEnvEnabled) {
+      logLine("env override: PIECODE_MCP_IMPORT=0");
+    }
+    logLine("usage: /mcp import on|off");
+    return { done: false, handled: true };
+  }
+  if (lower.startsWith("/mcp import ")) {
+    const mode = normalized.slice("/mcp import ".length).trim().toLowerCase();
+    if (mode !== "on" && mode !== "off") {
+      logLine("usage: /mcp import on|off");
+      return { done: false, handled: true };
+    }
+    const enabled = mode === "on";
+    setMcpImportEnabled(settings, enabled);
+    try {
+      await saveSettingsAndRefreshMcp(false);
+      if (enabled && !mcpImportEnvEnabled) {
+        logLine("mcp import local setting is on, but this session still has PIECODE_MCP_IMPORT=0");
+      }
+      logLine(`mcp import ${mode}`);
+      printMcpSummary();
+    } catch (err) {
+      logLine(`failed to save mcp config: ${String(err?.message || "unknown error")}`);
+    }
+    return { done: false, handled: true };
+  }
+  if (lower.startsWith("/mcp ")) {
+    logLine(`unknown mcp command: ${raw}`);
+    logLine("usage: /mcp list | /mcp show <name> | /mcp add <name> <command> [args...]");
+    logLine("       /mcp remove <name> | /mcp reload | /mcp import on|off");
     return { done: false, handled: true };
   }
   if (lower === "/skills") {
@@ -1958,6 +2581,321 @@ function getFilteredModelSuggestions(query, catalog = MODEL_SUGGESTIONS) {
   return [...starts, ...contains];
 }
 
+function isRecord(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function splitCommandArgs(input) {
+  const src = String(input || "").trim();
+  if (!src) return { args: [], error: "" };
+  const args = [];
+  let current = "";
+  let quote = "";
+  let escaped = false;
+  const pushCurrent = () => {
+    if (current.length === 0) return;
+    args.push(current);
+    current = "";
+  };
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    if (quote) {
+      if (escaped) {
+        current += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === quote) {
+        quote = "";
+        continue;
+      }
+      current += ch;
+      continue;
+    }
+    if (ch === "\"" || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\\") {
+      const next = src[i + 1];
+      if (next) {
+        current += next;
+        i += 1;
+      } else {
+        current += "\\";
+      }
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      pushCurrent();
+      continue;
+    }
+    current += ch;
+  }
+  if (quote) return { args, error: "unclosed quote in command" };
+  pushCurrent();
+  return { args, error: "" };
+}
+
+function applySettingsSnapshot(target, source) {
+  if (!isRecord(target)) return;
+  const next = isRecord(source) ? source : {};
+  for (const key of Object.keys(target)) delete target[key];
+  Object.assign(target, next);
+}
+
+function ensureLocalMcpServers(settings) {
+  const target = isRecord(settings) ? settings : {};
+  const direct = isRecord(target.mcpServers) ? target.mcpServers : {};
+  const nested = isRecord(target?.mcp?.servers) ? target.mcp.servers : {};
+  const merged = {
+    ...nested,
+    ...direct,
+  };
+  target.mcpServers = merged;
+  if (!isRecord(target.mcp)) target.mcp = {};
+  target.mcp.servers = merged;
+  return merged;
+}
+
+function setLocalMcpServer(settings, name, config) {
+  const key = String(name || "").trim();
+  if (!key) return false;
+  const servers = ensureLocalMcpServers(settings);
+  const nextConfig = isRecord(config) ? config : {};
+  servers[key] = nextConfig;
+  settings.mcpServers = servers;
+  if (!isRecord(settings.mcp)) settings.mcp = {};
+  settings.mcp.servers = servers;
+  return true;
+}
+
+function removeLocalMcpServer(settings, name) {
+  const key = String(name || "").trim();
+  if (!key) return false;
+  const servers = ensureLocalMcpServers(settings);
+  if (!Object.prototype.hasOwnProperty.call(servers, key)) return false;
+  delete servers[key];
+  settings.mcpServers = servers;
+  if (!isRecord(settings.mcp)) settings.mcp = {};
+  settings.mcp.servers = servers;
+  return true;
+}
+
+function getMcpImportEnabled(settings) {
+  const value = settings?.mcpImport?.enabled;
+  if (typeof value === "boolean") return value;
+  return true;
+}
+
+function setMcpImportEnabled(settings, enabled) {
+  const target = isRecord(settings) ? settings : {};
+  if (!isRecord(target.mcpImport)) target.mcpImport = {};
+  target.mcpImport.enabled = Boolean(enabled);
+}
+
+function getLocalMcpServerKeySet(settings) {
+  const direct = isRecord(settings?.mcpServers) ? settings.mcpServers : {};
+  const nested = isRecord(settings?.mcp?.servers) ? settings.mcp.servers : {};
+  const merged = {
+    ...nested,
+    ...direct,
+  };
+  const names = new Set();
+  for (const rawName of Object.keys(merged)) {
+    const name = String(rawName || "").trim();
+    if (name) names.add(name);
+  }
+  return names;
+}
+
+function getLocalMcpServerNameSet(settings, workspaceDir) {
+  const names = new Set();
+  const map = resolveMcpServerConfigs(settings, workspaceDir);
+  for (const name of map.keys()) names.add(name);
+  return names;
+}
+
+function buildSeedModelListUrls(endpoint) {
+  const base = String(endpoint || "").replace(/\/$/, "");
+  if (!base) return [];
+  const urls = new Set();
+  const add = (value) => {
+    const text = String(value || "").trim();
+    if (text) urls.add(text);
+  };
+
+  const chatPathRe = /\/chat\/completions$/i;
+  const versionedChatPathRe = /\/v\d+\/chat\/completions$/i;
+  if (chatPathRe.test(base)) {
+    add(base.replace(chatPathRe, "/models"));
+    add(base.replace(chatPathRe, "/model/list"));
+  }
+  if (versionedChatPathRe.test(base)) {
+    add(base.replace(versionedChatPathRe, "/v1/models"));
+    add(base.replace(versionedChatPathRe, "/v1/model/list"));
+  }
+
+  if (!/\/models$/i.test(base) && !/\/model\/list$/i.test(base)) {
+    add(`${base}/models`);
+    add(`${base}/model/list`);
+  }
+
+  try {
+    const u = new URL(base);
+    const pathname = String(u.pathname || "");
+    if (/\/api\/coding$/i.test(pathname)) {
+      add(`${u.origin}/api/coding/models`);
+      add(`${u.origin}/api/coding/model/list`);
+    }
+    add(`${u.origin}/api/v3/models`);
+    add(`${u.origin}/api/v3/model/list`);
+    add(`${u.origin}/api/v1/models`);
+    add(`${u.origin}/api/v1/model/list`);
+    add(`${u.origin}/v1/models`);
+    add(`${u.origin}/models`);
+  } catch {
+    // ignore invalid URL
+  }
+
+  return [...urls];
+}
+
+function extractModelRows(data) {
+  if (Array.isArray(data?.data)) return data.data;
+  if (Array.isArray(data?.models)) return data.models;
+  if (Array.isArray(data?.list)) return data.list;
+  if (Array.isArray(data?.result?.list)) return data.result.list;
+  if (Array.isArray(data?.result?.data)) return data.result.data;
+  if (Array.isArray(data?.result?.models)) return data.result.models;
+  if (Array.isArray(data?.ModelList)) return data.ModelList;
+  return [];
+}
+
+function seedAuthHeaderVariants(apiKey) {
+  const key = String(apiKey || "").trim();
+  if (!key) return [];
+  const base = {
+    "content-type": "application/json",
+    accept: "application/json",
+  };
+  return [
+    { ...base, Authorization: `Bearer ${key}` },
+    { ...base, "x-api-key": key },
+    { ...base, "X-API-Key": key },
+    { ...base, "api-key": key },
+  ];
+}
+
+function collectSeedProviderCandidates(settings = {}) {
+  const candidates = [];
+  const seen = new Set();
+  const addCandidate = (endpoint, apiKey) => {
+    const endpointText = String(endpoint || "").trim();
+    const apiKeyText = String(apiKey || "").trim();
+    if (!endpointText || !apiKeyText) return;
+    const key = `${endpointText}::${apiKeyText}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    candidates.push({ endpoint: endpointText, apiKey: apiKeyText });
+  };
+
+  const envApiKey = process.env.SEED_API_KEY || process.env.ARK_API_KEY || "";
+  const envEndpoint = process.env.SEED_BASE_URL || "";
+  const providers =
+    settings?.providers && typeof settings.providers === "object" && !Array.isArray(settings.providers)
+      ? settings.providers
+      : {};
+
+  for (const [providerName, providerSettings] of Object.entries(providers)) {
+    const key = String(providerName || "").trim().toLowerCase();
+    if (!key.startsWith("seed")) continue;
+    if (!providerSettings || typeof providerSettings !== "object") continue;
+    addCandidate(
+      providerSettings.endpoint || providerSettings.baseUrl || envEndpoint,
+      providerSettings.apiKey || envApiKey
+    );
+  }
+
+  if (String(settings?.provider || "").trim().toLowerCase().startsWith("seed")) {
+    addCandidate(settings?.endpoint || settings?.baseUrl || envEndpoint, settings?.apiKey || envApiKey);
+  }
+
+  addCandidate(envEndpoint || "https://ark.cn-beijing.volces.com/api/coding", envApiKey);
+  return candidates;
+}
+
+async function fetchSeedModelMetadata({ settings }) {
+  const providerCandidates = collectSeedProviderCandidates(settings);
+  if (providerCandidates.length === 0) {
+    throw new Error("Seed metadata lookup skipped: missing endpoint/apiKey configuration");
+  }
+
+  let lastErr = null;
+  for (const candidate of providerCandidates) {
+    const urls = buildSeedModelListUrls(candidate.endpoint);
+    for (const url of urls) {
+      const headerVariants = seedAuthHeaderVariants(candidate.apiKey);
+      for (const headers of headerVariants) {
+        try {
+          const res = await fetch(url, {
+            method: "GET",
+            headers,
+          });
+          if (!res.ok) {
+            const err = new Error(`Seed models request failed (${res.status}) at ${url}`);
+            err.status = res.status;
+            throw err;
+          }
+          const data = await res.json().catch(() => ({}));
+          const rows = extractModelRows(data);
+          const models = [];
+          const contextByModel = {};
+          for (const row of rows) {
+            const id = String(
+              row?.id ||
+                row?.model ||
+                row?.model_id ||
+                row?.modelId ||
+                row?.ModelId ||
+                row?.name ||
+                row?.slug ||
+                ""
+            ).trim();
+            if (!id) continue;
+            models.push(id);
+            const contextWindow = extractContextWindowValue(
+              row?.context_length ??
+                row?.context_window ??
+                row?.max_context_length ??
+                row?.maxContextLength ??
+                row
+            );
+            if (contextWindow != null) {
+              contextByModel[id] = contextWindow;
+              contextByModel[`seed:${id}`] = contextWindow;
+            }
+          }
+          if (models.length > 0) {
+            return { models, contextByModel, sourceUrl: url };
+          }
+          const err = new Error(`Seed models request returned no models at ${url}`);
+          err.status = 204;
+          throw err;
+        } catch (err) {
+          lastErr = err;
+        }
+      }
+    }
+  }
+
+  throw new Error(`Seed metadata lookup failed: ${lastErr?.message || "unknown error"}`);
+}
+
 async function fetchOpenRouterModelGroups({ settings }) {
   const providerSettings =
     settings?.providers && typeof settings.providers === "object"
@@ -1981,14 +2919,20 @@ async function fetchOpenRouterModelGroups({ settings }) {
   const data = await res.json().catch(() => ({}));
   const rows = Array.isArray(data?.data) ? data.data : [];
   const byId = new Map();
+  const contextByModel = {};
   for (const row of rows) {
     const id = String(row?.id || "").trim();
     if (!id) continue;
     byId.set(id, { id, created: Number(row?.created) || 0 });
+    const contextWindow = extractContextWindowValue(row?.context_length ?? row);
+    if (contextWindow != null) {
+      contextByModel[id] = contextWindow;
+      contextByModel[`openrouter:${id}`] = contextWindow;
+    }
   }
   const popular = OPENROUTER_ALLOWED_MODELS.filter((id) => byId.has(id)).slice(0, 10);
   const latest = [];
-  return { popular, latest };
+  return { popular, latest, contextByModel };
 }
 
 function mergeModelCatalog(baseCatalog, popular, latest, localSettingsModels = []) {
@@ -2093,12 +3037,14 @@ async function main() {
 
   const settingsFile = getSettingsFilePath();
   const workspaceDir = process.cwd();
-  const settings = await loadSettings(settingsFile, { workspaceDir });
+  const settings = await loadSettings(settingsFile);
   const planModeRef = { value: process.env.PIECODE_PLAN_MODE === "1" };
   const settingsModelSuggestions = collectModelsFromSettings(settings);
   const modelCatalogRef = {
     value: mergeModelCatalog(MODEL_SUGGESTIONS, [], [], settingsModelSuggestions),
   };
+  const modelContextWindowsRef = { value: new Map() };
+  const modelContextMetadataRef = { value: new Set() };
   const skillRoots = resolveSkillRoots(settings);
   let skillIndex = await discoverSkills(skillRoots);
   const refreshSkillIndex = async () => {
@@ -2146,6 +3092,7 @@ async function main() {
   const traceRef = { value: process.env.PIECODE_TRACE === "1" };
   const verboseToolLogs = process.env.PIECODE_VERBOSE_TOOL_LOGS === "1";
   const llmStreamRef = { value: { turn: "", planning: "", replanning: "" } };
+  const llmPendingRequestTokensRef = { value: new Map() };
   const traceStateRef = { value: { turnId: 0, turnStartedAt: 0, llmStageStart: {}, toolStartByName: {} } };
   const turnSummaryRef = {
     value: { active: false, tools: [], filesChanged: new Set(), beforeGitSet: null },
@@ -2162,6 +3109,15 @@ async function main() {
   const pendingCommandSubmitRef = { value: "" };
   const modelPickerRef = { active: false, query: "", options: [], index: 0 };
   const commandPickerRef = { active: false, mode: "command", options: [], index: 0 };
+  const mcpHubRef = { value: null };
+  const getMcpServerNamesForSuggestions = () => {
+    const names = new Set([...getLocalMcpServerKeySet(settings)]);
+    if (mcpHubRef.value && typeof mcpHubRef.value.hasServers === "function" && mcpHubRef.value.hasServers()) {
+      for (const name of mcpHubRef.value.getServerNames()) names.add(name);
+    }
+    for (const name of getLocalMcpServerNameSet(settings, workspaceDir)) names.add(name);
+    return [...names].sort((a, b) => a.localeCompare(b));
+  };
   const taskRunningRef = { value: false };
   const escAbortArmedRef = { value: false };
   const readlineOutput = useTui ? createMutedTtyOutput(stdout) : stdout;
@@ -2222,7 +3178,11 @@ async function main() {
       terminal: true,
       historySize: HISTORY_MAX,
       removeHistoryDuplicates: true,
-      completer: createCompleter(() => skillIndex),
+      completer: createCompleter(
+        () => skillIndex,
+        () => modelCatalogRef.value,
+        () => getMcpServerNamesForSuggestions()
+      ),
     });
     next.history = Array.isArray(history) ? [...history] : [];
     return next;
@@ -2279,6 +3239,46 @@ async function main() {
     stdout.on("resize", onResize);
     process.on("SIGWINCH", onResize);
   }
+
+  const resolveProviderContextLimit = (provider = providerRef.value) =>
+    resolveContextWindow({
+      modelName: provider?.model,
+      providerName: providerPrefix(provider?.kind),
+      settings,
+      dynamicByModel: modelContextWindowsRef.value,
+    });
+  const getPendingRequestTokenTotal = () => {
+    let total = 0;
+    for (const value of llmPendingRequestTokensRef.value.values()) {
+      const n = Number(value);
+      if (Number.isFinite(n) && n > 0) total += Math.round(n);
+    }
+    return total;
+  };
+  const addPendingRequestTokens = (stage, tokens) => {
+    const key = String(stage || "");
+    const amount = Math.max(0, Math.round(Number(tokens) || 0));
+    if (!key || amount <= 0) return;
+    const current = Number(llmPendingRequestTokensRef.value.get(key) || 0);
+    llmPendingRequestTokensRef.value.set(key, Math.max(0, current + amount));
+  };
+  const consumePendingRequestTokens = (stage) => {
+    const key = String(stage || "");
+    if (!key) return 0;
+    const current = Number(llmPendingRequestTokensRef.value.get(key) || 0);
+    llmPendingRequestTokensRef.value.delete(key);
+    return Number.isFinite(current) && current > 0 ? Math.round(current) : 0;
+  };
+  const clearPendingRequestTokens = () => {
+    llmPendingRequestTokensRef.value.clear();
+  };
+  const refreshTuiContextUsage = () => {
+    if (!tui) return;
+    const turnUsage = tui.getTurnTokenUsage();
+    const pending = getPendingRequestTokenTotal();
+    const used = Math.max(0, Math.round((turnUsage.sent || 0) + (turnUsage.received || 0) + pending));
+    tui.setContextUsage(used, resolveProviderContextLimit());
+  };
 
   const logLine = createLogger(tui, display, () => currentInputRef.value, (line) =>
     recordTaskLog(taskTraceRef, line)
@@ -2621,7 +3621,8 @@ async function main() {
               const commandOptions = getSuggestionsForInput(
                 currentLine,
                 () => skillIndex,
-                () => modelCatalogRef.value
+                () => modelCatalogRef.value,
+                () => getMcpServerNamesForSuggestions()
               ).slice(0, 8);
               if (commandOptions.length > 0) {
                 commandPickerRef.active = true;
@@ -2776,7 +3777,8 @@ async function main() {
       const suggestions = getSuggestionsForInput(
         currentLine,
         () => skillIndex,
-        () => modelCatalogRef.value
+        () => modelCatalogRef.value,
+        () => getMcpServerNamesForSuggestions()
       ).slice(0, 8);
       if (suggestions.length === 0) {
         if (display) display.clearSuggestions();
@@ -2901,7 +3903,15 @@ async function main() {
     );
     if (tui) {
       tui.onModelCall(formatProviderModel(nextProvider));
-      tui.setContextUsage(0, inferContextWindow(nextProvider?.model));
+      tui.setContextUsage(
+        0,
+        resolveContextWindow({
+          modelName: nextProvider?.model,
+          providerName: providerPrefix(nextProvider?.kind),
+          settings,
+          dynamicByModel: modelContextWindowsRef.value,
+        })
+      );
       tui.onThinkingDone();
     }
     return nextProvider;
@@ -2940,15 +3950,25 @@ async function main() {
     return ans === "y" || ans === "yes";
   };
 
-  const mcpHub = new McpHub({
+  const logMcpConfiguredServers = (hub) => {
+    if (!hub || typeof hub.hasServers !== "function" || !hub.hasServers()) {
+      logLine("[mcp] no configured servers");
+      return;
+    }
+    const names = hub.getServerNames();
+    logLine(`[mcp] configured servers: ${names.join(", ")}`);
+  };
+
+  const mergedMcpSettings = await mergeCommonMcpServers(settings, {
     workspaceDir,
-    settings,
     onLog: (line) => logLine(line),
   });
-  if (mcpHub.hasServers()) {
-    const names = mcpHub.getServerNames();
-    logLine(`[mcp] configured servers: ${names.join(", ")}`);
-  }
+  mcpHubRef.value = new McpHub({
+    workspaceDir,
+    settings: mergedMcpSettings,
+    onLog: (line) => logLine(line),
+  });
+  logMcpConfiguredServers(mcpHubRef.value);
 
   const agent = new Agent({
     provider: providerRef.value,
@@ -2957,7 +3977,7 @@ async function main() {
     askApproval,
     activeSkillsRef,
     projectInstructionsRef,
-    mcpHub,
+    mcpHub: mcpHubRef.value,
     onTodoWrite: (nextTodos) => {
       todosRef.value = normalizeTodos(nextTodos);
       todoAutoTrackRef.value = false;
@@ -3059,12 +4079,8 @@ async function main() {
           tui.setLiveThought("Analyzing request...");
         }
         const sentTokens = estimateTokenCount(evt.payload);
-        if (tui) {
-          const used = sentTokens;
-          const limit = inferContextWindow(evt.model || providerRef.value.model);
-          tui.setContextUsage(used, limit);
-          tui.addTokenUsage({ sent: sentTokens, received: 0 });
-        }
+        addPendingRequestTokens(evt.stage, sentTokens);
+        if (tui) refreshTuiContextUsage();
         logLine(`[thinking] request:${evt.stage} endpoint:${endpoint} ${summarizeForLog(evt.payload)}`);
       }
       if (evt.type === "llm_response_delta") {
@@ -3093,6 +4109,7 @@ async function main() {
       }
       if (evt.type === "llm_response") {
         recordTaskEvent(taskTraceRef, evt);
+        const normalizedUsage = normalizeTokenUsage(evt.usage);
         const responseProvider = providerPrefix(providerRef.value?.kind);
         const responseModel = String(providerRef.value?.model || "");
         const responseEndpoint = inferEndpointForProvider(providerOptionsRef.value, providerRef.value);
@@ -3105,6 +4122,7 @@ async function main() {
           provider: responseProvider,
           model: responseModel,
           endpoint: responseEndpoint,
+          usage: normalizedUsage,
           payload: String(evt.payload || ""),
         };
         const trackedResponse = trackLlmDebugEvent(llmHistoryRef, "response", llmLastRef.value.response);
@@ -3118,6 +4136,7 @@ async function main() {
           provider: responseProvider,
           model: responseModel,
           endpoint: responseEndpoint,
+          usage: normalizedUsage,
           durationMs: responseDurationMs,
           thinking: String(trackedResponse?.thinking || ""),
           payload: llmLastRef.value.response.payload,
@@ -3128,6 +4147,7 @@ async function main() {
           provider: responseProvider,
           model: responseModel,
           endpoint: responseEndpoint,
+          usage: normalizedUsage,
           chars: responseChars,
           durationMs: responseDurationMs,
           payload: evt.payload,
@@ -3148,8 +4168,21 @@ async function main() {
             tui.setLiveThought(preview);
           }
         }
-        const receivedTokens = estimateTokenCount(evt.payload);
-        if (tui) tui.addTokenUsage({ sent: 0, received: receivedTokens });
+        const pendingSent = consumePendingRequestTokens(evt.stage);
+        let sentTokens = normalizedUsage?.input_tokens ?? null;
+        let receivedTokens = normalizedUsage?.output_tokens ?? null;
+        if (sentTokens == null) sentTokens = pendingSent > 0 ? pendingSent : null;
+        if (receivedTokens == null && normalizedUsage?.total_tokens != null) {
+          const derivedSent = sentTokens != null ? sentTokens : pendingSent;
+          const total = normalizedUsage.total_tokens;
+          receivedTokens = Math.max(0, total - Math.max(0, derivedSent || 0));
+        }
+        if (sentTokens == null) sentTokens = 0;
+        if (receivedTokens == null) receivedTokens = estimateTokenCount(evt.payload);
+        if (tui) {
+          tui.addTokenUsage({ sent: sentTokens, received: receivedTokens });
+          refreshTuiContextUsage();
+        }
         logLine(`[thinking] response:${evt.stage} ${summarizeForLog(evt.payload)}`);
       }
       if (evt.type === "thinking_done") {
@@ -3227,10 +4260,36 @@ async function main() {
     },
   });
 
+  const refreshMcpHub = async ({ announce = true } = {}) => {
+    const merged = await mergeCommonMcpServers(settings, {
+      workspaceDir,
+      onLog: announce ? (line) => logLine(line) : null,
+    });
+    const nextHub = new McpHub({
+      workspaceDir,
+      settings: merged,
+      onLog: (line) => logLine(line),
+    });
+    const previousHub = mcpHubRef.value;
+    mcpHubRef.value = nextHub;
+    if (typeof agent.setMcpHub === "function") {
+      agent.setMcpHub(nextHub);
+    } else {
+      agent.mcpHub = nextHub;
+    }
+    if (announce) {
+      logMcpConfiguredServers(nextHub);
+    }
+    if (previousHub && previousHub !== nextHub) {
+      await previousHub.close();
+    }
+    return nextHub;
+  };
+
   if (args.prompt !== null) {
     try {
       startTaskTrace(taskTraceRef, { input: args.prompt, kind: "agent" });
-      const localInfo = maybeHandleLocalInfoTask(args.prompt, { logLine, tui, display, mcpHub });
+      const localInfo = maybeHandleLocalInfoTask(args.prompt, { logLine, tui, display, mcpHub: mcpHubRef.value });
       if (localInfo.handled) {
         const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done" });
         if (saved) console.log(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
@@ -3250,6 +4309,7 @@ async function main() {
       }
 
       try {
+        clearPendingRequestTokens();
         const result = await agent.runTurn(args.prompt, { planOnly: planModeRef.value });
         const output = typeof result === "string" ? result : JSON.stringify(result, null, 2);
         if (display) {
@@ -3266,9 +4326,12 @@ async function main() {
         });
         if (saved) console.error(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
         throw err;
+      } finally {
+        clearPendingRequestTokens();
+        if (tui) refreshTuiContextUsage();
       }
     } finally {
-      await mcpHub.close();
+      if (mcpHubRef.value) await mcpHubRef.value.close();
       await saveHistory(historyFile, rl.history);
       rl.close();
     }
@@ -3277,7 +4340,7 @@ async function main() {
 
   if (tui) {
     tui.start();
-    tui.setContextUsage(0, inferContextWindow(providerRef.value?.model));
+    tui.setContextUsage(0, resolveProviderContextLimit(providerRef.value));
     emitStartupLogo(tui, providerRef.value, workspaceDir, stdout.columns || 100);
     if (activeSkillsRef.value.length > 0) {
       tui.event(`skills: ${activeSkillsRef.value.map((s) => s.name).join(", ")}`);
@@ -3461,7 +4524,13 @@ async function main() {
       setStatusBar,
       planModeRef,
       settings,
+      settingsFile,
+      workspaceDir,
+      mcpHubRef,
+      refreshMcpHub,
       modelCatalogRef,
+      modelContextWindowsRef,
+      modelContextMetadataRef,
       todosRef,
       todoAutoTrackRef,
       llmLastRef,
@@ -3474,7 +4543,7 @@ async function main() {
       continue;
     }
 
-    const localTask = maybeHandleLocalInfoTask(finalInput, { logLine, tui, display, mcpHub });
+    const localTask = maybeHandleLocalInfoTask(finalInput, { logLine, tui, display, mcpHub: mcpHubRef.value });
     if (localTask.handled) {
       const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done" });
       if (saved) logLine(`[trace] session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
@@ -3486,6 +4555,7 @@ async function main() {
     await maybeAutoEnableSkills(finalInput, activeSkillsRef, skillIndex, logLine);
     taskRunningRef.value = true;
     try {
+      clearPendingRequestTokens();
       const turnResult = await runAgentTurn(
         agent,
         finalInput,
@@ -3502,6 +4572,8 @@ async function main() {
       });
       if (saved) logLine(`[trace] session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
     } finally {
+      clearPendingRequestTokens();
+      if (tui) refreshTuiContextUsage();
       taskRunningRef.value = false;
       escAbortArmedRef.value = false;
       if (escAbortTimer) {
@@ -3529,7 +4601,7 @@ async function main() {
   try {
     await saveHistory(historyFile, rl.history);
   } finally {
-    await mcpHub.close();
+    if (mcpHubRef.value) await mcpHubRef.value.close();
     if (onKeypress && keypressSource && typeof keypressSource.off === "function") {
       keypressSource.off("keypress", onKeypress);
     }

@@ -8,6 +8,7 @@ import { buildSystemPrompt, buildToolDefinitions } from "../src/lib/prompt.js";
 
 const testDir = path.dirname(fileURLToPath(import.meta.url));
 const fixtureServerPath = path.join(testDir, "fixtures", "mockMcpServer.mjs");
+const fixtureLineServerPath = path.join(testDir, "fixtures", "mockMcpServerLine.mjs");
 
 describe("mcp support", () => {
   test("resolves MCP server configuration from settings", async () => {
@@ -30,6 +31,25 @@ describe("mcp support", () => {
     expect(row.command).toBe(process.execPath);
     expect(row.args).toEqual([fixtureServerPath]);
     expect(row.cwd).toBe(workspaceDir);
+    expect(row.stdioProtocol).toBe("auto");
+  });
+
+  test("supports explicit stdioProtocol override", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-mcp-"));
+    const map = resolveMcpServerConfigs(
+      {
+        mcpServers: {
+          lineMock: {
+            command: process.execPath,
+            args: [fixtureLineServerPath],
+            stdioProtocol: "line",
+          },
+        },
+      },
+      workspaceDir
+    );
+    const row = map.get("lineMock");
+    expect(row.stdioProtocol).toBe("line");
   });
 
   test("imports shared MCP config files and keeps local overrides", async () => {
@@ -175,6 +195,34 @@ describe("mcp support", () => {
         uri: "memo://hello",
       });
       expect(JSON.stringify(resource)).toContain("hello from mock mcp");
+    } finally {
+      await hub.close();
+    }
+  });
+
+  test("hub auto-falls back to line protocol for line-delimited servers", async () => {
+    const workspaceDir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-mcp-"));
+    const hub = new McpHub({
+      workspaceDir,
+      settings: {
+        mcpServers: {
+          lineMock: {
+            command: process.execPath,
+            args: [fixtureLineServerPath],
+          },
+        },
+      },
+    });
+
+    try {
+      const tools = await hub.listTools({ server: "lineMock" });
+      expect(tools.some((tool) => tool.server === "lineMock" && tool.name === "echo_tool")).toBe(true);
+      const callResult = await hub.callTool({
+        server: "lineMock",
+        tool: "echo_tool",
+        input: { text: "line" },
+      });
+      expect(JSON.stringify(callResult)).toContain("echo:line");
     } finally {
       await hub.close();
     }

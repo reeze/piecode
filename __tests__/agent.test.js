@@ -495,6 +495,39 @@ describe("agent context controls", () => {
     expect(payload).toContain("test prompt content");
   });
 
+  test("llm_response events include provider usage when available", async () => {
+    const responses = [];
+    const providerUsage = { input_tokens: 42, output_tokens: 10, total_tokens: 52 };
+    const agent = new Agent({
+      provider: {
+        kind: "test-provider",
+        model: "test-model",
+        supportsNativeTools: false,
+        getLastUsage() {
+          return providerUsage;
+        },
+        async complete() {
+          return JSON.stringify({ type: "final", message: "done" });
+        },
+      },
+      workspaceDir: process.cwd(),
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      activeSkillsRef: { value: [] },
+      projectInstructionsRef: { value: null },
+      onEvent: (evt) => {
+        if (evt?.type === "llm_response" && evt?.stage === "turn") {
+          responses.push(evt);
+        }
+      },
+    });
+
+    const result = await agent.runTurn("say done");
+    expect(result).toContain("done");
+    expect(responses.length).toBeGreaterThan(0);
+    expect(responses[0]?.usage).toEqual(providerUsage);
+  });
+
   test("openai-native mode sends tool results as role=tool messages", async () => {
     const seenMessages = [];
     let calls = 0;
