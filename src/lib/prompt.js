@@ -103,6 +103,10 @@ export function buildSystemPrompt({
     "- Keep todo states strict: pending, in_progress, completed",
     "- Keep at most one todo in_progress at a time",
     "- Update todos whenever meaningful progress happens",
+    "- Read the target file before editing so replacements use exact current text",
+    "- Use edit_file for precise oldText -> newText changes with a unique match in existing files",
+    "- For existing files, do not use write_file unless the user explicitly asks for full rewrite/overwrite",
+    "- Use write_file only for creating new files or full file rewrites",
     "- Prefer safe execution and explicit approval for risky shell operations",
     "- End with clear outcome and concrete next actions when useful",
 
@@ -117,8 +121,10 @@ export function buildSystemPrompt({
     "- Prefer the minimum number of tools needed to complete the task correctly",
     "- Start with read/list tools before shell when possible",
     "- Avoid repeating the same tool call unless new input changed",
+    "- Never call the same read-only tool with identical input twice in one turn unless the first call errored",
     "- After each tool result, either: (a) proceed with next necessary step, or (b) finalize if enough evidence exists",
     "- When blocked by missing requirements, ask one concise clarifying question",
+    "- If PROJECT INSTRUCTIONS already include AGENTS.md content, treat AGENTS.md as already read and avoid read_file AGENTS.md unless exact line quoting is requested",
 
     "COMPLEX TASK EXECUTION:",
     "- For multi-step or high-uncertainty tasks, briefly restate a 3-7 step plan before acting",
@@ -140,8 +146,8 @@ export function buildSystemPrompt({
       "shell",
       "read_file",
       "read_files",
+      "edit_file",
       "write_file",
-      "apply_patch",
       "replace_in_files",
       "list_files",
       "glob_files",
@@ -180,13 +186,13 @@ export function buildSystemPrompt({
       "- shell: { command: string } - Run a shell command in the current directory",
       "- read_file: { path: string } - Read the contents of a file",
       "- read_files: { paths: string[], max_chars_per_file?: number, max_total_chars?: number } - Read multiple files in one call with total-size cap",
+      "- edit_file: { path: string, oldText?: string, newText?: string, old_text?: string, new_text?: string } - Surgical in-file replacement requiring exactly one oldText match",
       "- write_file: { path: string, content: string } - Write content to a file",
-      "- apply_patch: { path: string, find?: string, replace?: string, all?: boolean, dry_run?: boolean, edits?: Array<{find:string,replace:string,all?:boolean}> } - Make precise in-file edits",
       "- replace_in_files: { path?: string, find: string, replace?: string, file_pattern?: string, max_files?: number, max_replacements?: number, case_sensitive?: boolean, use_regex?: boolean, apply?: boolean } - Preview/apply bulk replacements",
       "- list_files: { path?: string, max_entries?: number, include_hidden?: boolean, include_ignored?: boolean } - List files in a directory (hidden/ignored skipped by default)",
       "- glob_files: { path?: string, pattern?: string, max_results?: number, include_hidden?: boolean } - Find files by glob pattern",
       "- find_files: { path?: string, query: string, max_results?: number, include_hidden?: boolean } - Fuzzy-find files by path text",
-      "- search_files: { path?: string, regex: string, file_pattern?: string, max_results?: number, case_sensitive?: boolean } - Search for patterns in files using ripgrep/grep",
+      "- search_files: { path?: string, regex?: string, query?: string, file_pattern?: string, max_results?: number, case_sensitive?: boolean } - Search for patterns in files using ripgrep/grep (query is accepted as alias)",
       "- git_status: { porcelain?: boolean } - Show current git status",
       "- git_diff: { path?: string, staged?: boolean, context?: number } - Show git diff",
       "- run_tests: { command?: string, timeout_ms?: number } - Run test command and return parsed summary",
@@ -272,14 +278,171 @@ export function buildSystemPrompt({
   return sections.join("\n");
 }
 
+const KNOWN_TOOL_NAMES = new Set([
+  "shell",
+  "read_file",
+  "read_files",
+  "write_file",
+  "edit_file",
+  "apply_patch",
+  "replace_in_files",
+  "list_files",
+  "glob_files",
+  "find_files",
+  "search_files",
+  "git_status",
+  "git_diff",
+  "run_tests",
+  "todo_write",
+  "todowrite",
+  "list_mcp_servers",
+  "list_mcp_tools",
+  "mcp_call_tool",
+  "list_mcp_resources",
+  "list_mcp_resource_templates",
+  "read_mcp_resource",
+]);
+
+function toJsonText(value) {
+  if (typeof value === "string") return value;
+  if (value == null) return "";
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
+function truncateForHistory(text, maxChars) {
+  const source = String(text || "");
+  if (source.length <= maxChars) return source;
+  return `${source.slice(0, maxChars)}\n[truncated for context budget]`;
+}
+
+function extractFirstJsonObject(sourceText = "") {
+  const source = String(sourceText || "");
+  const start = source.indexOf("{");
+  if (start < 0) return null;
+  let depth = 0;
+  let inString = false;
+  let escaped = false;
+  for (let i = start; i < source.length; i += 1) {
+    const ch = source[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === "\\") escaped = true;
+      else if (ch === "\"") inString = false;
+      continue;
+    }
+    if (ch === "\"") {
+      inString = true;
+      continue;
+    }
+    if (ch === "{") depth += 1;
+    if (ch === "}") depth -= 1;
+    if (depth === 0) return source.slice(start, i + 1);
+  }
+  return null;
+}
+
+function normalizeParsedAction(parsed = null) {
+  if (!parsed || typeof parsed !== "object") return null;
+  const typeRaw = String(parsed.type || "").trim();
+  const type = typeRaw.toLowerCase();
+
+  if (type === "final" && typeof parsed.message === "string") {
+    return { type: "final", message: parsed.message };
+  }
+  if (type === "thought" && typeof parsed.content === "string") {
+    return { type: "thought", content: parsed.content };
+  }
+
+  if (type === "tool_use" && parsed.tool) {
+    const toolName = String(parsed.tool || "").trim();
+    if (!toolName) return null;
+    return {
+      type: "tool_use",
+      tool: toolName,
+      input: parsed.input && typeof parsed.input === "object" ? parsed.input : {},
+      reason: String(parsed.reason || ""),
+      thought: String(parsed.thought || ""),
+    };
+  }
+
+  if (KNOWN_TOOL_NAMES.has(type)) {
+    return {
+      type: "tool_use",
+      tool: type,
+      input: parsed.input && typeof parsed.input === "object" ? parsed.input : {},
+      reason: String(parsed.reason || ""),
+      thought: String(parsed.thought || ""),
+    };
+  }
+
+  return null;
+}
+
 export function formatHistory(messages) {
-  return messages
-    .map((m) => {
-      const role = m.role || "user";
-      const content = m.content || "";
-      return `${role}: ${content}`;
-    })
-    .join("\n");
+  const maxToolResultChars = 4000;
+  const maxMessageChars = 6000;
+  const entries = Array.isArray(messages) ? messages : [];
+  const lines = [];
+
+  for (const msg of entries) {
+    const role = String(msg?.role || "user").toUpperCase();
+    const raw = msg?.content;
+    const text = toJsonText(raw);
+    let parsed = null;
+    if (typeof text === "string") {
+      const trimmed = text.trim();
+      if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch {
+          parsed = null;
+        }
+      }
+    }
+
+    if (parsed && typeof parsed === "object") {
+      const type = String(parsed.type || "").toLowerCase();
+      if (type === "tool_use") {
+        const toolName = String(parsed.tool || "unknown");
+        lines.push(`${role}: Tool Use: ${toolName}`);
+        if (parsed.reason) lines.push(`Reason: ${String(parsed.reason)}`);
+        if (parsed.thought) lines.push(`Thought: ${String(parsed.thought)}`);
+        if (parsed.input && typeof parsed.input === "object" && Object.keys(parsed.input).length > 0) {
+          lines.push(`Input: ${JSON.stringify(parsed.input)}`);
+        }
+        continue;
+      }
+
+      if (type === "tool_result") {
+        const toolName = String(parsed.tool || "unknown");
+        const resultText = toJsonText(parsed.result);
+        lines.push(`${role}: Tool Result: ${toolName} (result chars: ${resultText.length})`);
+        lines.push(truncateForHistory(resultText, maxToolResultChars));
+        continue;
+      }
+
+      if (type === "thought") {
+        lines.push(`${role}: Thought: ${String(parsed.content || "")}`);
+        continue;
+      }
+
+      if (type === "final") {
+        lines.push(`${role}: Final: ${String(parsed.message || "")}`);
+        continue;
+      }
+    }
+
+    lines.push(`${role}: ${truncateForHistory(text, maxMessageChars)}`);
+  }
+
+  return lines.join("\n");
 }
 
 export function parseModelAction(text) {
@@ -288,78 +451,50 @@ export function parseModelAction(text) {
     return { type: "unknown", raw: text };
   }
 
-  // Try to parse as JSON first
-  try {
-    const parsed = JSON.parse(trimmed);
-    if (parsed.type === "final" && typeof parsed.message === "string") {
-      return { type: "final", message: parsed.message };
-    }
-    if (parsed.type === "tool_use" && parsed.tool) {
-      return {
-        type: "tool_use",
-        tool: parsed.tool,
-        input: parsed.input || {},
-        reason: parsed.reason || "",
-        thought: parsed.thought || "",
-      };
-    }
-    if (parsed.type === "thought" && typeof parsed.content === "string") {
-      return { type: "thought", content: parsed.content };
-    }
-  } catch {
-    // Not valid JSON, fall through to text parsing
-  }
-
-  // Check for JSON code block
-  const jsonBlockMatch = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)```/);
-  if (jsonBlockMatch) {
+  const parseCandidate = (candidate) => {
+    if (!candidate) return null;
     try {
-      const parsed = JSON.parse(jsonBlockMatch[1].trim());
-      if (parsed.type === "final" && typeof parsed.message === "string") {
-        return { type: "final", message: parsed.message };
-      }
-      if (parsed.type === "tool_use" && parsed.tool) {
-        return {
-          type: "tool_use",
-          tool: parsed.tool,
-          input: parsed.input || {},
-          reason: parsed.reason || "",
-          thought: parsed.thought || "",
-        };
-      }
+      return normalizeParsedAction(JSON.parse(candidate));
     } catch {
-      // Invalid JSON in code block
+      return null;
     }
+  };
+
+  const direct = parseCandidate(trimmed);
+  if (direct) return direct;
+
+  const jsonBlockMatch = trimmed.match(/```(?:json)?\s*\n?([\s\S]*?)```/i);
+  if (jsonBlockMatch) {
+    const block = parseCandidate(String(jsonBlockMatch[1] || "").trim());
+    if (block) return block;
   }
 
-  // Check for explicit tool call pattern
-  const toolPattern =
-    /(?:tool\s*[:=]\s*)?(\w+)\s*[:=]\s*\{([^}]*)\}/i;
-  const match = trimmed.match(toolPattern);
-  if (match) {
-    const toolName = match[1].toLowerCase();
-    const args = match[2];
-    const input = {};
+  const embedded = parseCandidate(extractFirstJsonObject(trimmed));
+  if (embedded) return embedded;
 
-    // Simple key:value parsing
-    args.split(",").forEach((pair) => {
-      const [key, value] = pair.split(":").map((s) => s.trim());
-      if (key && value) {
-        // Remove quotes if present
-        input[key] = value.replace(/^["']|["']$/g, "");
+  const toolLineMatch = trimmed.match(/tool\s*(?:use)?\s*:\s*([a-zA-Z0-9_.-]+)/i);
+  if (toolLineMatch) {
+    const tool = String(toolLineMatch[1] || "").trim().toLowerCase();
+    let input = {};
+    const inputSection = trimmed.match(/input\s*:\s*([\s\S]+)$/i);
+    if (inputSection?.[1]) {
+      const maybeJson = extractFirstJsonObject(inputSection[1]) || String(inputSection[1]).trim();
+      try {
+        const parsedInput = JSON.parse(maybeJson);
+        input = parsedInput && typeof parsedInput === "object" ? parsedInput : {};
+      } catch {
+        input = {};
       }
-    });
-
+    }
     return {
       type: "tool_use",
-      tool: toolName,
+      tool,
       input,
       reason: "Parsed from text pattern",
       thought: "",
     };
   }
 
-  // Default: treat as final message
   return { type: "final", message: trimmed };
 }
 
@@ -489,6 +624,22 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
       },
     },
     {
+      name: "edit_file",
+      description:
+        "Make a surgical replacement in an existing file by replacing oldText with newText. oldText must match exactly once.",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Relative path to existing file" },
+          oldText: { type: "string", description: "Exact text to replace (must match uniquely)" },
+          newText: { type: "string", description: "Replacement text" },
+          old_text: { type: "string", description: "Alias for oldText" },
+          new_text: { type: "string", description: "Alias for newText" },
+        },
+        required: ["path"],
+      },
+    },
+    {
       name: "write_file",
       description:
         "Write content to a file at the given path (relative to workspace root). Creates parent directories if needed.",
@@ -499,34 +650,6 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
           content: { type: "string", description: "Content to write" },
         },
         required: ["path", "content"],
-      },
-    },
-    {
-      name: "apply_patch",
-      description:
-        "Apply precise in-file edits using find/replace operations. Supports dry-run and multiple edits.",
-      input_schema: {
-        type: "object",
-        properties: {
-          path: { type: "string", description: "Relative path to file" },
-          find: { type: "string", description: "Text to find (for single edit mode)" },
-          replace: { type: "string", description: "Replacement text (for single edit mode)" },
-          all: { type: "boolean", description: "Replace all occurrences for single edit mode" },
-          dry_run: { type: "boolean", description: "Validate patch only without writing" },
-          edits: {
-            type: "array",
-            items: {
-              type: "object",
-              properties: {
-                find: { type: "string" },
-                replace: { type: "string" },
-                all: { type: "boolean" },
-              },
-              required: ["find"],
-            },
-          },
-        },
-        required: ["path"],
       },
     },
     {
@@ -606,7 +729,11 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
           },
           regex: {
             type: "string",
-            description: "Regular expression pattern to search for (required)",
+            description: "Regular expression pattern to search for",
+          },
+          query: {
+            type: "string",
+            description: "Alias for regex; accepted for compatibility",
           },
           file_pattern: {
             type: "string",
@@ -621,7 +748,6 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
             description: "Case-sensitive search (default: false)",
           },
         },
-        required: ["regex"],
       },
     },
     {

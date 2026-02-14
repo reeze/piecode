@@ -19,7 +19,54 @@ function latestFrame(out) {
   return stripAnsi(out.writes[out.writes.length - 1] || "");
 }
 
+function withEnv(name, value, fn) {
+  const prev = process.env[name];
+  if (value == null) delete process.env[name];
+  else process.env[name] = String(value);
+  try {
+    return fn();
+  } finally {
+    if (prev == null) delete process.env[name];
+    else process.env[name] = prev;
+  }
+}
+
 describe("tui usability", () => {
+  test("does not enable mouse capture by default", () => {
+    withEnv("PIECODE_MOUSE_CAPTURE", null, () => {
+      const out = createOut();
+      const tui = new SimpleTui({
+        out,
+        workspaceDir: "/tmp/work",
+        providerLabel: () => "seed:model",
+        getSkillsLabel: () => "none",
+        getApprovalLabel: () => "off",
+      });
+      tui.start();
+      const raw = out.writes.join("");
+      expect(raw).not.toContain("\x1b[?1000h");
+      expect(raw).not.toContain("\x1b[?1006h");
+    });
+  });
+
+  test("enables mouse capture when PIECODE_MOUSE_CAPTURE=1", () => {
+    withEnv("PIECODE_MOUSE_CAPTURE", "1", () => {
+      const out = createOut();
+      const tui = new SimpleTui({
+        out,
+        workspaceDir: "/tmp/work",
+        providerLabel: () => "seed:model",
+        getSkillsLabel: () => "none",
+        getApprovalLabel: () => "off",
+      });
+      tui.start();
+      const raw = out.writes.join("");
+      expect(raw).toContain("\x1b[?1000h");
+      expect(raw).toContain("\x1b[?1006h");
+      expect(tui.isMouseCaptureEnabled()).toBe(true);
+    });
+  });
+
   test("todo panel renders empty and populated states", () => {
     const out = createOut();
     const tui = new SimpleTui({
@@ -73,10 +120,14 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines('[run] shell command="echo hi"')[0])).toContain("Bash(echo hi)");
     expect(stripAnsi(tui.formatTimelineLines("[run] shell echo hi")[0])).toContain("[~]");
     expect(tui.formatTimelineLines("[tool] shell (echo hi)")).toEqual([]);
+    expect(tui.formatTimelineLines("[tool] todo_write (3 todos)")).toEqual([]);
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("Tool: read_file");
     expect(stripAnsi(tui.formatTimelineLines("[result] done")[0])).toContain("[ok] done");
     expect(stripAnsi(tui.formatTimelineLines("[result] shell failed | time: 2s")[0])).toContain(
       "[x] shell failed | time: 2s"
+    );
+    expect(stripAnsi(tui.formatTimelineLines("[tool-result] 1 file changed, 1 insertion(+), 1 deletion(-)")[0])).toContain(
+      "1 file changed, 1 insertion(+), 1 deletion(-)"
     );
     expect(stripAnsi(tui.formatTimelineLines("[banner-1] ██████")[0])).toContain("██████");
     expect(stripAnsi(tui.formatTimelineLines("[banner-meta] model: seed:model")[0])).toContain("model: seed:model");
@@ -247,6 +298,37 @@ describe("tui usability", () => {
     expect(frame).not.toContain("llm:");
     expect(frame).not.toContain("view:");
     expect(frame).not.toContain("todos:");
+    expect(frame).not.toContain("TODO(");
+  });
+
+  test("status bar shows TODO progress and hides it when empty", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.setTodos([
+      { id: "todo-1", content: "step one", status: "completed" },
+      { id: "todo-2", content: "step two", status: "pending" },
+    ]);
+    let frame = latestFrame(out);
+    expect(frame).toContain("TODO(1/2)");
+
+    tui.setTodos([
+      { id: "todo-1", content: "step one", status: "completed" },
+      { id: "todo-2", content: "step two", status: "completed" },
+    ]);
+    frame = latestFrame(out);
+    expect(frame).toContain("TODO(2/2)");
+
+    tui.setTodos([]);
+    frame = latestFrame(out);
+    expect(frame).not.toContain("TODO(");
   });
 
   test("explicit status message persists across input rerenders", () => {

@@ -36,6 +36,8 @@ describe('Prompt functions', () => {
       expect(prompt).toContain('TOOL SCHEMAS');
       expect(prompt).toContain('"type":"thought"');
       expect(prompt).toContain('todo_write/todowrite');
+      expect(prompt).toContain('edit_file');
+      expect(prompt).not.toContain('apply_patch');
     });
 
     test('should omit tool schemas in native mode (nativeTools=true)', () => {
@@ -92,6 +94,20 @@ describe('Prompt functions', () => {
       expect(prompt).toContain('Do not edit generated files.');
     });
 
+    test('should include duplicate read guard for AGENTS context', () => {
+      const prompt = buildSystemPrompt({
+        workspaceDir: '/test/workspace',
+        autoApprove: false,
+        projectInstructions: {
+          source: 'AGENTS.md',
+          content: 'Project instructions body.',
+        },
+      });
+
+      expect(prompt).toContain('Never call the same read-only tool with identical input twice in one turn');
+      expect(prompt).toContain('treat AGENTS.md as already read');
+    });
+
     test('should include todo tracking conventions in text mode', () => {
       const prompt = buildSystemPrompt({
         workspaceDir: '/test/workspace',
@@ -101,6 +117,10 @@ describe('Prompt functions', () => {
 
       expect(prompt).toContain('todo_write');
       expect(prompt).toContain('pending, in_progress, completed');
+      expect(prompt).toContain('Read the target file before editing');
+      expect(prompt).toContain('Use edit_file for precise oldText -> newText changes');
+      expect(prompt).toContain('do not use write_file unless the user explicitly asks for full rewrite/overwrite');
+      expect(prompt).toContain('Use write_file only for creating new files or full file rewrites');
     });
   });
 
@@ -173,6 +193,15 @@ describe('Prompt functions', () => {
       expect(result.type).toBe('tool_use');
       expect(result.tool).toBe('read_file');
       expect(result.input).toEqual({ path: 'test.txt' });
+    });
+
+    test('should parse JSON tool call with preamble text', () => {
+      const result = parseModelAction(
+        'I will inspect first.\\n{"type":"tool_use","tool":"search_files","input":{"query":"todo_write","path":"src"},"reason":"find todo logic"}'
+      );
+      expect(result.type).toBe('tool_use');
+      expect(result.tool).toBe('search_files');
+      expect(result.input).toEqual({ query: 'todo_write', path: 'src' });
     });
 
     test('should handle invalid JSON', () => {
@@ -279,6 +308,14 @@ describe('Prompt functions', () => {
       expect(writeFile).toBeDefined();
       expect(writeFile.function.parameters.required).toContain('path');
       expect(writeFile.function.parameters.required).toContain('content');
+
+      const editFile = tools.find((t) => t.function?.name === 'edit_file');
+      expect(editFile).toBeDefined();
+      expect(editFile.function.parameters.properties.oldText).toBeDefined();
+      expect(editFile.function.parameters.properties.newText).toBeDefined();
+
+      const applyPatch = tools.find((t) => t.function?.name === 'apply_patch');
+      expect(applyPatch).toBeUndefined();
     });
 
     test('includes todo_write tool', () => {
@@ -286,6 +323,14 @@ describe('Prompt functions', () => {
       const todo = anthropic.find((t) => t.name === 'todo_write');
       expect(todo).toBeDefined();
       expect(todo.input_schema.properties.todos).toBeDefined();
+
+      const edit = anthropic.find((t) => t.name === 'edit_file');
+      expect(edit).toBeDefined();
+      expect(edit.input_schema.properties.path).toBeDefined();
+      expect(edit.input_schema.properties.oldText).toBeDefined();
+
+      const applyPatch = anthropic.find((t) => t.name === 'apply_patch');
+      expect(applyPatch).toBeUndefined();
 
       const openai = buildToolDefinitions('openai');
       const todoOai = openai.find((t) => t.function?.name === 'todo_write');

@@ -1,7 +1,7 @@
 import { Agent } from "../src/lib/agent.js";
 import os from "os";
 import path from "path";
-import { mkdtemp, readFile, rm } from "fs/promises";
+import { mkdtemp, readFile, rm, writeFile } from "fs/promises";
 
 function createAgentWithProvider(provider = {}) {
   return new Agent({
@@ -1217,6 +1217,110 @@ describe("agent context controls", () => {
       expect(readme).toContain("Scientific Calculator CLI");
       expect(readme).toContain("node bin/scicalc.js");
       expect(llmSystemPrompts[0]).toContain("COMPLEX TASK EXECUTION:");
+    } finally {
+      await rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  test("blocks write_file overwrite on existing files for non-rewrite requests", async () => {
+    const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "piecode-write-guard-"));
+    try {
+      await writeFile(path.join(workspaceDir, "AGENTS.md"), "original agents content\n", "utf8");
+      let calls = 0;
+      const agent = new Agent({
+        provider: {
+          kind: "test-provider",
+          model: "test-model",
+          async complete() {
+            calls += 1;
+            if (calls === 1) {
+              return JSON.stringify({
+                type: "tool_use",
+                tool: "write_file",
+                input: {
+                  path: "AGENTS.md",
+                  content: "rewritten by mistake\n",
+                },
+                reason: "update AGENTS docs",
+              });
+            }
+            return JSON.stringify({
+              type: "final",
+              message: "done",
+            });
+          },
+        },
+        workspaceDir,
+        autoApproveRef: { value: true },
+        askApproval: async () => true,
+        activeSkillsRef: { value: [] },
+        projectInstructionsRef: { value: null },
+      });
+
+      const result = await agent.runTurn("please optimize @AGENTS.md");
+      expect(result).toBe("done");
+
+      const next = await readFile(path.join(workspaceDir, "AGENTS.md"), "utf8");
+      expect(next).toBe("original agents content\n");
+
+      const blocked = agent.history.some((entry) => {
+        if (entry.role !== "user") return false;
+        try {
+          const parsed = JSON.parse(String(entry.content || ""));
+          return (
+            parsed?.type === "tool_result" &&
+            parsed?.tool === "write_file" &&
+            String(parsed?.result || "").includes("write_file is blocked for existing file")
+          );
+        } catch {
+          return false;
+        }
+      });
+      expect(blocked).toBe(true);
+    } finally {
+      await rm(workspaceDir, { recursive: true, force: true });
+    }
+  });
+
+  test("allows write_file overwrite when user explicitly requests full rewrite", async () => {
+    const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "piecode-write-allow-"));
+    try {
+      await writeFile(path.join(workspaceDir, "AGENTS.md"), "old\n", "utf8");
+      let calls = 0;
+      const agent = new Agent({
+        provider: {
+          kind: "test-provider",
+          model: "test-model",
+          async complete() {
+            calls += 1;
+            if (calls === 1) {
+              return JSON.stringify({
+                type: "tool_use",
+                tool: "write_file",
+                input: {
+                  path: "AGENTS.md",
+                  content: "new full rewrite\n",
+                },
+                reason: "rewrite file",
+              });
+            }
+            return JSON.stringify({
+              type: "final",
+              message: "done",
+            });
+          },
+        },
+        workspaceDir,
+        autoApproveRef: { value: true },
+        askApproval: async () => true,
+        activeSkillsRef: { value: [] },
+        projectInstructionsRef: { value: null },
+      });
+
+      const result = await agent.runTurn("please rewrite AGENTS.md from scratch");
+      expect(result).toBe("done");
+      const next = await readFile(path.join(workspaceDir, "AGENTS.md"), "utf8");
+      expect(next).toBe("new full rewrite\n");
     } finally {
       await rm(workspaceDir, { recursive: true, force: true });
     }

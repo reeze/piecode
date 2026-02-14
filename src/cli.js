@@ -853,7 +853,7 @@ function formatToolInputSummary(tool, input, maxLen = 120) {
   if (tool === "shell") {
     return summarizeForLog(safe.command || "", maxLen);
   }
-  if (tool === "read_file" || tool === "write_file" || tool === "apply_patch") {
+  if (tool === "read_file" || tool === "write_file" || tool === "edit_file" || tool === "apply_patch") {
     return summarizeForLog(safe.path || "", maxLen);
   }
   if (tool === "read_files") {
@@ -886,6 +886,43 @@ function formatToolInputSummary(tool, input, maxLen = 120) {
     return `${count} todos`;
   }
   return summarizeForLog(JSON.stringify(safe), maxLen);
+}
+
+function formatToolResultLinesForTimeline(tool, result, error) {
+  if (error) return [];
+  if (tool !== "edit_file") return [];
+
+  const raw = String(result || "").trim();
+  if (!raw) return [];
+
+  try {
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed !== "object") return [];
+    const lines = [];
+
+    const message = String(parsed?.message || "").trim();
+    if (message) lines.push(`[tool-result] ${message}`);
+
+    const diffStat = String(parsed?.details?.diffStat || "").trim();
+    if (diffStat) lines.push(`[tool-result] ${diffStat}`);
+
+    const diffText = String(parsed?.details?.diff || "").trim();
+    if (diffText) {
+      lines.push("[tool-result] diff:");
+      const diffLines = diffText.split("\n");
+      const maxPreviewLines = 40;
+      for (const line of diffLines.slice(0, maxPreviewLines)) {
+        lines.push(`[tool-result] ${line}`);
+      }
+      if (diffLines.length > maxPreviewLines) {
+        lines.push(`[tool-result] ... (${diffLines.length - maxPreviewLines} more lines)`);
+      }
+    }
+
+    return lines;
+  } catch {
+    return [];
+  }
 }
 
 function estimateTokenCount(text) {
@@ -986,7 +1023,8 @@ function maybeHandleLocalInfoTask(input, { logLine, tui, display, mcpHub = null 
     "- `read_file`: Read a file",
     "- `read_files`: Read multiple files in one call",
     "- `write_file`: Write a file",
-    "- `apply_patch`: Make targeted in-file edits (find/replace patches)",
+    "- `edit_file`: Surgical in-file replacement using oldText/newText unique match",
+    "- `apply_patch`: Legacy alias (prefer `edit_file`)",
     "- `replace_in_files`: Preview/apply bulk replacements",
     "- `list_files`: List files/directories",
     "- `glob_files`: Find files by glob pattern",
@@ -1482,6 +1520,7 @@ function shouldShowTurnSummary({ tools = [], filesChanged = [] } = {}) {
   // Show summary only for materially active turns.
   const significantTools = new Set([
     "write_file",
+    "edit_file",
     "apply_patch",
     "replace_in_files",
     "shell",
@@ -3828,7 +3867,7 @@ async function main() {
     };
     keypressSource.on("keypress", onKeypress);
   }
-  if (tui) {
+  if (tui && tui.isMouseCaptureEnabled && tui.isMouseCaptureEnabled()) {
     let mouseRemainder = "";
     onMouseData = (chunk) => {
       if (isReadlineClosed()) return;
@@ -4020,7 +4059,6 @@ async function main() {
       todosRef.value = normalizeTodos(nextTodos);
       todoAutoTrackRef.value = false;
       if (tui) tui.setTodos(todosRef.value);
-      logLine(`updated todos: ${todosRef.value.length}`);
     },
     onEvent: (evt) => {
       if (evt.type === "model_call") {
@@ -4051,7 +4089,6 @@ async function main() {
             todosRef.value = seeded;
             todoAutoTrackRef.value = true;
             if (tui) tui.setTodos(todosRef.value);
-            logLine(`seeded todos from plan: ${seeded.length}`);
           }
         } else {
           todoAutoTrackRef.value = false;
@@ -4236,9 +4273,13 @@ async function main() {
       }
       if (evt.type === "tool_use") {
         recordTaskEvent(taskTraceRef, evt);
+        const isTodoTool = evt.tool === "todo_write" || evt.tool === "todowrite";
         if (turnSummaryRef.value.active) {
           turnSummaryRef.value.tools.push(evt.tool);
           if (evt.tool === "write_file" && evt.input?.path) {
+            turnSummaryRef.value.filesChanged.add(String(evt.input.path));
+          }
+          if (evt.tool === "edit_file" && evt.input?.path) {
             turnSummaryRef.value.filesChanged.add(String(evt.input.path));
           }
           if (evt.tool === "apply_patch" && evt.input?.path) {
@@ -4255,7 +4296,9 @@ async function main() {
         }
         if (display) display.onToolUse(evt.tool, evt.input, evt.reason);
         const summary = formatToolInputSummary(evt.tool, evt.input, 100);
-        if (verboseToolLogs) {
+        if (isTodoTool) {
+          // keep todo activity in status bar only
+        } else if (verboseToolLogs) {
           const details = Object.entries(evt.input || {})
             .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
             .join(" ");
@@ -4301,6 +4344,10 @@ async function main() {
           logLine(`[trace] tool_end name=${evt.tool} duration=${durationMs}ms error=${err}`);
         }
         if (display) display.onToolEnd(evt.tool, evt.result, evt.error);
+        if (tui) {
+          const toolLines = formatToolResultLinesForTimeline(evt.tool, evt.result, evt.error);
+          for (const line of toolLines) logLine(line);
+        }
       }
     },
   });

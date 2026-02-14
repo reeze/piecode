@@ -289,15 +289,20 @@ export class SimpleTui {
     this.overlayHint = "";
     this.overlaySearchActive = false;
     this.overlaySearchQuery = "";
+    this.mouseCaptureEnabled = String(process.env.PIECODE_MOUSE_CAPTURE || "").trim() === "1";
+  }
+
+  isMouseCaptureEnabled() {
+    return Boolean(this.mouseCaptureEnabled);
   }
 
   start() {
     this.active = true;
-    // Enable mouse reporting (normal + SGR extended) for wheel scrolling support.
-    if (!this.layout) {
+    // Keep terminal-native selection enabled by default; mouse capture is opt-in.
+    if (!this.layout && this.mouseCaptureEnabled) {
       this.out.write("\x1b[?1000h\x1b[?1006h");
-      this.out.write("\x1b[?25h");
     }
+    if (!this.layout) this.out.write("\x1b[?25h");
     this.render("", "Ready. Type /help for commands.");
   }
 
@@ -305,9 +310,9 @@ export class SimpleTui {
     if (!this.active) return;
     this.active = false;
     this.stopThinkingAnimation();
-    // Disable mouse reporting on exit.
+    // Disable mouse reporting on exit (only if it was enabled).
     if (!this.layout) {
-      this.out.write("\x1b[?1000l\x1b[?1006l");
+      if (this.mouseCaptureEnabled) this.out.write("\x1b[?1000l\x1b[?1006l");
       this.out.write("\x1b[2J\x1b[H\x1b[?25h");
     }
   }
@@ -552,7 +557,7 @@ export class SimpleTui {
 
   setTodos(todos) {
     this.todos = Array.isArray(todos) ? todos : [];
-    if (this.showTodoPanel) this.render();
+    this.render();
   }
 
   setApprovalPrompt(prompt, defaultYes = false, meta = null) {
@@ -970,6 +975,10 @@ export class SimpleTui {
         // Shell tool usage is rendered from the `[run] shell ...` entry to avoid duplicate lines.
         return [];
       }
+      if (/^(todo_write|todowrite)\b/i.test(body)) {
+        // Keep todo changes in status bar only.
+        return [];
+      }
       return padAll([color(`Tool: ${body}`, "36")]);
     }
     if (line.startsWith("[response] ")) {
@@ -987,6 +996,11 @@ export class SimpleTui {
       const icon = failed ? "[x]" : ok ? "[ok]" : "[i]";
       const iconColor = failed ? "1;31" : ok ? "1;32" : "2;37";
       return padAll([`${color(icon, iconColor)} ${color(body, "2;37")}`, ""]);
+    }
+    if (line.startsWith("[tool-result] ")) {
+      const body = trimWorkspaceText(line.slice(14).trim(), 2000).text;
+      if (!body) return [];
+      return padAll([color(body, "2;37")]);
     }
     if (line.startsWith("[banner-1] ")) {
       return [color(line.slice(11), "1;82")];
@@ -1169,7 +1183,7 @@ export class SimpleTui {
         : "";
     const todoSummary =
       this.todos.length > 0
-        ? ` | todos: ${this.todos.filter((t) => t.status === "completed").length}/${this.todos.length}`
+        ? ` | TODO(${this.todos.filter((t) => t.status === "completed").length}/${this.todos.length})`
         : "";
     const tokenSummary =
       this.sessionTokensSent > 0 || this.sessionTokensReceived > 0
@@ -1301,8 +1315,10 @@ export class SimpleTui {
       this.sessionTokensSent > 0 || this.sessionTokensReceived > 0
         ? ` | session tok:↑${formatCompactNumber(this.sessionTokensSent)} ↓${formatCompactNumber(this.sessionTokensReceived)}`
         : "";
+    const todoDone = this.todos.filter((t) => String(t?.status || "").toLowerCase() === "completed").length;
+    const todoStatus = this.todos.length > 0 ? ` | TODO(${todoDone}/${this.todos.length})` : "";
     const planStatus = this.planModeEnabled ? " | plan:on" : "";
-    const promptStatusRaw = `status: ${this.lastStatus || "idle"}${planStatus}${ctxStatus}${tokStatus}${scrollLabel}`;
+    const promptStatusRaw = `status: ${this.lastStatus || "idle"}${planStatus}${ctxStatus}${tokStatus}${todoStatus}${scrollLabel}`;
     const bashMode = /^\s*!/.test(this.currentInput) ? " | mode:bash" : "";
     const projectLabel = this.formatProjectInstructionsLabel();
     let promptStatus = "";
@@ -1333,7 +1349,7 @@ export class SimpleTui {
         })()
       : [];
 
-    const todoStatus = (status) =>
+    const todoMark = (status) =>
       status === "completed" ? "[x]" : status === "in_progress" ? "[~]" : "[ ]";
     const todoLinesBlock = this.showTodoPanel
       ? [
@@ -1344,7 +1360,7 @@ export class SimpleTui {
               ? ["(no tasks yet)"]
               : this.todos
                   .slice(0, Math.max(0, todoLines - 1))
-                  .map((todo) => `${todoStatus(todo.status)} ${todo.content}`)),
+                  .map((todo) => `${todoMark(todo.status)} ${todo.content}`)),
           ].map((line) => truncateLine(line, width)),
         ]
       : [];

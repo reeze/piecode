@@ -413,6 +413,8 @@ export class Display {
         return `> Read ${Array.isArray(input?.paths) ? input.paths.length : 0} files`;
       case "write_file":
         return `> Write ${input?.path || "file"}`;
+      case "edit_file":
+        return `> Edit ${input?.path || "file"}`;
       case "apply_patch":
         return `> Patch ${input?.path || "file"}`;
       case "replace_in_files":
@@ -447,6 +449,8 @@ export class Display {
         return "Reading files...";
       case "write_file":
         return `Writing ${input?.path || ""}...`;
+      case "edit_file":
+        return `Editing ${input?.path || ""}...`;
       case "apply_patch":
         return `Patching ${input?.path || ""}...`;
       case "replace_in_files":
@@ -487,6 +491,32 @@ export class Display {
       case "read_file": {
         const lineCount = text.split("\n").length;
         return `    ${dim(`${lineCount} lines`)}`;
+      }
+      case "edit_file": {
+        try {
+          const parsed = JSON.parse(text);
+          if (!parsed || typeof parsed !== "object") return `    ${dim(text)}`;
+          const out = [];
+          const message = String(parsed.message || "").trim();
+          if (message) out.push(`    ${dim(message)}`);
+          const diffStat = String(parsed?.details?.diffStat || "").trim();
+          if (diffStat) out.push(`    ${dim(diffStat)}`);
+          if (parsed?.details?.diffTruncated) {
+            out.push(`    ${dim("Diff truncated for display.")}`);
+          }
+          const diffText = String(parsed?.details?.diff || "").trim();
+          if (diffText) {
+            const lines = diffText.split("\n");
+            const preview = lines.slice(0, 40).map((line) => `    ${dim(truncateLine(line, 160))}`);
+            out.push(...preview);
+            if (lines.length > 40) {
+              out.push(`    ${dim(`... (${lines.length - 40} more lines)`)}`);
+            }
+          }
+          return out.join("\n");
+        } catch {
+          return `    ${dim(text)}`;
+        }
       }
       case "read_files":
       case "apply_patch":

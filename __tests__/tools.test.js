@@ -108,6 +108,7 @@ describe("tools usability", () => {
     expect(typeof tools.read_files).toBe("function");
     expect(typeof tools.glob_files).toBe("function");
     expect(typeof tools.find_files).toBe("function");
+    expect(typeof tools.edit_file).toBe("function");
     expect(typeof tools.apply_patch).toBe("function");
     expect(typeof tools.replace_in_files).toBe("function");
     expect(typeof tools.git_status).toBe("function");
@@ -233,6 +234,97 @@ describe("tools usability", () => {
     expect(next).toBe("hello pie");
   });
 
+  test("edit_file applies a unique replacement and returns diff details", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    await fs.writeFile(path.join(dir, "target.txt"), "alpha\nbeta world\ngamma\n", "utf8");
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+    });
+
+    const raw = await tools.edit_file({
+      path: "target.txt",
+      oldText: "beta world",
+      newText: "beta pie",
+    });
+    const parsed = JSON.parse(raw);
+    expect(parsed.path).toBe("target.txt");
+    expect(parsed.changed).toBe(true);
+    expect(parsed.replacements).toBe(1);
+    expect(parsed.details.diff).toContain("--- a/target.txt");
+    expect(parsed.details.diff).toContain("-beta world");
+    expect(parsed.details.diff).toContain("+beta pie");
+    expect(parsed.details.diffStat).toBe("1 file changed, 1 insertion(+), 1 deletion(-)");
+    expect(parsed.details.diffTruncated).toBe(false);
+
+    const next = await fs.readFile(path.join(dir, "target.txt"), "utf8");
+    expect(next).toContain("beta pie");
+  });
+
+  test("edit_file truncates oversized diff output for display and reports diff stat", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    const oldBlock = Array.from({ length: 220 }, (_, i) => `old-line-${i}`).join("\n");
+    const newBlock = Array.from({ length: 220 }, (_, i) => `new-line-${i}`).join("\n");
+    await fs.writeFile(path.join(dir, "target.txt"), `header\n${oldBlock}\nfooter\n`, "utf8");
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+    });
+
+    const raw = await tools.edit_file({
+      path: "target.txt",
+      oldText: oldBlock,
+      newText: newBlock,
+    });
+    const parsed = JSON.parse(raw);
+
+    expect(parsed.changed).toBe(true);
+    expect(parsed.details.diffStat).toContain("1 file changed");
+    expect(parsed.details.diffStat).toContain("220 insertions(+)");
+    expect(parsed.details.diffStat).toContain("220 deletions(-)");
+    expect(parsed.details.diffTruncated).toBe(true);
+    expect(parsed.details.diff).toContain("... [truncated");
+    expect(parsed.details.diffMeta.omittedLines).toBeGreaterThan(0);
+  });
+
+  test("edit_file requires a unique match", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    await fs.writeFile(path.join(dir, "target.txt"), "foo\nfoo\n", "utf8");
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+    });
+
+    await expect(
+      tools.edit_file({
+        path: "target.txt",
+        oldText: "foo",
+        newText: "bar",
+      })
+    ).rejects.toThrow("must be unique");
+  });
+
+  test("edit_file rejects whole-file replacement", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    await fs.writeFile(path.join(dir, "target.txt"), "entire file body", "utf8");
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+    });
+
+    await expect(
+      tools.edit_file({
+        path: "target.txt",
+        oldText: "entire file body",
+        newText: "rewritten body",
+      })
+    ).rejects.toThrow("Use write_file");
+  });
+
   test("replace_in_files previews and applies replacements", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
     await fs.mkdir(path.join(dir, "src"), { recursive: true });
@@ -285,6 +377,19 @@ describe("tools usability", () => {
     const result = await tools.search_files({ regex: "logo", path: "." });
     expect(result).toMatch(/Found matches in|Found \d+ matches/);
     expect(result).toContain("huge.txt");
+  });
+
+  test("search_files accepts query alias for regex", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    await fs.writeFile(path.join(dir, "sample.js"), "const todo_write = true;\n", "utf8");
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+    });
+
+    const result = await tools.search_files({ query: "todo_write", path: "." });
+    expect(result).toContain("sample.js");
   });
 
   test("git_status and git_diff return graceful output outside git repo", async () => {

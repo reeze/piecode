@@ -1,6 +1,8 @@
 import { classifyShellCommand, createToolset } from "./tools.js";
 import { buildSystemPrompt, formatHistory, parseModelAction, buildToolDefinitions, buildMessages, parseNativeResponse } from "./prompt.js";
 import { TaskPlanner, TaskExecutor } from "./taskPlanner.js";
+import { promises as fs } from "node:fs";
+import path from "node:path";
 
 export class Agent {
   constructor({
@@ -31,10 +33,6 @@ export class Agent {
     this.defaultToolBudget = Math.max(
       1,
       Math.min(12, Number.parseInt(process.env.PIECODE_TOOL_BUDGET || "6", 10) || 6)
-    );
-    this.iterationCheckpoint = Math.max(
-      5,
-      Number.parseInt(process.env.PIECODE_ITERATION_CHECKPOINT || "20", 10) || 20
     );
     this.activeAbortController = null;
   }
@@ -355,6 +353,54 @@ export class Agent {
     return null;
   }
 
+  resolveInsideWorkspace(candidatePath) {
+    const resolved = path.resolve(this.workspaceDir, candidatePath || ".");
+    const rel = path.relative(this.workspaceDir, resolved);
+    if (rel.startsWith("..") || path.isAbsolute(rel)) {
+      throw new Error(`Path escapes workspace: ${candidatePath}`);
+    }
+    return resolved;
+  }
+
+  shouldAllowWriteOverwrite(userMessage, action = null) {
+    const userText = String(userMessage || "").toLowerCase();
+    const reasonText = String(action?.reason || "").toLowerCase();
+    const combined = `${userText}\n${reasonText}`;
+    return (
+      /\b(rewrite|overwrite|regenerate|recreate)\b/.test(combined) ||
+      /\b(full|entire|whole)\s+file\b/.test(combined) ||
+      /\bfrom\s+scratch\b/.test(combined)
+    );
+  }
+
+  async validateWriteFileAction(userMessage, action = null) {
+    if (String(action?.tool || "") !== "write_file") return null;
+    const input = action?.input && typeof action.input === "object" ? action.input : {};
+    const relPath = String(input.path || "").trim();
+    if (!relPath) return null;
+    if (Boolean(input.allow_overwrite)) return null;
+
+    let absPath;
+    try {
+      absPath = this.resolveInsideWorkspace(relPath);
+    } catch (error) {
+      return String(error?.message || "Invalid write_file path");
+    }
+
+    let stat;
+    try {
+      stat = await fs.stat(absPath);
+    } catch (error) {
+      if (error && typeof error === "object" && error.code === "ENOENT") return null;
+      return null;
+    }
+
+    if (!stat?.isFile?.()) return null;
+    if (this.shouldAllowWriteOverwrite(userMessage, action)) return null;
+
+    return `write_file is blocked for existing file "${relPath}" to prevent accidental overwrite. Use read_file first, then edit_file with exact oldText/newText for targeted changes. If full rewrite is intended, explicitly request rewrite/overwrite and retry.`;
+  }
+
   parsePlan(raw) {
     const source = String(raw || "").trim();
     const candidates = [source, this.extractFirstJsonObject(source)];
@@ -601,20 +647,8 @@ export class Agent {
       let commitCommandRequired = false;
 
       // 对于简单任务，使用原有的循环方式
-      let i = 0;
       while (true) {
         this.throwIfAborted(signal);
-        i += 1;
-        if (i % this.iterationCheckpoint === 0) {
-          const shouldContinue = await this.askApproval(
-            `The agent has run ${i} model iterations in this turn. Continue? [Y/n]: `
-          );
-          if (!shouldContinue) {
-            const msg = `Stopped after ${i} iterations by user choice.`;
-            this.history.push({ role: "assistant", content: msg });
-            return msg;
-          }
-        }
 
         let action;
         const useNativeTools = this.provider.supportsNativeTools === true;
@@ -881,6 +915,10 @@ export class Agent {
             result = todoDisabledResult;
             toolError = "todo_write disabled by turn policy";
           } else {
+            const writeFileGuardError = await this.validateWriteFileAction(userMessage, action);
+            if (writeFileGuardError) {
+              throw new Error(writeFileGuardError);
+            }
             result = await toolFn(action.input || {}, { signal });
           }
         } catch (err) {

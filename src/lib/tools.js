@@ -375,6 +375,175 @@ function countStringMatches(source, needle, caseSensitive = true) {
   return count;
 }
 
+function findAllMatchOffsets(source, needle) {
+  if (!needle) return [];
+  const out = [];
+  let idx = 0;
+  while (true) {
+    idx = source.indexOf(needle, idx);
+    if (idx === -1) break;
+    out.push(idx);
+    idx += Math.max(1, needle.length);
+  }
+  return out;
+}
+
+function buildLineStartOffsets(text) {
+  const starts = [0];
+  for (let i = 0; i < text.length; i += 1) {
+    if (text[i] === "\n") starts.push(i + 1);
+  }
+  return starts;
+}
+
+function lineIndexFromOffset(lineStarts, offset) {
+  if (!Array.isArray(lineStarts) || lineStarts.length === 0) return 0;
+  const target = Math.max(0, Number(offset) || 0);
+  let low = 0;
+  let high = lineStarts.length - 1;
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    if (lineStarts[mid] <= target) {
+      low = mid + 1;
+    } else {
+      high = mid - 1;
+    }
+  }
+  return Math.max(0, Math.min(lineStarts.length - 1, high));
+}
+
+function buildEditDiff({
+  relPath,
+  before,
+  after,
+  startOffset,
+  oldText,
+  newText,
+  contextLines = 2,
+  maxBodyLines = 120,
+}) {
+  const beforeText = String(before || "");
+  const afterText = String(after || "");
+  const beforeLines = beforeText.split("\n");
+  const afterLines = afterText.split("\n");
+
+  const beforeStarts = buildLineStartOffsets(beforeText);
+  const afterStarts = buildLineStartOffsets(afterText);
+
+  const oldStartLine = lineIndexFromOffset(beforeStarts, startOffset);
+  const oldEndOffset = Math.max(startOffset, startOffset + Math.max(1, oldText.length) - 1);
+  const oldEndLine = lineIndexFromOffset(beforeStarts, oldEndOffset);
+
+  const newStartLine = lineIndexFromOffset(afterStarts, startOffset);
+  const newEndOffset = Math.max(startOffset, startOffset + Math.max(1, newText.length) - 1);
+  const newEndLine = lineIndexFromOffset(afterStarts, newEndOffset);
+
+  const oldContextStart = Math.max(0, oldStartLine - contextLines);
+  const oldContextEnd = Math.min(beforeLines.length - 1, oldEndLine + contextLines);
+  const newContextStart = Math.max(0, newStartLine - contextLines);
+  const newContextEnd = Math.min(afterLines.length - 1, newEndLine + contextLines);
+
+  const prefixOld = beforeLines.slice(oldContextStart, oldStartLine);
+  const prefixNew = afterLines.slice(newContextStart, newStartLine);
+  const prefixCount = Math.min(prefixOld.length, prefixNew.length);
+  const prefix = prefixOld.slice(prefixOld.length - prefixCount);
+
+  const oldChanged = beforeLines.slice(oldStartLine, oldEndLine + 1);
+  const newChanged = afterLines.slice(newStartLine, newEndLine + 1);
+
+  const suffixOld = beforeLines.slice(oldEndLine + 1, oldContextEnd + 1);
+  const suffixNew = afterLines.slice(newEndLine + 1, newContextEnd + 1);
+  const suffixCount = Math.min(suffixOld.length, suffixNew.length);
+  const suffix = suffixOld.slice(0, suffixCount);
+
+  const oldRangeStart = Math.max(1, oldStartLine - prefix.length + 1);
+  const newRangeStart = Math.max(1, newStartLine - prefix.length + 1);
+  const oldRangeCount = prefix.length + oldChanged.length + suffix.length;
+  const newRangeCount = prefix.length + newChanged.length + suffix.length;
+
+  const bodyLines = [];
+  for (const line of prefix) bodyLines.push(` ${line}`);
+  for (const line of oldChanged) bodyLines.push(`-${line}`);
+  for (const line of newChanged) bodyLines.push(`+${line}`);
+  for (const line of suffix) bodyLines.push(` ${line}`);
+
+  let renderedBody = bodyLines;
+  let bodyTruncated = false;
+  if (bodyLines.length > maxBodyLines) {
+    renderedBody = bodyLines.slice(0, maxBodyLines);
+    renderedBody.push(`... [truncated ${bodyLines.length - maxBodyLines} line(s)]`);
+    bodyTruncated = true;
+  }
+
+  const diff = [
+    `--- a/${normalizeRelPathForMatch(relPath)}`,
+    `+++ b/${normalizeRelPathForMatch(relPath)}`,
+    `@@ -${oldRangeStart},${oldRangeCount} +${newRangeStart},${newRangeCount} @@`,
+    ...renderedBody,
+  ].join("\n");
+
+  return {
+    diff,
+    stats: {
+      filesChanged: 1,
+      insertions: newChanged.length,
+      deletions: oldChanged.length,
+      hunks: 1,
+      bodyTruncated,
+      omittedBodyLines: bodyTruncated ? bodyLines.length - maxBodyLines : 0,
+    },
+  };
+}
+
+function formatDiffStat({ filesChanged = 1, insertions = 0, deletions = 0 } = {}) {
+  const fileLabel = filesChanged === 1 ? "file changed" : "files changed";
+  const additionsLabel = insertions === 1 ? "insertion(+)" : "insertions(+)";
+  const deletionsLabel = deletions === 1 ? "deletion(-)" : "deletions(-)";
+  return `${filesChanged} ${fileLabel}, ${insertions} ${additionsLabel}, ${deletions} ${deletionsLabel}`;
+}
+
+function truncateDiffForDisplay(diffText, { maxLines = 180, maxChars = 8000 } = {}) {
+  const raw = String(diffText || "");
+  if (!raw) {
+    return {
+      diff: "",
+      truncated: false,
+      omittedLines: 0,
+      omittedChars: 0,
+      totalLines: 0,
+      totalChars: 0,
+    };
+  }
+
+  const lines = raw.split("\n");
+  const lineLimited = lines.length > maxLines ? lines.slice(0, maxLines) : lines;
+  let displayText = lineLimited.join("\n");
+  if (displayText.length > maxChars) {
+    displayText = displayText.slice(0, Math.max(0, maxChars));
+  }
+
+  const omittedLines = Math.max(0, lines.length - lineLimited.length);
+  const omittedChars = Math.max(0, raw.length - displayText.length);
+  const truncated = omittedLines > 0 || omittedChars > 0;
+
+  if (truncated) {
+    const parts = [];
+    if (omittedLines > 0) parts.push(`${omittedLines} line(s)`);
+    if (omittedChars > 0) parts.push(`${omittedChars} char(s)`);
+    const suffix = parts.length > 0 ? parts.join(", ") : "content";
+    displayText = `${displayText}\n... [truncated ${suffix}]`;
+  }
+
+  return {
+    diff: displayText,
+    truncated,
+    omittedLines,
+    omittedChars,
+    totalLines: lines.length,
+    totalChars: raw.length,
+  };
+}
+
 function isStdioMaxBufferError(error) {
   const code = String(error?.code || "");
   const message = String(error?.message || "");
@@ -514,6 +683,98 @@ export function createToolset({
     await fs.mkdir(path.dirname(abs), { recursive: true });
     await fs.writeFile(abs, content, "utf8");
     return `Wrote ${content.length} bytes to ${relPath}`;
+  };
+
+  const editFile = async ({
+    path: relPath,
+    oldText,
+    newText,
+    old_text: oldTextAlias,
+    new_text: newTextAlias,
+  } = {}) => {
+    onToolStart?.("edit_file", { path: relPath });
+    const normalizedPath = String(relPath || "").trim();
+    if (!normalizedPath) throw new Error("Missing required parameter: path");
+
+    const needle = String(oldText ?? oldTextAlias ?? "");
+    const replacement = String(newText ?? newTextAlias ?? "");
+    if (!needle) {
+      throw new Error("Missing required parameter: oldText (or old_text)");
+    }
+
+    const abs = resolveInsideRoot(workspaceDir, normalizedPath);
+    let fileContent = "";
+    try {
+      fileContent = await fs.readFile(abs, "utf8");
+    } catch (error) {
+      if (error && typeof error === "object" && error.code === "ENOENT") {
+        throw new Error(`edit_file requires an existing file: ${normalizedPath}`);
+      }
+      throw error;
+    }
+
+    if (needle === fileContent && replacement !== fileContent) {
+      throw new Error("edit_file rejects whole-file replacements. Use write_file for complete rewrites.");
+    }
+
+    const matches = findAllMatchOffsets(fileContent, needle);
+    if (matches.length === 0) {
+      throw new Error("edit_file oldText was not found in the file");
+    }
+    if (matches.length > 1) {
+      throw new Error(`edit_file oldText must be unique, found ${matches.length} matches`);
+    }
+
+    const startOffset = matches[0];
+    const next = `${fileContent.slice(0, startOffset)}${replacement}${fileContent.slice(startOffset + needle.length)}`;
+    const changed = next !== fileContent;
+    if (changed) {
+      await fs.writeFile(abs, next, "utf8");
+    }
+
+    const editDiff = changed
+      ? buildEditDiff({
+          relPath: normalizedPath,
+          before: fileContent,
+          after: next,
+          startOffset,
+          oldText: needle,
+          newText: replacement,
+        })
+      : { diff: "", stats: { filesChanged: 0, insertions: 0, deletions: 0, hunks: 0, bodyTruncated: false, omittedBodyLines: 0 } };
+    const displayDiff = truncateDiffForDisplay(editDiff.diff);
+    const diffTruncated = Boolean(editDiff?.stats?.bodyTruncated || displayDiff.truncated);
+
+    return formatStructuredResult({
+      path: normalizedPath,
+      changed,
+      replacements: changed ? 1 : 0,
+      message: changed ? `Edited ${normalizedPath}: 1 replacement` : `No changes applied to ${normalizedPath}`,
+      details: {
+        diff: changed ? displayDiff.diff : "",
+        diffStat: changed
+          ? formatDiffStat({
+              filesChanged: Number(editDiff?.stats?.filesChanged || 1),
+              insertions: Number(editDiff?.stats?.insertions || 0),
+              deletions: Number(editDiff?.stats?.deletions || 0),
+            })
+          : "0 files changed, 0 insertions(+), 0 deletions(-)",
+        diffTruncated,
+        diffMeta: changed
+          ? {
+              omittedLines: Number(displayDiff.omittedLines || 0) + Number(editDiff?.stats?.omittedBodyLines || 0),
+              omittedChars: Number(displayDiff.omittedChars || 0),
+              totalLines: Number(displayDiff.totalLines || 0),
+              totalChars: Number(displayDiff.totalChars || 0),
+            }
+          : {
+              omittedLines: 0,
+              omittedChars: 0,
+              totalLines: 0,
+              totalChars: 0,
+            },
+      },
+    });
   };
 
   const listFiles = async ({
@@ -930,20 +1191,28 @@ export function createToolset({
   const searchFiles = async ({
     path: searchPath = ".",
     regex,
+    query,
     file_pattern: filePattern,
     max_results: maxResults = 50,
     case_sensitive: caseSensitive = false,
   } = {}) => {
+    const pattern =
+      typeof regex === "string" && regex.trim()
+        ? regex
+        : typeof query === "string"
+          ? query
+          : "";
     onToolStart?.("search_files", {
       path: searchPath,
-      regex,
+      regex: pattern,
+      query,
       file_pattern: filePattern,
       max_results: maxResults,
       case_sensitive: caseSensitive,
     });
 
-    if (!regex || typeof regex !== "string") {
-      throw new Error("Missing required parameter: regex (search pattern)");
+    if (!pattern || typeof pattern !== "string") {
+      throw new Error("Missing required parameter: regex or query (search pattern)");
     }
 
     const absPath = resolveInsideRoot(workspaceDir, searchPath);
@@ -954,7 +1223,7 @@ export function createToolset({
       return searchWithRipgrep({
         workspaceDir,
         absPath,
-        regex,
+        regex: pattern,
         filePattern,
         limit,
         caseSensitive,
@@ -966,7 +1235,7 @@ export function createToolset({
       return searchWithGrep({
         workspaceDir,
         absPath,
-        regex,
+        regex: pattern,
         filePattern,
         limit,
         caseSensitive,
@@ -977,7 +1246,7 @@ export function createToolset({
     return searchNative({
       workspaceDir,
       absPath,
-      regex,
+      regex: pattern,
       filePattern,
       limit,
       caseSensitive,
@@ -1079,6 +1348,7 @@ export function createToolset({
     read_file: readFile,
     read_files: readFiles,
     write_file: writeFile,
+    edit_file: editFile,
     apply_patch: applyPatch,
     replace_in_files: replaceInFiles,
     list_files: listFiles,

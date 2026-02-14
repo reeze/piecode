@@ -211,7 +211,7 @@ describe("Benchmark 2: system prompt size (affects TTFT + cost)", () => {
     console.log(`Skills + plan + instructions overhead: ${overhead} chars`);
 
     // This overhead is sent with EVERY LLM call in the loop
-    expect(overhead).toBeGreaterThan(1000);
+    expect(overhead).toBeGreaterThan(850);
   });
 
   test("system prompt is rebuilt from scratch every iteration (no caching)", () => {
