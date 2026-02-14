@@ -9,3 +9,4 @@ dist/*.tgz
 .piecode/shell
 .piecode/tasks
 .piecode/sessions
+.crush/
