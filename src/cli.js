@@ -1319,7 +1319,7 @@ function providerPrefix(kind) {
 function formatProviderModel(provider) {
   const prefix = providerPrefix(provider?.kind);
   const model = String(provider?.model || "").trim() || "unknown";
-  return `${prefix}/${model}`;
+  return `${model}(${prefix})`;
 }
 
 function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
@@ -1658,6 +1658,7 @@ async function handleSlashCommand(input, ctx) {
     refreshSkillIndex,
     tui,
     setModel,
+    setStatusBar,
     settings,
     modelCatalogRef,
     llmLastRef,
@@ -1668,6 +1669,11 @@ async function handleSlashCommand(input, ctx) {
   if (!raw.startsWith("/")) return { done: false, handled: false };
   const normalized = raw.replace(/\s+/g, " ");
   const lower = normalized.toLowerCase();
+  const formatModelStatus = (provider, prefix = "current model") => {
+    const modelLabel = formatProviderModel(provider);
+    const contextWindow = formatCompactNumber(inferContextWindow(provider?.model));
+    return `${prefix}: ${modelLabel} | context window: ${contextWindow}`;
+  };
 
   if (lower === "/exit" || lower === "/quit") return { done: true, handled: true };
   if (lower === "/help") {
@@ -1747,13 +1753,20 @@ async function handleSlashCommand(input, ctx) {
   }
   if (lower === "/model") {
     const p = providerRef.value;
-    logLine(`active model: ${formatProviderModel(p)}`);
-    logLine("usage: /model list | /model <model-id>");
+    if (tui && typeof setStatusBar === "function") {
+      setStatusBar(formatModelStatus(p, "current model"));
+    } else {
+      logLine(formatModelStatus(p, "current model"));
+      logLine("usage: /model list | /model <model-id>");
+    }
     return { done: false, handled: true };
   }
   if (lower === "/model list") {
-    const p = providerRef.value;
-    logLine(`active model: ${formatProviderModel(p)}`);
+    if (tui && typeof setStatusBar === "function") {
+      setStatusBar(formatModelStatus(providerRef.value, "current model"));
+    } else {
+      logLine(formatModelStatus(providerRef.value, "current model"));
+    }
     let listed = false;
     try {
       const groups = await fetchOpenRouterModelGroups({ settings });
@@ -1784,7 +1797,11 @@ async function handleSlashCommand(input, ctx) {
     }
     try {
       const nextProvider = await setModel(targetModel);
-      logLine(`model switched: ${formatProviderModel(nextProvider)}`);
+      if (tui && typeof setStatusBar === "function") {
+        setStatusBar(formatModelStatus(nextProvider, "model switched"));
+      } else {
+        logLine(formatModelStatus(nextProvider, "model switched"));
+      }
     } catch (err) {
       logLine(`unable to switch model: ${err.message}`);
       if (
@@ -2025,6 +2042,7 @@ async function main() {
   };
   const taskTraceRef = { seq: 0, current: null, sessionId: makeSessionId(), sessionDir: "" };
   const currentInputRef = { value: "" };
+  const keepIdleStatusRef = { value: false };
   const todosRef = { value: [] };
   const todoAutoTrackRef = { value: false };
   const fileMentionIndexRef = { files: [], loading: false, lastLoadedAt: 0 };
@@ -2154,6 +2172,13 @@ async function main() {
   const logLine = createLogger(tui, display, () => currentInputRef.value, (line) =>
     recordTaskLog(taskTraceRef, line)
   );
+  const setStatusBar = (message) => {
+    if (!tui) return;
+    const text = String(message || "").trim();
+    if (!text) return;
+    keepIdleStatusRef.value = true;
+    tui.render(currentInputRef.value, text);
+  };
   let escAbortTimer = null;
   let onKeypress = null;
   let onMouseData = null;
@@ -2750,25 +2775,32 @@ async function main() {
     }
     if (tui) {
       tui.onModelCall(formatProviderModel(nextProvider));
+      tui.setContextUsage(0, inferContextWindow(nextProvider?.model));
       tui.onThinkingDone();
     }
     return nextProvider;
   };
 
   const askApproval = async (q, details = null) => {
+    let approvalMeta = null;
     if (q === "shell" && details && typeof details === "object") {
       const classificationLevel = String(details?.classification?.level || "unclassified");
       if (classificationLevel === "safe") return true;
       const reason = String(details?.classification?.reason || "");
       const cmdPreview = summarizeForLog(String(details?.command || ""), 220);
       q = `shell: ${cmdPreview}${reason ? ` (${reason})` : ""}`;
+      approvalMeta = {
+        question: "Approve shell command?",
+        command: cmdPreview,
+        reason,
+      };
     }
     let ans = "";
     const defaultYes = false;
     if (tui) {
       const compactPrompt = q.replace(/\s+/g, " ").trim();
       approvalActiveRef.value = true;
-      tui.setApprovalPrompt(compactPrompt, defaultYes);
+      tui.setApprovalPrompt(compactPrompt, defaultYes, approvalMeta);
       const approved = await waitForTuiApproval({ stdinStream: keypressSource, defaultYes });
       approvalActiveRef.value = false;
       tui.clearApprovalPrompt();
@@ -2892,7 +2924,7 @@ async function main() {
         const sentTokens = estimateTokenCount(evt.payload);
         if (tui) {
           const used = sentTokens;
-          const limit = inferContextWindow(providerRef.value.model);
+          const limit = inferContextWindow(evt.model || providerRef.value.model);
           tui.setContextUsage(used, limit);
           tui.addTokenUsage({ sent: sentTokens, received: 0 });
         }
@@ -3106,6 +3138,7 @@ async function main() {
 
   if (tui) {
     tui.start();
+    tui.setContextUsage(0, inferContextWindow(providerRef.value?.model));
     emitStartupLogo(tui, providerRef.value, workspaceDir, stdout.columns || 100);
     if (activeSkillsRef.value.length > 0) {
       tui.event(`skills: ${activeSkillsRef.value.map((s) => s.name).join(", ")}`);
@@ -3136,7 +3169,11 @@ async function main() {
 
   while (true) {
     currentInputRef.value = "";
-    if (tui) tui.render(currentInputRef.value, "waiting for input");
+    if (tui) {
+      const preserveStatus = keepIdleStatusRef.value;
+      keepIdleStatusRef.value = false;
+      tui.render(currentInputRef.value, preserveStatus ? "" : "waiting for input");
+    }
     let rawInput = "";
     try {
       rawInput = await rl.question(tui ? "" : "\n> ");
@@ -3258,6 +3295,7 @@ async function main() {
       refreshSkillIndex,
       tui,
       setModel: switchModel,
+      setStatusBar,
       settings,
       modelCatalogRef,
       todosRef,

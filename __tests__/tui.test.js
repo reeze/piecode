@@ -70,11 +70,14 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines("[task] simplify repo")[0])).toContain("Task: simplify repo");
     expect(tui.formatTimelineLines("[model] seed-openai-compatible:doubao")).toEqual([]);
     expect(tui.formatTimelineLines("[plan] budget=3 - scoped plan")).toEqual([]);
-    expect(tui.formatTimelineLines('[run] shell command="echo hi"')).toEqual([]);
-    expect(stripAnsi(tui.formatTimelineLines("[tool] shell (echo hi)")[0])).toContain("Tool: shell (echo hi)");
-    expect(stripAnsi(tui.formatTimelineLines("[run] shell echo hi")[0])).toContain("Bash(echo hi)");
+    expect(stripAnsi(tui.formatTimelineLines('[run] shell command="echo hi"')[0])).toContain("Bash(echo hi)");
+    expect(stripAnsi(tui.formatTimelineLines("[run] shell echo hi")[0])).toContain("[~]");
+    expect(tui.formatTimelineLines("[tool] shell (echo hi)")).toEqual([]);
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("Tool: read_file");
-    expect(stripAnsi(tui.formatTimelineLines("[result] done")[0])).toContain("✓ done");
+    expect(stripAnsi(tui.formatTimelineLines("[result] done")[0])).toContain("[ok] done");
+    expect(stripAnsi(tui.formatTimelineLines("[result] shell failed | time: 2s")[0])).toContain(
+      "[x] shell failed | time: 2s"
+    );
     expect(stripAnsi(tui.formatTimelineLines("[banner-1] ██████")[0])).toContain("██████");
     expect(stripAnsi(tui.formatTimelineLines("[banner-meta] model: seed:model")[0])).toContain("model: seed:model");
     expect(stripAnsi(tui.formatTimelineLines("[banner-hint] keys: CTRL+L")[0])).toContain("keys: CTRL+L");
@@ -96,6 +99,30 @@ describe("tui usability", () => {
     const longResponse = `[response] ${"a".repeat(9000)}`;
     const longLines = tui.formatTimelineLines(longResponse).map((line) => stripAnsi(line));
     expect(longLines.join("\n")).toContain("[trimmed ");
+  });
+
+  test("formatApprovalLines separates question, command, and reason without duplication", () => {
+    const out = createOut();
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.setApprovalPrompt(
+      'shell: curl -sL "https://agentskills.io/specification" (command is neither known safe nor explicitly dangerous)',
+      false
+    );
+
+    const lines = tui.formatApprovalLines(220).map((line) => stripAnsi(line));
+    expect(lines.join("\n")).toContain("Question: Approve shell command?");
+    expect(lines.join("\n")).toContain('Command: curl -sL "https://agentskills.io/specification"');
+    expect(lines.join("\n")).toContain("Details: command is neither known safe nor explicitly dangerous");
+    expect(lines.join("\n")).not.toContain(
+      'Details: shell: curl -sL "https://agentskills.io/specification" (command is neither known safe nor explicitly dangerous)'
+    );
   });
 
   test("overlay renders section labels and hint text", () => {
@@ -434,7 +461,7 @@ describe("tui usability", () => {
     const tui = new SimpleTui({
       out,
       workspaceDir: "/tmp/work",
-      providerLabel: () => "seed:model",
+      providerLabel: () => "gpt-5.3-codex(codex)",
       getSkillsLabel: () => "none",
       getApprovalLabel: () => "off",
     });
@@ -442,9 +469,37 @@ describe("tui usability", () => {
     tui.start();
     tui.setModelSuggestions(["openai/gpt-4.1-mini", "anthropic/claude-3.7-sonnet"], 1);
     const frame = latestFrame(out);
-    expect(frame).toContain("models");
+    expect(frame).toContain("models <gpt-5.3-codex(codex)>");
     expect(frame).toContain("> anthropic/claude-3.7-sonnet");
     expect(frame).toContain("openai/gpt-4.1-mini");
+  });
+
+  test("model suggestions scroll with hidden-above/below indicators", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "gpt-5.3-codex(codex)",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    const models = Array.from({ length: 12 }, (_v, i) => `provider/model-${i + 1}`);
+    tui.start();
+    tui.setModelSuggestions(models, 0);
+    let frame = latestFrame(out);
+    expect(frame).toContain("> provider/model-1");
+    expect(frame).toContain("provider/model-8");
+    expect(frame).toContain("... 4 below");
+    expect(frame).not.toContain("provider/model-9");
+
+    tui.setModelSuggestions(models, 10);
+    frame = latestFrame(out);
+    expect(frame).toContain("> provider/model-11");
+    expect(frame).toContain("... 3 above");
+    expect(frame).toContain("... 1 below");
+    expect(frame).not.toMatch(/\n\s*> provider\/model-1(?:\s|\n|$)/);
+    expect(frame).not.toMatch(/\n\s+provider\/model-1(?:\s|\n|$)/);
   });
 
   test("command suggestions render with highlighted selection", () => {

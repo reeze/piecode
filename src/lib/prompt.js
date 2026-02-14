@@ -1,3 +1,64 @@
+function renderActiveSkillsSection(activeSkills = []) {
+  const skills = Array.isArray(activeSkills) ? activeSkills : [];
+  if (skills.length === 0) return [];
+
+  const lines = ["", "ACTIVE SKILLS:"];
+  for (const rawSkill of skills) {
+    if (typeof rawSkill === "string") {
+      const name = rawSkill.trim();
+      if (!name) continue;
+      lines.push(`- ${name}`);
+      continue;
+    }
+    if (!rawSkill || typeof rawSkill !== "object") continue;
+    const name = String(rawSkill.name || rawSkill.id || "unnamed-skill").trim();
+    const path = String(rawSkill.path || "").trim();
+    const content = String(rawSkill.content || "").trim();
+    const label = path ? `${name} (${path})` : name;
+    lines.push(`- ${label}`);
+    if (content) {
+      const excerpt = content
+        .split("\n")
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .slice(0, 3)
+        .join(" ");
+      if (excerpt) lines.push(`  guidance: ${excerpt.slice(0, 260)}`);
+    }
+  }
+  if (lines.length === 2) return [];
+  lines.push("Apply these skill instructions when relevant, but keep output focused on the user request.");
+  return lines;
+}
+
+function renderActivePlanSection(activePlan = null) {
+  if (!activePlan) return [];
+  if (typeof activePlan === "string") {
+    const text = activePlan.trim();
+    if (!text) return [];
+    return ["", "ACTIVE PLAN:", text, "Follow this plan unless tool evidence requires an adjustment."];
+  }
+  if (typeof activePlan !== "object") return [];
+
+  const summary = String(activePlan.summary || "").trim();
+  const steps = Array.isArray(activePlan.steps)
+    ? activePlan.steps.map((step) => String(step || "").trim()).filter(Boolean)
+    : [];
+  const budget = Number(activePlan.toolBudget);
+
+  if (!summary && steps.length === 0 && !Number.isFinite(budget)) return [];
+
+  const lines = ["", "ACTIVE PLAN:"];
+  if (summary) lines.push(`Summary: ${summary}`);
+  if (steps.length > 0) {
+    lines.push("Steps:");
+    steps.slice(0, 8).forEach((step, idx) => lines.push(`${idx + 1}. ${step}`));
+  }
+  if (Number.isFinite(budget)) lines.push(`Tool budget: ${Math.max(1, Math.round(budget))}`);
+  lines.push("Follow this plan unless tool evidence requires an adjustment.");
+  return lines;
+}
+
 export function buildSystemPrompt({
   workspaceDir,
   autoApprove,
@@ -57,6 +118,13 @@ export function buildSystemPrompt({
     "- After each tool result, either: (a) proceed with next necessary step, or (b) finalize if enough evidence exists",
     "- When blocked by missing requirements, ask one concise clarifying question",
 
+    "COMPLEX TASK EXECUTION:",
+    "- For multi-step or high-uncertainty tasks, briefly restate a 3-7 step plan before acting",
+    "- Keep one concrete step in progress at a time and do not skip validation-critical steps",
+    "- Prefer incremental changes over broad rewrites; verify behavior after each meaningful edit",
+    "- If a command or approach fails twice, switch strategy using new evidence instead of retrying blindly",
+    "- Before finalizing, confirm deliverables, mention validation status, and clearly call out remaining risks",
+
     "SEARCH BEST PRACTICES:",
     "- Use search_files to find code patterns, function definitions, or references",
     "- Use file_pattern to narrow search (e.g., '*.js' for JavaScript files only)",
@@ -101,20 +169,11 @@ export function buildSystemPrompt({
   }
 
   if (activeSkills.length > 0) {
-    sections.push(
-      "",
-      `Active skills: ${activeSkills.join(", ")}`,
-      "These skills are currently enabled and should be applied to relevant tasks."
-    );
+    sections.push(...renderActiveSkillsSection(activeSkills));
   }
 
   if (activePlan) {
-    sections.push(
-      "",
-      "ACTIVE PLAN:",
-      activePlan,
-      "Follow this plan to complete the current task."
-    );
+    sections.push(...renderActivePlanSection(activePlan));
   }
 
   if (projectInstructions) {

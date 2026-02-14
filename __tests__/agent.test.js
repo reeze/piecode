@@ -1,4 +1,7 @@
 import { Agent } from "../src/lib/agent.js";
+import os from "os";
+import path from "path";
+import { mkdtemp, readFile, rm } from "fs/promises";
 
 function createAgentWithProvider(provider = {}) {
   return new Agent({
@@ -920,5 +923,106 @@ describe("agent context controls", () => {
 
     const result = await agent.runTurn("do those things: inspect workspace and verify cwd");
     expect(result).toContain("same verified step result");
+  });
+
+  test("complex prompt can generate a command-line scientific calculator", async () => {
+    const workspaceDir = await mkdtemp(path.join(os.tmpdir(), "piecode-scicalc-"));
+    const llmSystemPrompts = [];
+    let calls = 0;
+    const calculatorSource = [
+      "#!/usr/bin/env node",
+      "const [op, ...args] = process.argv.slice(2);",
+      "const nums = args.map((v) => Number(v));",
+      "if (!op) {",
+      "  console.log('Usage: scicalc <op> <numbers...>');",
+      "  process.exit(1);",
+      "}",
+      "const unary = (fn) => {",
+      "  if (nums.length !== 1 || Number.isNaN(nums[0])) throw new Error('Expected one numeric argument');",
+      "  return fn(nums[0]);",
+      "};",
+      "const binary = (fn) => {",
+      "  if (nums.length !== 2 || Number.isNaN(nums[0]) || Number.isNaN(nums[1])) throw new Error('Expected two numeric arguments');",
+      "  return fn(nums[0], nums[1]);",
+      "};",
+      "let result;",
+      "switch (op) {",
+      "  case 'add': result = nums.reduce((a, b) => a + b, 0); break;",
+      "  case 'sub': result = binary((a, b) => a - b); break;",
+      "  case 'mul': result = nums.reduce((a, b) => a * b, 1); break;",
+      "  case 'div': result = binary((a, b) => a / b); break;",
+      "  case 'pow': result = binary((a, b) => Math.pow(a, b)); break;",
+      "  case 'sqrt': result = unary((a) => Math.sqrt(a)); break;",
+      "  case 'sin': result = unary((a) => Math.sin(a)); break;",
+      "  case 'cos': result = unary((a) => Math.cos(a)); break;",
+      "  case 'tan': result = unary((a) => Math.tan(a)); break;",
+      "  case 'log': result = unary((a) => Math.log(a)); break;",
+      "  default:",
+      "    throw new Error(`Unknown operation: ${op}`);",
+      "}",
+      "console.log(result);",
+    ].join("\n");
+
+    try {
+      const agent = new Agent({
+        provider: {
+          kind: "test-provider",
+          model: "test-model",
+          async complete(args = {}) {
+            llmSystemPrompts.push(String(args?.systemPrompt || ""));
+            calls += 1;
+            if (calls === 1) {
+              return JSON.stringify({
+                type: "tool_use",
+                tool: "write_file",
+                input: {
+                  path: "bin/scicalc.js",
+                  content: calculatorSource,
+                },
+                reason: "Create the scientific calculator CLI entry point",
+              });
+            }
+            if (calls === 2) {
+              return JSON.stringify({
+                type: "tool_use",
+                tool: "write_file",
+                input: {
+                  path: "README.scicalc.md",
+                  content:
+                    "## Scientific Calculator CLI\n\nUsage:\n- `node bin/scicalc.js add 1 2`\n- `node bin/scicalc.js sin 0.5`\n",
+                },
+                reason: "Add usage documentation",
+              });
+            }
+            return JSON.stringify({
+              type: "final",
+              message: "Implemented `bin/scicalc.js` and added `README.scicalc.md` usage examples.",
+            });
+          },
+        },
+        workspaceDir,
+        autoApproveRef: { value: true },
+        askApproval: async () => true,
+        activeSkillsRef: { value: [] },
+        projectInstructionsRef: { value: null },
+      });
+
+      const result = await agent.runTurn(
+        "Build a command-line scientific calculator with trig/log/power operations and add usage docs."
+      );
+      const script = await readFile(path.join(workspaceDir, "bin/scicalc.js"), "utf8");
+      const readme = await readFile(path.join(workspaceDir, "README.scicalc.md"), "utf8");
+
+      expect(result).toContain("bin/scicalc.js");
+      expect(script).toContain("process.argv.slice(2)");
+      expect(script).toContain("case 'sin'");
+      expect(script).toContain("case 'sqrt'");
+      expect(script).toContain("case 'pow'");
+      expect(readme).toContain("Scientific Calculator CLI");
+      expect(readme).toContain("node bin/scicalc.js");
+      expect(llmSystemPrompts[0]).toContain("COMPLEX TASK EXECUTION:");
+    } finally {
+      await rm(workspaceDir, { recursive: true, force: true });
+    }
   });
 });

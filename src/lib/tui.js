@@ -256,6 +256,7 @@ export class SimpleTui {
     this.lastInputRow = 0;
     this.lastInputLine = "";
     this.approvalPrompt = "";
+    this.approvalMeta = null;
     this.approvalDefaultYes = false;
     this.inputHint = "";
     this.currentInput = "";
@@ -264,6 +265,8 @@ export class SimpleTui {
     this.modelSuggestionsVisible = false;
     this.modelSuggestions = [];
     this.modelSuggestionIndex = 0;
+    this.modelSuggestionWindowStart = 0;
+    this.modelSuggestionMaxVisible = 8;
     this.commandSuggestionsVisible = false;
     this.commandSuggestions = [];
     this.commandSuggestionIndex = 0;
@@ -551,8 +554,17 @@ export class SimpleTui {
     if (this.showTodoPanel) this.render();
   }
 
-  setApprovalPrompt(prompt, defaultYes = false) {
+  setApprovalPrompt(prompt, defaultYes = false, meta = null) {
     this.approvalPrompt = String(prompt || "").trim();
+    this.approvalMeta =
+      meta && typeof meta === "object"
+        ? {
+            question: String(meta.question || "").trim(),
+            command: String(meta.command || "").trim(),
+            reason: String(meta.reason || "").trim(),
+            details: String(meta.details || "").trim(),
+          }
+        : null;
     this.approvalDefaultYes = Boolean(defaultYes);
     this.lastStatus = "Awaiting approval";
     this.render();
@@ -560,6 +572,7 @@ export class SimpleTui {
 
   clearApprovalPrompt() {
     this.approvalPrompt = "";
+    this.approvalMeta = null;
     this.approvalDefaultYes = false;
     this.render();
   }
@@ -740,13 +753,15 @@ export class SimpleTui {
 
   setModelSuggestions(options, selectedIndex = 0) {
     const list = Array.isArray(options) ? options.map((item) => String(item || "")).filter(Boolean) : [];
-    this.modelSuggestions = list.slice(0, 8);
+    this.modelSuggestions = list;
     this.modelSuggestionsVisible = this.modelSuggestions.length > 0;
     if (!this.modelSuggestionsVisible) {
       this.modelSuggestionIndex = 0;
+      this.modelSuggestionWindowStart = 0;
     } else {
       const clamped = Math.max(0, Math.min(this.modelSuggestions.length - 1, Number(selectedIndex) || 0));
       this.modelSuggestionIndex = clamped;
+      this.ensureModelSuggestionWindow();
     }
     this.render();
   }
@@ -756,7 +771,45 @@ export class SimpleTui {
     this.modelSuggestionsVisible = false;
     this.modelSuggestions = [];
     this.modelSuggestionIndex = 0;
+    this.modelSuggestionWindowStart = 0;
     this.render();
+  }
+
+  ensureModelSuggestionWindow() {
+    const total = this.modelSuggestions.length;
+    if (total <= 0) {
+      this.modelSuggestionIndex = 0;
+      this.modelSuggestionWindowStart = 0;
+      return;
+    }
+    const maxVisible = Math.max(1, Number(this.modelSuggestionMaxVisible) || 8);
+    const maxStart = Math.max(0, total - maxVisible);
+    const clampedIndex = Math.max(0, Math.min(total - 1, Number(this.modelSuggestionIndex) || 0));
+    let start = Math.max(0, Math.min(maxStart, Number(this.modelSuggestionWindowStart) || 0));
+    if (clampedIndex < start) start = clampedIndex;
+    if (clampedIndex >= start + maxVisible) start = clampedIndex - maxVisible + 1;
+    this.modelSuggestionIndex = clampedIndex;
+    this.modelSuggestionWindowStart = Math.max(0, Math.min(maxStart, start));
+  }
+
+  getModelSuggestionViewport() {
+    this.ensureModelSuggestionWindow();
+    const total = this.modelSuggestions.length;
+    if (total <= 0) {
+      return { total: 0, start: 0, end: 0, items: [], hiddenAbove: 0, hiddenBelow: 0 };
+    }
+    const maxVisible = Math.max(1, Number(this.modelSuggestionMaxVisible) || 8);
+    const start = this.modelSuggestionWindowStart;
+    const end = Math.min(total, start + maxVisible);
+    const items = this.modelSuggestions.slice(start, end);
+    return {
+      total,
+      start,
+      end,
+      items,
+      hiddenAbove: start,
+      hiddenBelow: Math.max(0, total - end),
+    };
   }
 
   setCommandSuggestions(options, selectedIndex = 0, label = "commands") {
@@ -784,13 +837,41 @@ export class SimpleTui {
 
   formatApprovalLines(width) {
     const prompt = String(this.approvalPrompt || "");
+    const meta = this.approvalMeta && typeof this.approvalMeta === "object" ? this.approvalMeta : null;
     const lines = [];
-    const cmdMatch = prompt.match(/\$\s+([^\n]+)$/);
-    const command = cmdMatch?.[1] ? String(cmdMatch[1]).trim() : "";
-    const question = prompt
-      .replace(/\$\s+[^\n]+$/m, "")
-      .replace(/Approve\s*\[[^\]]+\]\s*:?\s*$/i, "")
-      .trim();
+    const normalize = (value) => String(value || "").replace(/\s+/g, " ").trim().toLowerCase();
+
+    let question = String(meta?.question || "").trim();
+    let command = String(meta?.command || "").trim();
+    let detailsText = String(meta?.reason || meta?.details || "").trim();
+
+    if (!question || !command || !detailsText) {
+      const cmdMatch = prompt.match(/\$\s+([^\n]+)$/m);
+      const promptCommand = cmdMatch?.[1] ? String(cmdMatch[1]).trim() : "";
+      const promptQuestion = prompt
+        .replace(/\$\s+[^\n]+$/m, "")
+        .replace(/Approve\s*\[[^\]]+\]\s*:?\s*/i, "")
+        .trim();
+      if (!command && promptCommand) command = promptCommand;
+      if (!question && promptQuestion) question = promptQuestion;
+    }
+
+    if (question.toLowerCase().startsWith("shell:")) {
+      let shellBody = question.slice("shell:".length).trim();
+      let shellReason = "";
+      const trailingReason = shellBody.match(/\s+\(([^()]*)\)\s*$/);
+      if (trailingReason?.[1]) {
+        shellReason = String(trailingReason[1]).trim();
+        shellBody = shellBody.slice(0, trailingReason.index).trim();
+      }
+      if (!command && shellBody) command = shellBody;
+      if (!detailsText && shellReason) detailsText = shellReason;
+      question = "Approve shell command?";
+    }
+
+    if (!question && command) {
+      question = "Approve command execution?";
+    }
 
     lines.push(color(" APPROVAL REQUIRED", "1;33"));
     if (question) {
@@ -798,8 +879,12 @@ export class SimpleTui {
     }
     if (command) {
       lines.push(truncateLine(` ${color("Command:", "1;35")} ${color(command, "37")}`, width));
-    } else if (prompt) {
-      lines.push(truncateLine(` ${color("Details:", "1;35")} ${prompt}`, width));
+    }
+    if (!detailsText && prompt && normalize(prompt) !== normalize(question) && normalize(prompt) !== normalize(command)) {
+      detailsText = prompt;
+    }
+    if (detailsText && normalize(detailsText) !== normalize(question)) {
+      lines.push(truncateLine(` ${color("Details:", "1;35")} ${detailsText}`, width));
     }
     const choiceLine = this.approvalDefaultYes
       ? `${color("[Y]", "1;32")}es  ${color("[N]", "1;31")}o  ${color("[ENTER]", "1;33")}=${color("Yes", "32")}`
@@ -839,10 +924,6 @@ export class SimpleTui {
       return padAll([color(`Thought: ${details || "<empty>"}`, "35"), ""]);
     }
     if (line.startsWith("[run] shell")) {
-      if (/command=("[^"]*"|\S+)/.test(line)) {
-        // Structured shell runs from tool_start duplicate the `[tool] shell ...` entry.
-        return [];
-      }
       const m = line.match(/command=("[^"]*"|\\S+)/);
       const approvalMatch = line.match(/approval=("[^"]*"|\\S+)/);
       const shortMatch = line.match(/^\[run\]\s+shell\s+(.+)$/);
@@ -871,12 +952,16 @@ export class SimpleTui {
         approval === "approved"
           ? color("[APPROVED]", "1;33")
           : approval === "auto"
-            ? color("[AUTO]", "2;32")
-            : "";
-      return padAll([color(`Bash(${safeDisplay})`, "36") + (tag ? ` ${tag}` : ""), color("L Running...", "2;37"), ""]);
+          ? color("[AUTO]", "2;32")
+          : "";
+      return padAll([`${color("[~]", "1;33")} ${color(`Bash(${safeDisplay})`, "36")}${tag ? ` ${tag}` : ""}`, ""]);
     }
     if (line.startsWith("[tool] ")) {
       const body = line.slice(7).trim();
+      if (/^shell\b/i.test(body)) {
+        // Shell tool usage is rendered from the `[run] shell ...` entry to avoid duplicate lines.
+        return [];
+      }
       return padAll([color(`Tool: ${body}`, "36")]);
     }
     if (line.startsWith("[response] ")) {
@@ -887,7 +972,13 @@ export class SimpleTui {
       return padAll([...chunks, ""]);
     }
     if (line.startsWith("[result] ")) {
-      return padAll([color(`✓ ${line.slice(9).trim()}`, "2;37"), ""]);
+      const body = line.slice(9).trim();
+      const lower = body.toLowerCase();
+      const failed = /\b(fail(?:ed|ure)?|error|aborted|denied|timeout|timed out)\b/.test(lower);
+      const ok = !failed && /\b(done|ok|success|succeeded|completed)\b/.test(lower);
+      const icon = failed ? "[x]" : ok ? "[ok]" : "[i]";
+      const iconColor = failed ? "1;31" : ok ? "1;32" : "2;37";
+      return padAll([`${color(icon, iconColor)} ${color(body, "2;37")}`, ""]);
     }
     if (line.startsWith("[banner-1] ")) {
       return [color(line.slice(11), "1;82")];
@@ -1158,7 +1249,13 @@ export class SimpleTui {
     const approvalContentLines = this.approvalPrompt ? this.formatApprovalLines(width) : [];
     const approvalLines = this.approvalPrompt ? 1 + approvalContentLines.length : 0;
     const commandSuggestionLines = this.commandSuggestionsVisible ? (1 + this.commandSuggestions.length) : 0;
-    const modelSuggestionLines = this.modelSuggestionsVisible ? (1 + this.modelSuggestions.length) : 0;
+    const modelSuggestionViewport = this.modelSuggestionsVisible ? this.getModelSuggestionViewport() : null;
+    const modelSuggestionLines = modelSuggestionViewport
+      ? 1 +
+        modelSuggestionViewport.items.length +
+        (modelSuggestionViewport.hiddenAbove > 0 ? 1 : 0) +
+        (modelSuggestionViewport.hiddenBelow > 0 ? 1 : 0)
+      : 0;
     const hintLines = this.inputHint ? 1 : 0;
     const thinkingLines = this.thinking ? 1 : 0;
     const thoughtWrapped = this.thoughtStreamVisible ? wrapText(this.thoughtStreamText, width) : [];
@@ -1253,12 +1350,23 @@ export class SimpleTui {
 
     const modelSuggestionBlock = this.modelSuggestionsVisible
       ? [
-          color(" models", "2;37"),
-          ...this.modelSuggestions.map((modelId, idx) => {
-            const selected = idx === this.modelSuggestionIndex;
+          (() => {
+            const current = String(this.providerLabel?.() || this.modelName || "").trim();
+            const label = current ? ` models <${current}>` : " models";
+            return color(label, "2;37");
+          })(),
+          ...(modelSuggestionViewport && modelSuggestionViewport.hiddenAbove > 0
+            ? [truncateLine(` ${color(`... ${modelSuggestionViewport.hiddenAbove} above`, "2;37")}`, width)]
+            : []),
+          ...((modelSuggestionViewport?.items || []).map((modelId, offset) => {
+            const absoluteIndex = (modelSuggestionViewport?.start || 0) + offset;
+            const selected = absoluteIndex === this.modelSuggestionIndex;
             const text = selected ? color(`> ${modelId}`, "1;32") : color(`  ${modelId}`, "2;37");
             return truncateLine(` ${text}`, width);
-          }),
+          })),
+          ...(modelSuggestionViewport && modelSuggestionViewport.hiddenBelow > 0
+            ? [truncateLine(` ${color(`... ${modelSuggestionViewport.hiddenBelow} below`, "2;37")}`, width)]
+            : []),
         ]
       : [];
 
