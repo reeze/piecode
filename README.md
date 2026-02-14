@@ -127,6 +127,32 @@ One-shot prompt:
 node src/cli.js --prompt "inspect this repo and suggest next steps"
 ```
 
+## Benchmarking
+
+Run Terminal-Bench 2.0 against PieCode using your existing `~/.piecode/settings.json` provider/model config:
+
+```bash
+# default smoke task (hello-world)
+./scripts/run-terminal-bench.sh
+
+# run specific tasks
+./scripts/run-terminal-bench.sh \
+  --task-id hello-world \
+  --task-id broken-python \
+  --task-id fix-permissions
+```
+
+Notes:
+
+- The script clones `terminal-bench` into `/tmp/terminal-bench` if needed.
+- Results are written to `/tmp/piecode-tb-runs/<run-id>/results.json`.
+- Override settings path with `PIECODE_SETTINGS_PATH=/path/to/settings.json`.
+- If you use OrbStack, set Docker socket explicitly:
+
+```bash
+DOCKER_HOST=unix:///Users/$USER/.orbstack/run/docker.sock ./scripts/run-terminal-bench.sh
+```
+
 ## Interactive Commands
 
 - `/help` show help

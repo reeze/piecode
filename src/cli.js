@@ -3208,6 +3208,11 @@ async function main() {
     skillIndex
   );
   const autoApproveRef = { value: false };
+  const oneShotPromptMode = args.prompt !== null;
+  if (oneShotPromptMode) {
+    // One-shot mode has no interactive approval channel; auto-approve tool prompts.
+    autoApproveRef.value = true;
+  }
   const historyFile = getHistoryFilePath();
   const initialHistory = await loadHistory(historyFile);
   const useTui = args.tui || process.env.PIECODE_TUI === "1";
@@ -4064,6 +4069,17 @@ async function main() {
     }
     let ans = "";
     const defaultYes = false;
+    const nonInteractiveApproval =
+      !tui && (oneShotPromptMode || !filteredInput.isTTY || isReadlineClosed());
+    if (nonInteractiveApproval) {
+      const approved = Boolean(autoApproveRef.value || oneShotPromptMode);
+      logLine(
+        approved
+          ? `[approve] auto-approved ${q} (non-interactive mode)`
+          : `[approve] denied ${q} (non-interactive mode)`
+      );
+      return approved;
+    }
     if (tui) {
       const compactPrompt = q.replace(/\s+/g, " ").trim();
       approvalActiveRef.value = true;
@@ -4432,6 +4448,30 @@ async function main() {
     return nextHub;
   };
 
+  let shutdownComplete = false;
+  const shutdown = async () => {
+    if (shutdownComplete) return;
+    shutdownComplete = true;
+    try {
+      await saveHistory(historyFile, rl.history);
+    } finally {
+      if (mcpHubRef.value) await mcpHubRef.value.close();
+      if (onKeypress && keypressSource && typeof keypressSource.off === "function") {
+        keypressSource.off("keypress", onKeypress);
+      }
+      if (escAbortTimer) clearTimeout(escAbortTimer);
+      if (onMouseData) filteredInput.off("data", onMouseData);
+      stdin.unpipe(stdinFilter);
+      destroyKeypressSource();
+      if (onResize) {
+        stdout.off("resize", onResize);
+        process.off("SIGWINCH", onResize);
+      }
+      if (tui) tui.stop();
+      rl.close();
+    }
+  };
+
   if (args.prompt !== null) {
     try {
       startTaskTrace(taskTraceRef, { input: args.prompt, kind: "agent" });
@@ -4477,9 +4517,7 @@ async function main() {
         if (tui) refreshTuiContextUsage();
       }
     } finally {
-      if (mcpHubRef.value) await mcpHubRef.value.close();
-      await saveHistory(historyFile, rl.history);
-      rl.close();
+      await shutdown();
     }
     return;
   }
@@ -4744,24 +4782,7 @@ async function main() {
     currentInputRef.value = "";
   }
 
-  try {
-    await saveHistory(historyFile, rl.history);
-  } finally {
-    if (mcpHubRef.value) await mcpHubRef.value.close();
-    if (onKeypress && keypressSource && typeof keypressSource.off === "function") {
-      keypressSource.off("keypress", onKeypress);
-    }
-    if (escAbortTimer) clearTimeout(escAbortTimer);
-    if (onMouseData) filteredInput.off("data", onMouseData);
-    stdin.unpipe(stdinFilter);
-    destroyKeypressSource();
-    if (onResize) {
-      stdout.off("resize", onResize);
-      process.off("SIGWINCH", onResize);
-    }
-    if (tui) tui.stop();
-    rl.close();
-  }
+  await shutdown();
 }
 
 main().catch((err) => {
