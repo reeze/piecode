@@ -331,6 +331,27 @@ describe("tui usability", () => {
     expect(frame).not.toContain("TODO(");
   });
 
+  test("all completed todos show a transient left notice that clears next turn", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.setTodos([{ id: "todo-1", content: "finish", status: "completed" }]);
+    let frame = latestFrame(out);
+    expect(frame).toContain("notice: TODO completed");
+
+    tui.beginTurn();
+    frame = latestFrame(out);
+    expect(frame).not.toContain("notice: TODO completed");
+    expect(frame).toContain("TODO(1/1)");
+  });
+
   test("explicit status message persists across input rerenders", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({

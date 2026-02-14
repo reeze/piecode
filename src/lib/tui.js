@@ -281,6 +281,7 @@ export class SimpleTui {
       detail: "",
     };
     this.showProjectInstructionsStatus = true;
+    this.transientStatusNotice = "";
     this.overlayVisible = false;
     this.overlayTitle = "";
     this.overlayText = "";
@@ -403,6 +404,7 @@ export class SimpleTui {
 
   beginTurn() {
     this.showProjectInstructionsStatus = false;
+    this.transientStatusNotice = "";
     this.turnTokensSent = 0;
     this.turnTokensReceived = 0;
     this.turnStartedAt = Date.now();
@@ -556,7 +558,19 @@ export class SimpleTui {
   }
 
   setTodos(todos) {
+    const previousTodos = Array.isArray(this.todos) ? this.todos : [];
+    const previousTotal = previousTodos.length;
+    const previousDone = previousTodos.filter((t) => String(t?.status || "").toLowerCase() === "completed").length;
     this.todos = Array.isArray(todos) ? todos : [];
+    const nextTotal = this.todos.length;
+    const nextDone = this.todos.filter((t) => String(t?.status || "").toLowerCase() === "completed").length;
+    const becameAllCompleted =
+      nextTotal > 0 &&
+      nextDone === nextTotal &&
+      !(previousTotal > 0 && previousDone === previousTotal);
+    if (becameAllCompleted) {
+      this.transientStatusNotice = "notice: TODO completed";
+    }
     this.render();
   }
 
@@ -1213,6 +1227,10 @@ export class SimpleTui {
     return "";
   }
 
+  formatTransientStatusLabel() {
+    return String(this.transientStatusNotice || "").trim();
+  }
+
   render(input = this.currentInput, status = "", cursorIndex = null) {
     if (!this.active) return;
     this.currentInput = String(input || "");
@@ -1320,10 +1338,10 @@ export class SimpleTui {
     const planStatus = this.planModeEnabled ? " | plan:on" : "";
     const promptStatusRaw = `status: ${this.lastStatus || "idle"}${planStatus}${ctxStatus}${tokStatus}${todoStatus}${scrollLabel}`;
     const bashMode = /^\s*!/.test(this.currentInput) ? " | mode:bash" : "";
-    const projectLabel = this.formatProjectInstructionsLabel();
+    const leftStatusLabel = this.formatTransientStatusLabel() || this.formatProjectInstructionsLabel();
     let promptStatus = "";
-    if (projectLabel) {
-      const left = truncateLine(` ${projectLabel}`, width);
+    if (leftStatusLabel) {
+      const left = truncateLine(` ${leftStatusLabel}`, width);
       const fixedLeft = stringDisplayWidth(left);
       const rightBudget = Math.max(0, width - fixedLeft - 1);
       const right = truncateLine(`${promptStatusRaw}${bashMode}`, rightBudget);

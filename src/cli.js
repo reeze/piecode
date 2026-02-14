@@ -700,7 +700,14 @@ function appendThinkingToLlmDebugEvent(llmHistoryRef, stage, delta) {
     }
   }
   if (!target) return null;
-  target.thinking = `${String(target.thinking || "")}${String(delta || "")}`;
+  const nextChunk = sanitizeThinkingChunk(delta);
+  if (!nextChunk) return target;
+  const previous = String(target.thinking || "");
+  const needsSpace =
+    previous.length > 0 &&
+    !/\s$/.test(previous) &&
+    !/^[\s.,;:!?]/.test(nextChunk);
+  target.thinking = `${previous}${needsSpace ? " " : ""}${nextChunk}`;
   return target;
 }
 
@@ -846,6 +853,50 @@ function summarizeForLog(value, maxLen = 220) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (!text) return "<empty>";
   return text.length > maxLen ? `${text.slice(0, maxLen - 3)}...` : text;
+}
+
+function sanitizeThinkingChunk(raw) {
+  const source = String(raw || "");
+  if (!source.trim()) return "";
+
+  // Ignore explicit tool-call metadata payload.
+  if (
+    /"tool_calls"\s*:|"function"\s*:|"arguments"\s*:|"tool_call_id"\s*:|"tool_use_id"\s*:/i.test(source)
+  ) {
+    return "";
+  }
+
+  // Remove small JSON argument objects that can leak during tool-call streaming.
+  let text = source.replace(/\{[^{}]{0,240}\}/g, (match) => {
+    if (
+      /"?(path|command|tool|server|uri|input|oldText|newText|content|regex|query)"?\s*:/i.test(match)
+    ) {
+      return " ";
+    }
+    return match;
+  });
+
+  // Remove dangling partial JSON fragments, e.g. {"path": "
+  if (/^\s*\{\s*"?[a-z_][a-z0-9_]*"?\s*:\s*"?\s*$/i.test(text.trim())) return "";
+  text = text.replace(/\s*\{\s*"?[a-z_][a-z0-9_]*"?\s*:\s*"?\s*$/i, "");
+
+  text = text.replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  if (!/[A-Za-z]/.test(text)) return "";
+  return text;
+}
+
+function summarizeThinkingResponseForLog(payload) {
+  const text = String(payload || "").replace(/\s+/g, " ").trim();
+  if (!text) return "<empty>";
+  if (/"tool_calls"\s*:/i.test(text)) {
+    const fn =
+      text.match(/"function"\s*:\s*\{\s*"name"\s*:\s*"([^"\\]+)"/i)?.[1] ||
+      text.match(/"tool"\s*:\s*"([^"\\]+)"/i)?.[1] ||
+      "";
+    return fn ? `native tool call prepared: ${fn}` : "native tool call prepared";
+  }
+  return summarizeForLog(text);
 }
 
 function formatToolInputSummary(tool, input, maxLen = 120) {
@@ -1093,7 +1144,10 @@ function extractThoughtContentFromPartialJson(raw) {
 function extractReadableThinkingPreview(raw) {
   const source = String(raw || "");
   const thought = extractThoughtContentFromPartialJson(source);
-  if (thought) return thought;
+  if (thought) {
+    const cleanedThought = sanitizeThinkingChunk(thought);
+    if (cleanedThought) return cleanedThought;
+  }
 
   const compact = source.replace(/\s+/g, " ").trim();
   if (!compact) return "";
@@ -1117,7 +1171,7 @@ function extractReadableThinkingPreview(raw) {
   // If output is raw JSON/tool schema and we cannot extract a readable field yet, avoid noise.
   if (compact.startsWith("{") || compact.startsWith("[")) return "";
 
-  return compact;
+  return sanitizeThinkingChunk(compact);
 }
 
 function extractJsonObject(raw) {
@@ -4258,7 +4312,7 @@ async function main() {
           tui.addTokenUsage({ sent: sentTokens, received: receivedTokens });
           refreshTuiContextUsage();
         }
-        logLine(`[thinking] response:${evt.stage} ${summarizeForLog(evt.payload)}`);
+        logLine(`[thinking] response:${evt.stage} ${summarizeThinkingResponseForLog(evt.payload)}`);
       }
       if (evt.type === "thinking_done") {
         recordTaskEvent(taskTraceRef, evt);
