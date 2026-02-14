@@ -120,6 +120,7 @@ node src/cli.js --prompt "inspect this repo and suggest next steps"
 - `/help` show help
 - `/exit` quit
 - `/clear` clear conversation memory
+- `/plan on|off` toggle plan mode (generate plans, allow safe read-only tools, no file changes)
 - `/approve on|off` toggle shell auto approval
 - `/model` show active provider/model
 - `/skills` show active skills
@@ -144,6 +145,8 @@ You can also mention `$skill-name` in a prompt to auto-enable that skill for the
 - Set `PIECODE_DISABLE_CODEX_CLI=1` to skip the Codex CLI session backend.
 - Set `PIECODE_SETTINGS_FILE` to override the settings file location.
 - Set `PIECODE_ENABLE_PLANNER=1` to enable the experimental task planner (disabled by default).
+- Set `PIECODE_PLAN_MODE=1` to start in plan mode (safe read-only tools allowed, no file changes).
 - Set `PIECODE_SKILLS_DIR` to override/extend skill root directories (comma-separated).
 - Set `PIECODE_PLAN_FIRST=1` to enable lightweight pre-plan (disabled by default).
 - Set `PIECODE_TOOL_BUDGET` to set initial planning budget guidance (default `6`, range `1-12`).
+- Model suggestions for `/model` are loaded from both built-in defaults and `~/.piecode/settings.json` (`model` and `providers.*.model`).

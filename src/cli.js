@@ -26,6 +26,7 @@ import { SimpleTui } from "./lib/tui.js";
 import { Display } from "./lib/display.js";
 import { consumeMouseWheelDeltas, stripMouseInputNoise } from "./lib/mouse.js";
 import { TuiLineEditor } from "./lib/tuiLineEditor.js";
+import { classifyShellCommand } from "./lib/tools.js";
 import { applyFileMentionSelection, getFileMentionSuggestions, isGitRelatedPath } from "./lib/fileMentions.js";
 
 const HISTORY_MAX = 500;
@@ -39,6 +40,7 @@ const SLASH_COMMANDS = [
   "/quit",
   "/clear",
   "/compact",
+  "/plan",
   "/approve",
   "/trace",
   "/debug llm",
@@ -453,6 +455,7 @@ Environment:
   CODEX_MODEL          Optional for codex token mode (default gpt-5.3-codex)
   PIECODE_DISABLE_CODEX_CLI Optional (set 1 to disable codex CLI session backend)
   PIECODE_ENABLE_PLANNER  Optional (set 1 to enable experimental task planner)
+  PIECODE_PLAN_MODE       Optional (set 1 to start in plan-only mode)
   PIECODE_PLAN_FIRST      Optional (default off; set 1 to enable lightweight pre-plan)
   PIECODE_TOOL_BUDGET     Optional (default 6, range 1-12)
   PIECODE_VERBOSE_TOOL_LOGS Optional (set 1 for full tool input details in logs)
@@ -474,6 +477,8 @@ Slash commands in interactive mode:
   /quit                Quit (alias)
   /clear               Clear all turn context (history + todos)
   /compact             Compact older context and keep recent turns
+  /plan on|off         Toggle plan mode (safe read-only tools allowed; no file changes)
+  /plan                Show current plan mode
   /approve on|off      Toggle shell auto-approval
   /trace on|off        Toggle runtime trace logs (timings/stages)
   /debug llm           Dump latest LLM request/response payloads
@@ -1460,7 +1465,7 @@ function isMultilineShortcut(str, key = {}) {
   return false;
 }
 
-function getSuggestionsForInput(line, getSkillIndex) {
+function getSuggestionsForInput(line, getSkillIndex, getModelCatalog = null) {
   const input = String(line || "");
   const trimmed = input.trimStart();
   if (!trimmed.startsWith("/")) return [];
@@ -1491,7 +1496,13 @@ function getSuggestionsForInput(line, getSkillIndex) {
 
   if (/^\/model(?:\s+.*)?$/i.test(trimmed)) {
     const fragment = trimmed.replace(/^\/model\s*/i, "");
-    const candidates = ["/model", "/model list", ...MODEL_SUGGESTIONS];
+    const modelCatalog =
+      typeof getModelCatalog === "function"
+        ? getModelCatalog()
+        : getModelCatalog;
+    const modelCandidates =
+      Array.isArray(modelCatalog) && modelCatalog.length > 0 ? modelCatalog : MODEL_SUGGESTIONS;
+    const candidates = ["/model", "/model list", ...modelCandidates];
     if (!fragment) return candidates;
     return filterByPrefix(candidates, fragment);
   }
@@ -1563,8 +1574,9 @@ async function maybeAutoEnableSkills(input, activeSkillsRef, skillIndex, logLine
   }
 }
 
-async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef, workspaceDir) {
+async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef, workspaceDir, options = {}) {
   const startedAt = Date.now();
+  const planOnly = Boolean(options?.planOnly);
   if (tui) tui.beginTurn();
   const beforeGitSet = getGitChangedFileSet(workspaceDir);
   const beforeGitNumstat = getGitNumstatMap(workspaceDir);
@@ -1576,7 +1588,7 @@ async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef,
     turnSummaryRef.value.beforeGitNumstat = beforeGitNumstat;
   }
   try {
-    const result = await agent.runTurn(input);
+    const result = await agent.runTurn(input, { planOnly });
     const durationMs = Date.now() - startedAt;
     if (tui) tui.onTurnSuccess(durationMs);
     const afterGitSet = getGitChangedFileSet(workspaceDir);
@@ -1659,6 +1671,7 @@ async function handleSlashCommand(input, ctx) {
     tui,
     setModel,
     setStatusBar,
+    planModeRef,
     settings,
     modelCatalogRef,
     llmLastRef,
@@ -1674,6 +1687,10 @@ async function handleSlashCommand(input, ctx) {
     const contextWindow = formatCompactNumber(inferContextWindow(provider?.model));
     return `${prefix}: ${modelLabel} | context window: ${contextWindow}`;
   };
+  const formatPlanModeStatus = (prefix = "plan mode", enabled = planModeRef?.value) =>
+    enabled
+      ? `${prefix}: on | planning with safe read-only tools (no file changes)`
+      : `${prefix}: off | normal execution enabled`;
 
   if (lower === "/exit" || lower === "/quit") return { done: true, handled: true };
   if (lower === "/help") {
@@ -1684,6 +1701,7 @@ async function handleSlashCommand(input, ctx) {
         "/exit | /quit",
         "/clear",
         "/compact",
+        "/plan",
         "/approve on|off",
         "/trace on|off",
         "/debug llm",
@@ -1725,6 +1743,33 @@ async function handleSlashCommand(input, ctx) {
     logLine(
       `context compacted: ${result.beforeMessages} -> ${result.afterMessages} messages (removed ${result.removedMessages})`
     );
+    return { done: false, handled: true };
+  }
+  if (lower === "/plan") {
+    const status = formatPlanModeStatus("plan mode");
+    if (tui && typeof setStatusBar === "function") {
+      setStatusBar(status);
+    } else {
+      logLine(status);
+      logLine("usage: /plan on|off");
+    }
+    return { done: false, handled: true };
+  }
+  if (lower.startsWith("/plan ")) {
+    const mode = normalized.split(/\s+/)[1]?.toLowerCase();
+    if (mode === "on" || mode === "off") {
+      const enabled = mode === "on";
+      if (planModeRef) planModeRef.value = enabled;
+      if (tui && typeof tui.setPlanMode === "function") tui.setPlanMode(enabled);
+      const status = formatPlanModeStatus("plan mode", enabled);
+      if (tui && typeof setStatusBar === "function") {
+        setStatusBar(status);
+      } else {
+        logLine(status);
+      }
+    } else {
+      logLine("usage: /plan on|off");
+    }
     return { done: false, handled: true };
   }
   if (lower.startsWith("/approve")) {
@@ -1780,7 +1825,12 @@ async function handleSlashCommand(input, ctx) {
         logLine("latest (openrouter):");
         for (const id of groups.latest) logLine(`- openrouter:${id}`);
       }
-      modelCatalogRef.value = mergeModelCatalog(MODEL_SUGGESTIONS, groups.popular, groups.latest);
+      modelCatalogRef.value = mergeModelCatalog(
+        MODEL_SUGGESTIONS,
+        groups.popular,
+        groups.latest,
+        collectModelsFromSettings(settings)
+      );
     } catch {
       // keep static fallback catalog
     }
@@ -1927,7 +1977,7 @@ async function fetchOpenRouterModelGroups({ settings }) {
   return { popular, latest };
 }
 
-function mergeModelCatalog(baseCatalog, popular, latest) {
+function mergeModelCatalog(baseCatalog, popular, latest, localSettingsModels = []) {
   const out = [];
   const seen = new Set();
   const push = (item) => {
@@ -1938,7 +1988,49 @@ function mergeModelCatalog(baseCatalog, popular, latest) {
   };
   for (const id of popular || []) push(`openrouter:${id}`);
   for (const id of latest || []) push(`openrouter:${id}`);
+  for (const id of localSettingsModels || []) push(id);
   for (const id of baseCatalog || []) push(id);
+  return out;
+}
+
+function collectModelsFromSettings(settings = {}) {
+  const out = [];
+  const seen = new Set();
+  const push = (item) => {
+    const v = String(item || "").trim();
+    if (!v || seen.has(v)) return;
+    seen.add(v);
+    out.push(v);
+  };
+  const pushModel = (providerHint, modelValue) => {
+    const provider = String(providerHint || "").trim().toLowerCase();
+    const raw = String(modelValue || "").trim();
+    if (!raw) return;
+    const parsed = parseModelTarget(raw);
+    if (parsed.provider) {
+      push(`${parsed.provider}:${parsed.model}`);
+      return;
+    }
+    if (provider) push(`${provider}:${raw}`);
+    push(raw);
+  };
+
+  const defaultProvider = String(settings?.provider || "").trim().toLowerCase();
+  pushModel(defaultProvider, settings?.model);
+
+  const providers =
+    settings?.providers && typeof settings.providers === "object" && !Array.isArray(settings.providers)
+      ? settings.providers
+      : {};
+  for (const [providerName, providerSettings] of Object.entries(providers)) {
+    if (!providerSettings || typeof providerSettings !== "object") continue;
+    pushModel(providerName, providerSettings.model);
+    if (Array.isArray(providerSettings.models)) {
+      for (const candidate of providerSettings.models) {
+        pushModel(providerName, candidate);
+      }
+    }
+  }
   return out;
 }
 
@@ -1987,7 +2079,11 @@ async function main() {
 
   const settingsFile = getSettingsFilePath();
   const settings = await loadSettings(settingsFile);
-  const modelCatalogRef = { value: [...MODEL_SUGGESTIONS] };
+  const planModeRef = { value: process.env.PIECODE_PLAN_MODE === "1" };
+  const settingsModelSuggestions = collectModelsFromSettings(settings);
+  const modelCatalogRef = {
+    value: mergeModelCatalog(MODEL_SUGGESTIONS, [], [], settingsModelSuggestions),
+  };
   const skillRoots = resolveSkillRoots(settings);
   let skillIndex = await discoverSkills(skillRoots);
   const refreshSkillIndex = async () => {
@@ -2162,6 +2258,7 @@ async function main() {
     });
     tui.setProjectInstructionsStatus(projectInstructionsStatusRef.value);
     tui.setTodos(todosRef.value);
+    tui.setPlanMode(planModeRef.value);
     onResize = () => {
       tui.render(currentInputRef.value);
     };
@@ -2209,9 +2306,23 @@ async function main() {
       currentInputRef.value = text;
       if (tui) tui.renderInput(text, cursor);
     };
+    const submitCurrentLine = () => {
+      if (rl && typeof rl.submit === "function") {
+        rl.submit();
+        return true;
+      }
+      if (rl && typeof rl._submitCurrentLine === "function") {
+        rl._submitCurrentLine();
+        return true;
+      }
+      return false;
+    };
     onKeypress = (str, key = {}) => {
       if (isReadlineClosed()) return;
       if (approvalActiveRef.value) return;
+      const keyNameRaw = String(key?.name || "");
+      const keyName = keyNameRaw.toLowerCase();
+      const enterPressed = keyName === "return" || keyName === "enter" || str === "\r" || str === "\n";
       const currentLineRaw = String(rl.line || "");
       const currentLine = stripMouseInputNoise(currentLineRaw);
       if (currentLine !== currentLineRaw) {
@@ -2247,7 +2358,7 @@ async function main() {
               tui.cancelOverlaySearch();
               return;
             }
-            if (!key.ctrl && !key.meta && (key.name === "return" || key.name === "enter")) {
+            if (!key.ctrl && !key.meta && enterPressed) {
               tui.submitOverlaySearch();
               return;
             }
@@ -2453,11 +2564,11 @@ async function main() {
           return;
         }
 
-        const keyName = String(key?.name || "").toLowerCase();
         const isPickerNavigationKey =
-          keyName === "tab" || keyName === "up" || keyName === "down" || keyName === "return" || keyName === "enter";
+          keyName === "tab" || keyName === "up" || keyName === "down" || enterPressed;
+        const isBareHistoryNavKey = !key.ctrl && !key.meta && !key.shift && (keyName === "up" || keyName === "down");
 
-        if (!(isPickerNavigationKey && (modelPickerRef.active || commandPickerRef.active))) {
+        if (!(isPickerNavigationKey && (modelPickerRef.active || commandPickerRef.active)) && !isBareHistoryNavKey) {
           const pickerQuery = getModelQueryFromInput(currentLine);
           if (pickerQuery !== null) {
             const nextOptions = getFilteredModelSuggestions(pickerQuery, modelCatalogRef.value);
@@ -2493,7 +2604,11 @@ async function main() {
             }
             const trimmed = currentLine.trimStart();
             if (trimmed.startsWith("/")) {
-              const commandOptions = getSuggestionsForInput(currentLine, () => skillIndex).slice(0, 8);
+              const commandOptions = getSuggestionsForInput(
+                currentLine,
+                () => skillIndex,
+                () => modelCatalogRef.value
+              ).slice(0, 8);
               if (commandOptions.length > 0) {
                 commandPickerRef.active = true;
                 commandPickerRef.mode = "command";
@@ -2564,14 +2679,13 @@ async function main() {
             tui.setModelSuggestions(modelPickerRef.options, modelPickerRef.index);
             return;
           }
-          if (key.name === "return" || key.name === "enter") {
-            const selectedModel = modelPickerRef.options[modelPickerRef.index];
+          if (enterPressed) {
             modelPickerRef.active = false;
             modelPickerRef.query = "";
             modelPickerRef.options = [];
             modelPickerRef.index = 0;
             tui.clearModelSuggestions();
-            writeLineWithCursor(`/model ${selectedModel}`);
+            submitCurrentLine();
             return;
           }
         }
@@ -2612,25 +2726,13 @@ async function main() {
             }
             return;
           }
-          if (key.name === "return" || key.name === "enter") {
-            const selectedItem = commandPickerRef.options[commandPickerRef.index];
-            if (commandPickerRef.mode === "file") {
-              const cursorNow = Number.isFinite(rl.cursor) ? Math.max(0, Math.floor(rl.cursor)) : currentLine.length;
-              const applied = applyFileMentionSelection(currentLine, cursorNow, selectedItem);
-              if (applied) writeLineWithCursor(applied.line, applied.cursor);
-              commandPickerRef.active = false;
-              commandPickerRef.mode = "command";
-              commandPickerRef.options = [];
-              commandPickerRef.index = 0;
-              tui.clearCommandSuggestions();
-              return;
-            }
+          if (enterPressed) {
             commandPickerRef.active = false;
             commandPickerRef.mode = "command";
             commandPickerRef.options = [];
             commandPickerRef.index = 0;
             tui.clearCommandSuggestions();
-            writeLineWithCursor(selectedItem);
+            submitCurrentLine();
             return;
           }
         }
@@ -2657,7 +2759,11 @@ async function main() {
         return;
       }
 
-      const suggestions = getSuggestionsForInput(currentLine, () => skillIndex).slice(0, 8);
+      const suggestions = getSuggestionsForInput(
+        currentLine,
+        () => skillIndex,
+        () => modelCatalogRef.value
+      ).slice(0, 8);
       if (suggestions.length === 0) {
         if (display) display.clearSuggestions();
         return;
@@ -2773,6 +2879,12 @@ async function main() {
     } catch {
       // best effort
     }
+    modelCatalogRef.value = mergeModelCatalog(
+      MODEL_SUGGESTIONS,
+      [],
+      [],
+      collectModelsFromSettings(settings)
+    );
     if (tui) {
       tui.onModelCall(formatProviderModel(nextProvider));
       tui.setContextUsage(0, inferContextWindow(nextProvider?.model));
@@ -3114,7 +3226,7 @@ async function main() {
     }
 
     try {
-      const result = await agent.runTurn(args.prompt);
+      const result = await agent.runTurn(args.prompt, { planOnly: planModeRef.value });
       const output = typeof result === "string" ? result : JSON.stringify(result, null, 2);
       if (display) {
         display.onResponse(output);
@@ -3149,6 +3261,9 @@ async function main() {
     if (startupAutoSkills.missing.length > 0) {
       tui.event(`warning: auto-load skills missing: ${startupAutoSkills.missing.join(", ")}`);
     }
+    if (planModeRef.value) {
+      tui.event("plan mode: on (safe read-only tools allowed, no file changes)");
+    }
     tui.render(currentInputRef.value, "Type /help for commands");
   } else {
     console.log(`Pie Code (${formatProviderModel(providerRef.value)})`);
@@ -3163,6 +3278,9 @@ async function main() {
     }
     if (startupAutoSkills.missing.length > 0) {
       console.error(`warning: auto-load skills missing: ${startupAutoSkills.missing.join(", ")}`);
+    }
+    if (planModeRef.value) {
+      console.log("plan mode: on (safe read-only tools allowed, no file changes)");
     }
     console.log("Type /help for commands.");
   }
@@ -3247,6 +3365,17 @@ async function main() {
     exitArmedRef.value = false;
     if (tui) tui.clearInputHint();
     if (finalInput.startsWith("!")) {
+      if (planModeRef.value) {
+        const commandText = String(finalInput.slice(1) || "").trim();
+        const classification = classifyShellCommand(commandText);
+        if (classification.level !== "safe") {
+          logLine(
+            `plan mode only allows safe direct shell commands. blocked (${classification.reason}). Use /plan off to run this command.`
+          );
+          currentInputRef.value = "";
+          continue;
+        }
+      }
       startTaskTrace(taskTraceRef, { input: finalInput, kind: "shell" });
       currentInputRef.value = "";
       if (tui) tui.setProjectInstructionsVisible(false);
@@ -3271,7 +3400,14 @@ async function main() {
       if (tui) tui.setProjectInstructionsVisible(false);
     }
     currentInputRef.value = "";
-    if (tui) tui.render(currentInputRef.value, isSlash ? "handling command" : "processing task");
+    if (tui) {
+      const status = isSlash
+        ? "handling command"
+        : planModeRef.value
+          ? "planning task (safe tools only)"
+          : "processing task";
+      tui.render(currentInputRef.value, status);
+    }
     if (!isSlash) {
       traceStateRef.value.turnId += 1;
       traceStateRef.value.turnStartedAt = Date.now();
@@ -3296,6 +3432,7 @@ async function main() {
       tui,
       setModel: switchModel,
       setStatusBar,
+      planModeRef,
       settings,
       modelCatalogRef,
       todosRef,
@@ -3322,7 +3459,16 @@ async function main() {
     await maybeAutoEnableSkills(finalInput, activeSkillsRef, skillIndex, logLine);
     taskRunningRef.value = true;
     try {
-      const turnResult = await runAgentTurn(agent, finalInput, tui, logLine, display, turnSummaryRef, workspaceDir);
+      const turnResult = await runAgentTurn(
+        agent,
+        finalInput,
+        tui,
+        logLine,
+        display,
+        turnSummaryRef,
+        workspaceDir,
+        { planOnly: planModeRef.value }
+      );
       const saved = await finishTaskTrace(taskTraceRef, workspaceDir, {
         status: turnResult?.ok ? "done" : turnResult?.aborted ? "aborted" : "error",
         error: turnResult?.ok ? "" : String(turnResult?.error || ""),

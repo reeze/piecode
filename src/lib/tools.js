@@ -113,7 +113,7 @@ function extractCommandName(segment) {
   return first.replace(/^["']|["']$/g, "").toLowerCase();
 }
 
-function classifyShellCommand(command) {
+export function classifyShellCommand(command) {
   const raw = String(command || "");
   if (!raw.trim()) {
     return { level: "dangerous", reason: "empty command is invalid" };

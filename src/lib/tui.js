@@ -274,6 +274,7 @@ export class SimpleTui {
     this.scrollOffset = 0;
     this.thoughtStreamText = "";
     this.thoughtStreamVisible = false;
+    this.planModeEnabled = false;
     this.projectInstructionsStatus = {
       state: "unknown",
       source: "AGENTS.md",
@@ -585,6 +586,13 @@ export class SimpleTui {
   clearInputHint() {
     if (!this.inputHint) return;
     this.inputHint = "";
+    this.render();
+  }
+
+  setPlanMode(enabled) {
+    const next = Boolean(enabled);
+    if (this.planModeEnabled === next) return;
+    this.planModeEnabled = next;
     this.render();
   }
 
@@ -1193,6 +1201,8 @@ export class SimpleTui {
   render(input = this.currentInput, status = "", cursorIndex = null) {
     if (!this.active) return;
     this.currentInput = String(input || "");
+    const statusText = String(status || "").trim();
+    if (statusText) this.lastStatus = statusText;
 
     const termWidth = Math.max(40, this.out.columns || 100);
     const width = Math.max(20, termWidth - 1);
@@ -1290,7 +1300,8 @@ export class SimpleTui {
       this.sessionTokensSent > 0 || this.sessionTokensReceived > 0
         ? ` | session tok:↑${formatCompactNumber(this.sessionTokensSent)} ↓${formatCompactNumber(this.sessionTokensReceived)}`
         : "";
-    const promptStatusRaw = `status: ${status || this.lastStatus || "idle"}${ctxStatus}${tokStatus}${scrollLabel}`;
+    const planStatus = this.planModeEnabled ? " | plan:on" : "";
+    const promptStatusRaw = `status: ${this.lastStatus || "idle"}${planStatus}${ctxStatus}${tokStatus}${scrollLabel}`;
     const bashMode = /^\s*!/.test(this.currentInput) ? " | mode:bash" : "";
     const projectLabel = this.formatProjectInstructionsLabel();
     let promptStatus = "";

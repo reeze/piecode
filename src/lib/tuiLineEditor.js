@@ -65,6 +65,10 @@ export class TuiLineEditor {
     });
   }
 
+  submit() {
+    this._submitCurrentLine();
+  }
+
   close() {
     if (this.closed) return;
     this.closed = true;

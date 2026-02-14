@@ -110,6 +110,129 @@ describe("agent context controls", () => {
     await expect(turnPromise).rejects.toMatchObject({ code: "TASK_ABORTED" });
   });
 
+  test("plan-only mode returns a plan without executing tools", async () => {
+    let completeCalls = 0;
+    const agent = createAgentWithProvider({
+      async complete() {
+        completeCalls += 1;
+        if (completeCalls === 1) {
+          return JSON.stringify({
+            summary: "Implement feature safely",
+            steps: ["Inspect related files", "Design minimal edits", "Validate with tests"],
+            toolBudget: 3,
+          });
+        }
+        return JSON.stringify({
+          type: "final",
+          message:
+            "Summary: Implement feature safely\nSteps:\n1. Inspect related files\n2. Design minimal edits\n3. Validate with tests\nNo files were changed.",
+        });
+      },
+    });
+
+    let shellCalls = 0;
+    let writeCalls = 0;
+    agent.tools.shell = async () => {
+      shellCalls += 1;
+      throw new Error("shell should not run in plan-only mode");
+    };
+    agent.tools.write_file = async () => {
+      writeCalls += 1;
+      throw new Error("write_file should not run in plan-only mode");
+    };
+
+    const result = await agent.runTurn("implement a new feature", { planOnly: true });
+
+    expect(result).toContain("No files were changed.");
+    expect(result).toContain("Summary: Implement feature safely");
+    expect(result).toContain("1. Inspect related files");
+    expect(completeCalls).toBe(2);
+    expect(shellCalls).toBe(0);
+    expect(writeCalls).toBe(0);
+  });
+
+  test("plan-only mode allows safe tool calls before finalizing plan", async () => {
+    let completeCalls = 0;
+    const agent = createAgentWithProvider({
+      async complete() {
+        completeCalls += 1;
+        if (completeCalls === 1) {
+          return JSON.stringify({
+            summary: "Investigate then plan",
+            steps: ["Inspect current state", "Draft plan"],
+            toolBudget: 2,
+          });
+        }
+        if (completeCalls === 2) {
+          return JSON.stringify({
+            type: "tool_use",
+            tool: "shell",
+            input: { command: "pwd" },
+            reason: "confirm current working directory",
+          });
+        }
+        return JSON.stringify({
+          type: "final",
+          message: "Summary: Drafted plan after safe checks.\nSteps:\n1. Review files\n2. Apply minimal change\n3. Run tests",
+        });
+      },
+    });
+
+    let shellCalls = 0;
+    let writeCalls = 0;
+    agent.tools.shell = async () => {
+      shellCalls += 1;
+      return "Command: pwd\nOutput:\n/tmp/workspace";
+    };
+    agent.tools.write_file = async () => {
+      writeCalls += 1;
+      throw new Error("write_file should not run in plan-only mode");
+    };
+
+    const result = await agent.runTurn("fix lint", { planOnly: true });
+
+    expect(result).toContain("Plan mode is ON");
+    expect(result).toContain("Drafted plan");
+    expect(completeCalls).toBe(3);
+    expect(shellCalls).toBe(1);
+    expect(writeCalls).toBe(0);
+  });
+
+  test("plan-only mode blocks unsafe tools", async () => {
+    let completeCalls = 0;
+    const agent = createAgentWithProvider({
+      async complete() {
+        completeCalls += 1;
+        if (completeCalls === 1) {
+          return JSON.stringify({
+            summary: "Prepare plan",
+            steps: ["Inspect", "Plan"],
+            toolBudget: 2,
+          });
+        }
+        return JSON.stringify({
+          type: "tool_use",
+          tool: "write_file",
+          input: { path: "x.txt", content: "x" },
+          reason: "apply change",
+        });
+      },
+    });
+
+    let writeCalls = 0;
+    agent.tools.write_file = async () => {
+      writeCalls += 1;
+      return "should never run";
+    };
+
+    const result = await agent.runTurn("fix lint", { planOnly: true });
+
+    expect(result).toContain("not allowed for this turn policy");
+    expect(result).toContain("write_file");
+    expect(completeCalls).toBe(2);
+    expect(writeCalls).toBe(0);
+  });
+
   test("stops when the same tool call repeats without progress", async () => {
     const agent = createAgentWithProvider({
       async complete() {

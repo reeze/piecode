@@ -71,6 +71,16 @@ describe("tui line editor", () => {
     rl.close();
   });
 
+  test("submit() resolves pending question with current line", async () => {
+    const source = new EventEmitter();
+    const rl = new TuiLineEditor({ keypressSource: source });
+    const pending = rl.question("");
+    rl.write("plan");
+    rl.submit();
+    await expect(pending).resolves.toBe("plan");
+    rl.close();
+  });
+
   test("history up/down recalls previous entries", async () => {
     const source = new EventEmitter();
     const rl = new TuiLineEditor({ keypressSource: source, history: ["second", "first"] });

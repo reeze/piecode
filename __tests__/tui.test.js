@@ -249,6 +249,49 @@ describe("tui usability", () => {
     expect(frame).not.toContain("todos:");
   });
 
+  test("explicit status message persists across input rerenders", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.render("", "plan mode: off | normal execution enabled");
+    let frame = latestFrame(out);
+    expect(frame).toContain("plan mode: off | normal execution enabled");
+
+    tui.renderInput("/plan", 5);
+    frame = latestFrame(out);
+    expect(frame).toContain("plan mode: off | normal execution enabled");
+  });
+
+  test("plan mode status is shown only when enabled", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    let frame = latestFrame(out);
+    expect(frame).not.toContain("plan:on");
+
+    tui.setPlanMode(true);
+    frame = latestFrame(out);
+    expect(frame).toContain("plan:on");
+
+    tui.setPlanMode(false);
+    frame = latestFrame(out);
+    expect(frame).not.toContain("plan:on");
+  });
+
   test("bash input highlights leading bang and shows bash mode in status", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({

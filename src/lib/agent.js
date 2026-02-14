@@ -1,4 +1,4 @@
-import { createToolset } from "./tools.js";
+import { classifyShellCommand, createToolset } from "./tools.js";
 import { buildSystemPrompt, formatHistory, parseModelAction, buildToolDefinitions, buildMessages, parseNativeResponse } from "./prompt.js";
 import { TaskPlanner, TaskExecutor } from "./taskPlanner.js";
 
@@ -459,24 +459,51 @@ export class Agent {
     }
   }
 
-  async runTurn(userMessage) {
+  formatPlanModeFinalMessage(message) {
+    const body = String(message || "").trim();
+    const prefix = "Plan mode is ON. Only safe read-only tools were allowed. No files were changed.";
+    if (!body) return prefix;
+    if (/no files were changed|no file changes/i.test(body)) return body;
+    return `${prefix}\n\n${body}`;
+  }
+
+  async runTurn(userMessage, options = {}) {
     this.activeAbortController = new AbortController();
     const signal = this.activeAbortController.signal;
     this.history.push({ role: "user", content: userMessage });
     let activePlan = null;
-    const turnPolicy = this.detectTurnPolicy(userMessage);
+    let turnPolicy = this.detectTurnPolicy(userMessage);
+    const planOnly = Boolean(options?.planOnly);
 
     try {
       this.throwIfAborted(signal);
-      if (this.planFirstEnabled && !this.enablePlanner) {
+      if (planOnly) {
+        const prePlan = await this.planTurn(userMessage, signal);
+        if (prePlan) activePlan = prePlan;
+        const planBudget = Number.isFinite(prePlan?.toolBudget)
+          ? Math.max(1, Math.min(6, Math.round(prePlan.toolBudget)))
+          : Math.max(1, Math.min(6, this.defaultToolBudget));
+        turnPolicy = {
+          name: "plan_mode_safe_tools",
+          maxToolCalls: planBudget,
+          allowedTools: ["shell", "read_file", "list_files", "search_files"],
+          disableTodos: true,
+          forceFinalizeAfterTool: false,
+          note:
+            "Plan mode is enabled. Use only safe read-only tools to gather context. Never modify files. Final answer must be a concrete plan and must state that no files were changed.",
+        };
+      }
+      if (!planOnly && this.planFirstEnabled && !this.enablePlanner) {
         activePlan = await this.planTurn(userMessage, signal);
       }
 
       // 首先检查是否需要任务规划
-      const shouldPlan = this.shouldPlanTask(userMessage);
-      if (shouldPlan) {
-        this.throwIfAborted(signal);
-        return await this.runPlannedTask(userMessage);
+      if (!planOnly) {
+        const shouldPlan = this.shouldPlanTask(userMessage);
+        if (shouldPlan) {
+          this.throwIfAborted(signal);
+          return await this.runPlannedTask(userMessage);
+        }
       }
 
       const toolBudget = activePlan?.toolBudget ?? this.defaultToolBudget;
@@ -596,8 +623,9 @@ export class Agent {
 
         if (action.type === "final") {
           this.onEvent?.({ type: "thinking_done" });
-          this.history.push({ role: "assistant", content: action.message });
-          return action.message;
+          const finalMessage = planOnly ? this.formatPlanModeFinalMessage(action.message) : action.message;
+          this.history.push({ role: "assistant", content: finalMessage });
+          return finalMessage;
         }
 
         if (action.type === "thought") {
@@ -661,6 +689,15 @@ export class Agent {
             const msg =
               String(forced || "").trim() ||
               "Blocked non-read-only shell command for this summary request. I finalized from collected evidence instead.";
+            this.history.push({ role: "assistant", content: msg });
+            return msg;
+          }
+        }
+        if (planOnly && action.tool === "shell") {
+          const cmd = String(action?.input?.command || "");
+          const classification = classifyShellCommand(cmd);
+          if (classification.level !== "safe") {
+            const msg = `Plan mode only allows safe shell commands. Blocked shell command (${classification.reason}).`;
             this.history.push({ role: "assistant", content: msg });
             return msg;
           }
