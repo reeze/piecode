@@ -409,10 +409,26 @@ export class Display {
         return `> Bash: ${truncateLine(String(input?.command || "command"), 100)}`;
       case "read_file":
         return `> Read ${input?.path || "file"}`;
+      case "read_files":
+        return `> Read ${Array.isArray(input?.paths) ? input.paths.length : 0} files`;
       case "write_file":
         return `> Write ${input?.path || "file"}`;
+      case "apply_patch":
+        return `> Patch ${input?.path || "file"}`;
+      case "replace_in_files":
+        return `> Replace in files (${input?.file_pattern || "**/*"})`;
       case "list_files":
         return `> List ${input?.path || "."}`;
+      case "glob_files":
+        return `> Glob ${input?.pattern || "**/*"}`;
+      case "find_files":
+        return `> Find "${input?.query || ""}"`;
+      case "git_status":
+        return "> Git status";
+      case "git_diff":
+        return `> Git diff ${input?.path || ""}`.trim();
+      case "run_tests":
+        return `> Test ${input?.command || "npm test"}`;
       case "todo_write":
       case "todowrite":
         return "> Update Todos";
@@ -427,10 +443,24 @@ export class Display {
         return "Running...";
       case "read_file":
         return `Reading ${input?.path || ""}...`;
+      case "read_files":
+        return "Reading files...";
       case "write_file":
         return `Writing ${input?.path || ""}...`;
+      case "apply_patch":
+        return `Patching ${input?.path || ""}...`;
+      case "replace_in_files":
+        return "Replacing in files...";
       case "list_files":
         return `Listing ${input?.path || "."}...`;
+      case "glob_files":
+      case "find_files":
+        return "Scanning files...";
+      case "git_status":
+      case "git_diff":
+        return "Inspecting git state...";
+      case "run_tests":
+        return "Running tests...";
       case "todo_write":
       case "todowrite":
         return "Updating todos...";
@@ -458,13 +488,28 @@ export class Display {
         const lineCount = text.split("\n").length;
         return `    ${dim(`${lineCount} lines`)}`;
       }
+      case "read_files":
+      case "apply_patch":
+      case "replace_in_files":
       case "write_file":
+      case "git_status":
+      case "git_diff":
+      case "run_tests":
         return `    ${dim(text)}`;
       case "list_files": {
         const entries = text.split("\n").filter(Boolean);
         const preview = entries.slice(0, 8).map((l) => `    ${dim(l)}`);
         if (entries.length > 8) {
           preview.push(`    ${dim(`... (${entries.length - 8} more)`)}`);
+        }
+        return preview.join("\n");
+      }
+      case "glob_files":
+      case "find_files": {
+        const entries = text.split("\n").filter(Boolean);
+        const preview = entries.slice(0, 12).map((l) => `    ${dim(l)}`);
+        if (entries.length > 12) {
+          preview.push(`    ${dim(`... (${entries.length - 12} more)`)}`);
         }
         return preview.join("\n");
       }

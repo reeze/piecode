@@ -233,6 +233,46 @@ describe("agent context controls", () => {
     expect(writeCalls).toBe(0);
   });
 
+  test("plan-only mode continues when todo_write is requested", async () => {
+    let completeCalls = 0;
+    const agent = createAgentWithProvider({
+      async complete() {
+        completeCalls += 1;
+        if (completeCalls === 1) {
+          return JSON.stringify({
+            summary: "Create plan",
+            steps: ["Inspect files", "Draft plan"],
+            toolBudget: 2,
+          });
+        }
+        if (completeCalls === 2) {
+          return JSON.stringify({
+            type: "tool_use",
+            tool: "todo_write",
+            input: {
+              todos: [{ id: "t1", content: "Draft plan", status: "in_progress" }],
+            },
+            reason: "track planning",
+          });
+        }
+        return JSON.stringify({
+          type: "final",
+          message: "Summary: Plan completed.\nSteps:\n1. Inspect files\n2. Draft plan",
+        });
+      },
+    });
+
+    const result = await agent.runTurn("plan the work", { planOnly: true });
+
+    expect(result).toContain("Plan completed");
+    expect(completeCalls).toBe(3);
+    expect(
+      agent.history.some((entry) =>
+        String(entry.content || "").includes("todo_write is disabled for this turn policy")
+      )
+    ).toBe(true);
+  });
+
   test("stops when the same tool call repeats without progress", async () => {
     const agent = createAgentWithProvider({
       async complete() {

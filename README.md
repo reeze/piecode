@@ -5,7 +5,7 @@ A Claude Code-like command line coding agent.
 ## Features
 
 - Interactive terminal agent loop
-- Model-driven tool use (`shell`, `read_file`, `write_file`, `list_files`, `search_files`)
+- Model-driven tool use (`shell`, `read_file`, `read_files`, `write_file`, `apply_patch`, `replace_in_files`, `list_files`, `glob_files`, `find_files`, `search_files`, `git_status`, `git_diff`, `run_tests`)
 - MCP support via `mcpServers` settings and shared agent MCP configs (list/call tools, list/read resources)
 - Workspace path sandboxing for file operations
 - Shell command approval mode (`/approve on|off`)

@@ -541,8 +541,13 @@ export class Agent {
           allowedTools: [
             "shell",
             "read_file",
+            "read_files",
             "list_files",
+            "glob_files",
+            "find_files",
             "search_files",
+            "git_status",
+            "git_diff",
             ...(mcpEnabled
               ? [
                   "list_mcp_servers",
@@ -730,24 +735,24 @@ export class Agent {
           return msg;
         }
 
+        const todoDisabledForTurn = turnPolicy?.disableTodos && (action.tool === "todo_write" || action.tool === "todowrite");
+        const todoDisabledResult =
+          "Tool error: todo_write is disabled for this turn policy. Continue with concrete actions or finalize.";
         const toolFn = this.tools[action.tool];
         if (!toolFn) {
           const msg = `Unknown tool: ${action.tool}`;
           this.history.push({ role: "assistant", content: msg });
           return msg;
         }
-
-        if (turnPolicy?.disableTodos && (action.tool === "todo_write" || action.tool === "todowrite")) {
-          const msg = "This request does not need todo tracking. Provide the final answer directly.";
+        if (
+          Array.isArray(turnPolicy?.allowedTools) &&
+          turnPolicy.allowedTools.length > 0 &&
+          !turnPolicy.allowedTools.includes(action.tool) &&
+          !todoDisabledForTurn
+        ) {
+          const msg = `Tool ${action.tool} is not allowed for this turn policy. Use ${turnPolicy.allowedTools.join(", ")} or finalize.`;
           this.history.push({ role: "assistant", content: msg });
           return msg;
-        }
-        if (Array.isArray(turnPolicy?.allowedTools) && turnPolicy.allowedTools.length > 0) {
-          if (!turnPolicy.allowedTools.includes(action.tool)) {
-            const msg = `Tool ${action.tool} is not allowed for this turn policy. Use ${turnPolicy.allowedTools.join(", ")} or finalize.`;
-            this.history.push({ role: "assistant", content: msg });
-            return msg;
-          }
         }
         if (action.tool === "shell" && turnPolicy?.readOnlyShellOnly) {
           const cmd = String(action?.input?.command || "");
@@ -872,7 +877,12 @@ export class Agent {
         let result;
         let toolError = null;
         try {
-          result = await toolFn(action.input || {}, { signal });
+          if (todoDisabledForTurn) {
+            result = todoDisabledResult;
+            toolError = "todo_write disabled by turn policy";
+          } else {
+            result = await toolFn(action.input || {}, { signal });
+          }
         } catch (err) {
           if (err?.code === "ABORT_ERR" || err?.name === "AbortError") {
             const abortErr = new Error("Task aborted by user.");

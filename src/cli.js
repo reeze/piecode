@@ -853,11 +853,33 @@ function formatToolInputSummary(tool, input, maxLen = 120) {
   if (tool === "shell") {
     return summarizeForLog(safe.command || "", maxLen);
   }
-  if (tool === "read_file" || tool === "write_file") {
+  if (tool === "read_file" || tool === "write_file" || tool === "apply_patch") {
     return summarizeForLog(safe.path || "", maxLen);
+  }
+  if (tool === "read_files") {
+    const count = Array.isArray(safe.paths) ? safe.paths.length : 0;
+    return `${count} paths`;
+  }
+  if (tool === "replace_in_files") {
+    return summarizeForLog(`${safe.file_pattern || "**/*"} :: ${safe.find || ""}`, maxLen);
   }
   if (tool === "list_files") {
     return summarizeForLog(safe.path || ".", maxLen);
+  }
+  if (tool === "glob_files") {
+    return summarizeForLog(`${safe.path || "."} ${safe.pattern || "**/*"}`, maxLen);
+  }
+  if (tool === "find_files") {
+    return summarizeForLog(`${safe.path || "."} ${safe.query || ""}`, maxLen);
+  }
+  if (tool === "git_status") {
+    return Boolean(safe.porcelain) ? "porcelain" : "full";
+  }
+  if (tool === "git_diff") {
+    return summarizeForLog(`${safe.staged ? "--staged " : ""}${safe.path || ""}`, maxLen);
+  }
+  if (tool === "run_tests") {
+    return summarizeForLog(safe.command || "npm test", maxLen);
   }
   if (tool === "todo_write" || tool === "todowrite") {
     const count = Array.isArray(safe.todos) ? safe.todos.length : 0;
@@ -962,9 +984,17 @@ function maybeHandleLocalInfoTask(input, { logLine, tui, display, mcpHub = null 
     "## Available Tools",
     "- `shell`: Run a shell command in the workspace",
     "- `read_file`: Read a file",
+    "- `read_files`: Read multiple files in one call",
     "- `write_file`: Write a file",
+    "- `apply_patch`: Make targeted in-file edits (find/replace patches)",
+    "- `replace_in_files`: Preview/apply bulk replacements",
     "- `list_files`: List files/directories",
+    "- `glob_files`: Find files by glob pattern",
+    "- `find_files`: Fuzzy-find files by path text",
     "- `search_files`: Search file contents (ripgrep/grep/native)",
+    "- `git_status`: Show git status",
+    "- `git_diff`: Show git diff",
+    "- `run_tests`: Run tests with structured summary",
     "- `todo_write` / `todowrite`: Update task todo list",
   ];
   if (mcpHub && typeof mcpHub.hasServers === "function" && mcpHub.hasServers()) {
@@ -1450,7 +1480,15 @@ function shouldShowTurnSummary({ tools = [], filesChanged = [] } = {}) {
   if (list.length === 0) return false;
 
   // Show summary only for materially active turns.
-  const significantTools = new Set(["write_file", "shell", "todo_write", "todowrite"]);
+  const significantTools = new Set([
+    "write_file",
+    "apply_patch",
+    "replace_in_files",
+    "shell",
+    "run_tests",
+    "todo_write",
+    "todowrite",
+  ]);
   if (list.some((t) => significantTools.has(t))) return true;
   if (list.length >= 3) return true;
 
@@ -4202,6 +4240,13 @@ async function main() {
           turnSummaryRef.value.tools.push(evt.tool);
           if (evt.tool === "write_file" && evt.input?.path) {
             turnSummaryRef.value.filesChanged.add(String(evt.input.path));
+          }
+          if (evt.tool === "apply_patch" && evt.input?.path) {
+            turnSummaryRef.value.filesChanged.add(String(evt.input.path));
+          }
+          if (evt.tool === "replace_in_files" && evt.input?.apply) {
+            const root = String(evt.input?.path || ".").trim();
+            turnSummaryRef.value.filesChanged.add(root || ".");
           }
         }
         if (tui) tui.onToolUse(evt.tool);

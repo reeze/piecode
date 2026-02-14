@@ -139,9 +139,17 @@ export function buildSystemPrompt({
     const textToolNames = [
       "shell",
       "read_file",
+      "read_files",
       "write_file",
+      "apply_patch",
+      "replace_in_files",
       "list_files",
+      "glob_files",
+      "find_files",
       "search_files",
+      "git_status",
+      "git_diff",
+      "run_tests",
       "todo_write",
       "todowrite",
       ...(mcpEnabled
@@ -171,11 +179,20 @@ export function buildSystemPrompt({
       "TOOL SCHEMAS:",
       "- shell: { command: string } - Run a shell command in the current directory",
       "- read_file: { path: string } - Read the contents of a file",
+      "- read_files: { paths: string[], max_chars_per_file?: number, max_total_chars?: number } - Read multiple files in one call with total-size cap",
       "- write_file: { path: string, content: string } - Write content to a file",
-      "- list_files: { path?: string, max_entries?: number } - List files in a directory",
+      "- apply_patch: { path: string, find?: string, replace?: string, all?: boolean, dry_run?: boolean, edits?: Array<{find:string,replace:string,all?:boolean}> } - Make precise in-file edits",
+      "- replace_in_files: { path?: string, find: string, replace?: string, file_pattern?: string, max_files?: number, max_replacements?: number, case_sensitive?: boolean, use_regex?: boolean, apply?: boolean } - Preview/apply bulk replacements",
+      "- list_files: { path?: string, max_entries?: number, include_hidden?: boolean, include_ignored?: boolean } - List files in a directory (hidden/ignored skipped by default)",
+      "- glob_files: { path?: string, pattern?: string, max_results?: number, include_hidden?: boolean } - Find files by glob pattern",
+      "- find_files: { path?: string, query: string, max_results?: number, include_hidden?: boolean } - Fuzzy-find files by path text",
       "- search_files: { path?: string, regex: string, file_pattern?: string, max_results?: number, case_sensitive?: boolean } - Search for patterns in files using ripgrep/grep",
+      "- git_status: { porcelain?: boolean } - Show current git status",
+      "- git_diff: { path?: string, staged?: boolean, context?: number } - Show git diff",
+      "- run_tests: { command?: string, timeout_ms?: number } - Run test command and return parsed summary",
       "- todo_write: { todos: Array<{id?: string, content: string, status: 'pending'|'in_progress'|'completed'}> } - Update task tracking",
       "- todowrite: alias for todo_write",
+      "- todo_write/todowrite: both names are accepted",
       ...(mcpEnabled
         ? [
             "- list_mcp_servers: {} - List configured MCP servers",
@@ -449,6 +466,29 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
       },
     },
     {
+      name: "read_files",
+      description: "Read multiple files in one call.",
+      input_schema: {
+        type: "object",
+        properties: {
+          paths: {
+            type: "array",
+            items: { type: "string" },
+            description: "List of relative file paths to read",
+          },
+          max_chars_per_file: {
+            type: "integer",
+            description: "Maximum characters returned per file (default: 4000)",
+          },
+          max_total_chars: {
+            type: "integer",
+            description: "Total character cap across all returned files (default: 24000)",
+          },
+        },
+        required: ["paths"],
+      },
+    },
+    {
       name: "write_file",
       description:
         "Write content to a file at the given path (relative to workspace root). Creates parent directories if needed.",
@@ -462,6 +502,54 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
       },
     },
     {
+      name: "apply_patch",
+      description:
+        "Apply precise in-file edits using find/replace operations. Supports dry-run and multiple edits.",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Relative path to file" },
+          find: { type: "string", description: "Text to find (for single edit mode)" },
+          replace: { type: "string", description: "Replacement text (for single edit mode)" },
+          all: { type: "boolean", description: "Replace all occurrences for single edit mode" },
+          dry_run: { type: "boolean", description: "Validate patch only without writing" },
+          edits: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                find: { type: "string" },
+                replace: { type: "string" },
+                all: { type: "boolean" },
+              },
+              required: ["find"],
+            },
+          },
+        },
+        required: ["path"],
+      },
+    },
+    {
+      name: "replace_in_files",
+      description:
+        "Preview or apply bulk replacements across files. Useful for safe large-scale refactors.",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Relative root path to scan (default: .)" },
+          find: { type: "string", description: "Text or regex pattern to find" },
+          replace: { type: "string", description: "Replacement text (default: empty)" },
+          file_pattern: { type: "string", description: "Glob filter, e.g. '**/*.js'" },
+          max_files: { type: "integer", description: "Maximum files to scan (default: 200)" },
+          max_replacements: { type: "integer", description: "Safety cap for total replacements" },
+          case_sensitive: { type: "boolean", description: "Case-sensitive matching (default: true)" },
+          use_regex: { type: "boolean", description: "Treat find as regular expression" },
+          apply: { type: "boolean", description: "Apply changes (false = preview only)" },
+        },
+        required: ["find"],
+      },
+    },
+    {
       name: "list_files",
       description:
         "List files and directories at the given path. Returns relative paths. Use max_entries to limit results.",
@@ -470,7 +558,39 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
         properties: {
           path: { type: "string", description: "Relative path to directory (default: current)" },
           max_entries: { type: "integer", description: "Maximum entries to return (default: 200)" },
+          include_hidden: { type: "boolean", description: "Include hidden files/directories (default: false)" },
+          include_ignored: {
+            type: "boolean",
+            description: "Include heavy ignored dirs like .git and node_modules (default: false)",
+          },
         },
+      },
+    },
+    {
+      name: "glob_files",
+      description: "Find files by glob pattern.",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Relative root path to scan (default: .)" },
+          pattern: { type: "string", description: "Glob pattern (default: **/*)" },
+          max_results: { type: "integer", description: "Maximum matches to return (default: 200)" },
+          include_hidden: { type: "boolean", description: "Include dotfiles/directories" },
+        },
+      },
+    },
+    {
+      name: "find_files",
+      description: "Find files by fuzzy path text match.",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Relative root path to scan (default: .)" },
+          query: { type: "string", description: "Case-insensitive path substring to match" },
+          max_results: { type: "integer", description: "Maximum matches to return (default: 200)" },
+          include_hidden: { type: "boolean", description: "Include dotfiles/directories" },
+        },
+        required: ["query"],
       },
     },
     {
@@ -502,6 +622,40 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
           },
         },
         required: ["regex"],
+      },
+    },
+    {
+      name: "git_status",
+      description: "Show git status for the current workspace.",
+      input_schema: {
+        type: "object",
+        properties: {
+          porcelain: { type: "boolean", description: "Use concise porcelain output (default: true)" },
+        },
+      },
+    },
+    {
+      name: "git_diff",
+      description: "Show git diff in the current workspace.",
+      input_schema: {
+        type: "object",
+        properties: {
+          path: { type: "string", description: "Optional path filter" },
+          staged: { type: "boolean", description: "Show staged diff instead of unstaged" },
+          context: { type: "integer", description: "Unified diff context lines (default: 3)" },
+        },
+      },
+    },
+    {
+      name: "run_tests",
+      description:
+        "Run a test command and return structured summary with pass/fail and extracted failed tests.",
+      input_schema: {
+        type: "object",
+        properties: {
+          command: { type: "string", description: "Shell command to run tests (default: npm test)" },
+          timeout_ms: { type: "integer", description: "Command timeout in ms (default: 120000)" },
+        },
       },
     },
     {
