@@ -67,6 +67,8 @@ export function buildSystemPrompt({
   projectInstructions = null,
   nativeTools = false,
   turnPolicy = null,
+  mcpEnabled = false,
+  mcpServerNames = [],
 }) {
   const sections = [
     "You are PieCode, a command line coding agent designed to help with software engineering tasks.",
@@ -134,6 +136,25 @@ export function buildSystemPrompt({
   ];
 
   if (!nativeTools) {
+    const textToolNames = [
+      "shell",
+      "read_file",
+      "write_file",
+      "list_files",
+      "search_files",
+      "todo_write",
+      "todowrite",
+      ...(mcpEnabled
+        ? [
+            "list_mcp_servers",
+            "list_mcp_tools",
+            "mcp_call_tool",
+            "list_mcp_resources",
+            "list_mcp_resource_templates",
+            "read_mcp_resource",
+          ]
+        : []),
+    ];
     sections.push(
       "RESPONSE FORMAT:",
       "You must respond with strict JSON only. Choose one of these formats:",
@@ -142,7 +163,7 @@ export function buildSystemPrompt({
       '{"type":"final","message":"Your complete response here"}',
 
       "2. Tool Use (when you need to gather information or perform an action):",
-      '{"type":"tool_use","tool":"shell|read_file|write_file|list_files|search_files|todo_write|todowrite","input":{...},"reason":"Brief explanation of why this tool is needed","thought":"Your reasoning for choosing this tool"}',
+      `{"type":"tool_use","tool":"${textToolNames.join("|")}","input":{...},"reason":"Brief explanation of why this tool is needed","thought":"Your reasoning for choosing this tool"}`,
 
       "3. Thought Process (when you need to explain your reasoning):",
       '{"type":"thought","content":"Your reasoning and thought process here"}',
@@ -155,6 +176,16 @@ export function buildSystemPrompt({
       "- search_files: { path?: string, regex: string, file_pattern?: string, max_results?: number, case_sensitive?: boolean } - Search for patterns in files using ripgrep/grep",
       "- todo_write: { todos: Array<{id?: string, content: string, status: 'pending'|'in_progress'|'completed'}> } - Update task tracking",
       "- todowrite: alias for todo_write",
+      ...(mcpEnabled
+        ? [
+            "- list_mcp_servers: {} - List configured MCP servers",
+            "- list_mcp_tools: { server?: string } - List available tools from MCP server(s)",
+            "- mcp_call_tool: { server: string, tool: string, input?: object } - Call a tool exposed by an MCP server",
+            "- list_mcp_resources: { server?: string, cursor?: string } - List resources from MCP server(s)",
+            "- list_mcp_resource_templates: { server?: string, cursor?: string } - List MCP resource templates",
+            "- read_mcp_resource: { server: string, uri: string } - Read an MCP resource by URI",
+          ]
+        : []),
 
       "EXAMPLES:",
       'Find all uses of a function: {"type":"tool_use","tool":"search_files","input":{"regex":"functionName\\(","path":"src","file_pattern":"*.js"},"reason":"Find all calls to functionName in JS files"}',
@@ -166,6 +197,14 @@ export function buildSystemPrompt({
       "- No markdown formatting outside the JSON",
       "- No explanatory text before or after the JSON"
     );
+  }
+
+  if (mcpEnabled) {
+    const names = Array.isArray(mcpServerNames)
+      ? mcpServerNames.map((name) => String(name || "").trim()).filter(Boolean)
+      : [];
+    const serverLine = names.length > 0 ? names.join(", ") : "(configured)";
+    sections.push("", `MCP servers available: ${serverLine}`);
   }
 
   if (activeSkills.length > 0) {
@@ -307,7 +346,84 @@ export function parseModelAction(text) {
   return { type: "final", message: trimmed };
 }
 
-export function buildToolDefinitions(nativeTools = false) {
+function buildMcpToolDefinitions({ mcpEnabled = false, mcpServerNames = [] } = {}) {
+  if (!mcpEnabled) return [];
+  const names = Array.isArray(mcpServerNames)
+    ? mcpServerNames.map((name) => String(name || "").trim()).filter(Boolean)
+    : [];
+  const serverHint = names.length > 0 ? `Configured servers: ${names.join(", ")}.` : "Use list_mcp_servers first.";
+  return [
+    {
+      name: "list_mcp_servers",
+      description: `List configured MCP servers. ${serverHint}`,
+      input_schema: {
+        type: "object",
+        properties: {},
+      },
+    },
+    {
+      name: "list_mcp_tools",
+      description: "List available tools from one MCP server or all configured servers.",
+      input_schema: {
+        type: "object",
+        properties: {
+          server: { type: "string", description: "MCP server name (optional)" },
+        },
+      },
+    },
+    {
+      name: "mcp_call_tool",
+      description: "Call a tool exposed by an MCP server.",
+      input_schema: {
+        type: "object",
+        properties: {
+          server: { type: "string", description: "MCP server name" },
+          tool: { type: "string", description: "MCP tool name" },
+          input: { type: "object", description: "Tool input object" },
+        },
+        required: ["server", "tool"],
+      },
+    },
+    {
+      name: "list_mcp_resources",
+      description: "List MCP resources from one server or all servers.",
+      input_schema: {
+        type: "object",
+        properties: {
+          server: { type: "string", description: "MCP server name (optional)" },
+          cursor: { type: "string", description: "Pagination cursor (optional)" },
+        },
+      },
+    },
+    {
+      name: "list_mcp_resource_templates",
+      description: "List MCP resource templates from one server or all servers.",
+      input_schema: {
+        type: "object",
+        properties: {
+          server: { type: "string", description: "MCP server name (optional)" },
+          cursor: { type: "string", description: "Pagination cursor (optional)" },
+        },
+      },
+    },
+    {
+      name: "read_mcp_resource",
+      description: "Read an MCP resource by URI.",
+      input_schema: {
+        type: "object",
+        properties: {
+          server: { type: "string", description: "MCP server name" },
+          uri: { type: "string", description: "Resource URI" },
+        },
+        required: ["server", "uri"],
+      },
+    },
+  ];
+}
+
+export function buildToolDefinitions(nativeTools = false, options = {}) {
+  const mcpEnabled = Boolean(options?.mcpEnabled);
+  const mcpServerNames = Array.isArray(options?.mcpServerNames) ? options.mcpServerNames : [];
   const baseTools = [
     {
       name: "shell",
@@ -415,10 +531,18 @@ export function buildToolDefinitions(nativeTools = false) {
       },
     },
   ];
+  const allTools = [
+    ...baseTools,
+    ...buildMcpToolDefinitions({
+      mcpEnabled,
+      mcpServerNames,
+    }),
+  ];
+
   const wantsOpenAI =
     nativeTools === "openai" || nativeTools === true || nativeTools === "openrouter" || nativeTools === "seed";
   if (wantsOpenAI) {
-    return baseTools.map((tool) => ({
+    return allTools.map((tool) => ({
       type: "function",
       function: {
         name: tool.name,
@@ -427,7 +551,7 @@ export function buildToolDefinitions(nativeTools = false) {
       },
     }));
   }
-  return baseTools;
+  return allTools;
 }
 
 export function buildMessages(arg1 = {}, arg2 = {}) {

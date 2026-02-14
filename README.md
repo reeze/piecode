@@ -5,7 +5,8 @@ A Claude Code-like command line coding agent.
 ## Features
 
 - Interactive terminal agent loop
-- Model-driven tool use (`shell`, `read_file`, `write_file`, `list_files`)
+- Model-driven tool use (`shell`, `read_file`, `write_file`, `list_files`, `search_files`)
+- MCP support via `mcpServers` settings and shared agent MCP configs (list/call tools, list/read resources)
 - Workspace path sandboxing for file operations
 - Shell command approval mode (`/approve on|off`)
 - Works with Anthropic (preferred) or OpenAI-compatible APIs
@@ -64,6 +65,17 @@ Or use persistent settings in `~/.piecode/settings.json`:
     "openai": {
       "endpoint": "https://api.openai.com/v1"
     }
+  },
+  "mcpServers": {
+    "mock": {
+      "command": "node",
+      "args": ["/absolute/path/to/server.js"]
+    }
+  },
+  "mcpImport": {
+    "enabled": true,
+    "includeDefaults": true,
+    "paths": ["/absolute/path/to/other-agent-mcp.json"]
   }
 }
 ```
@@ -137,6 +149,18 @@ You can also mention `$skill-name` in a prompt to auto-enable that skill for the
 - `shell` tool runs commands from the current working directory.
 - File tools are restricted to the current workspace root.
 - Shell tool is approval-gated by default for safety.
+- MCP can be configured in `~/.piecode/settings.json` with `mcpServers` (or `mcp.servers`).
+- PieCode also imports MCP servers from common agent config paths (for example Cursor/Claude-style JSON configs).
+- Local `~/.piecode/settings.json` MCP entries override imported server entries with the same name.
+- Set `PIECODE_MCP_IMPORT=0` to disable shared MCP import.
+- Set `PIECODE_MCP_CONFIG_PATHS` for extra JSON config files (comma-separated).
+- MCP helper tools available to the model when configured:
+  - `list_mcp_servers`
+  - `list_mcp_tools`
+  - `mcp_call_tool`
+  - `list_mcp_resources`
+  - `list_mcp_resource_templates`
+  - `read_mcp_resource`
 - Provider selection order is: CLI args -> `~/.piecode/settings.json` -> env vars -> Codex CLI session -> Codex auth file.
 - `seed` provider is OpenAI-compatible and can be selected with `"provider": "seed"` (or `--provider seed`).
 - Codex OAuth tokens may not include all API scopes; if needed, set `OPENAI_API_KEY`.

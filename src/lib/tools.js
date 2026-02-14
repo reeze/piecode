@@ -213,8 +213,42 @@ export function createToolset({
   askApproval,
   onToolStart,
   onTodoWrite,
+  mcpHub = null,
 }) {
   let lastTodoSignature = "";
+  const mcpAvailable = () => Boolean(mcpHub && typeof mcpHub.hasServers === "function" && mcpHub.hasServers());
+
+  const ensureMcp = () => {
+    if (!mcpAvailable()) {
+      throw new Error("MCP is not configured. Add mcpServers in ~/.piecode/settings.json");
+    }
+  };
+
+  const asObject = (value) => (value && typeof value === "object" && !Array.isArray(value) ? value : {});
+
+  const formatStructuredResult = (value, maxChars = 12000) => {
+    const text = typeof value === "string" ? value : JSON.stringify(value ?? {}, null, 2);
+    if (text.length <= maxChars) return text;
+    return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
+  };
+
+  const formatMcpToolCallResult = ({ server, tool, result }) => {
+    const payload = asObject(result);
+    const content = Array.isArray(payload.content) ? payload.content : [];
+    const textParts = content
+      .map((item) => {
+        if (item && typeof item === "object" && item.type === "text") return String(item.text || "");
+        return "";
+      })
+      .map((part) => part.trim())
+      .filter(Boolean);
+    if (textParts.length > 0) return textParts.join("\n");
+    return formatStructuredResult({
+      server,
+      tool,
+      result: payload,
+    });
+  };
 
   const runShell = async ({ command } = {}) => {
     onToolStart?.("shell", { command });
@@ -358,6 +392,96 @@ export function createToolset({
     });
   };
 
+  const listMcpServers = async () => {
+    onToolStart?.("list_mcp_servers", {});
+    if (!mcpAvailable()) return "No MCP servers configured.";
+    const names = mcpHub.getServerNames();
+    if (names.length === 0) return "No MCP servers configured.";
+    return `MCP servers:\n${names.map((name) => `- ${name}`).join("\n")}`;
+  };
+
+  const listMcpTools = async ({ server } = {}) => {
+    onToolStart?.("list_mcp_tools", { server });
+    ensureMcp();
+    const rows = await mcpHub.listTools({ server: server || null });
+    if (!Array.isArray(rows) || rows.length === 0) return "No MCP tools available.";
+    return rows
+      .map((row) => {
+        const prefix = row.server ? `${row.server}.` : "";
+        const desc = String(row.description || "").trim();
+        return desc ? `- ${prefix}${row.name}: ${desc}` : `- ${prefix}${row.name}`;
+      })
+      .join("\n");
+  };
+
+  const callMcpTool = async ({ server, tool, input = {} } = {}) => {
+    onToolStart?.("mcp_call_tool", { server, tool, input });
+    ensureMcp();
+    const serverName = String(server || "").trim();
+    const toolName = String(tool || "").trim();
+    if (!serverName) throw new Error("Missing required parameter: server");
+    if (!toolName) throw new Error("Missing required parameter: tool");
+
+    let approved = autoApproveRef?.value ?? false;
+    if (!approved && askApproval) {
+      approved = await askApproval(`mcp tool: ${serverName}.${toolName}`);
+    }
+    if (!approved) {
+      throw new Error("User did not approve MCP tool call");
+    }
+
+    const result = await mcpHub.callTool({
+      server: serverName,
+      tool: toolName,
+      input: asObject(input),
+    });
+    return formatMcpToolCallResult({
+      server: serverName,
+      tool: toolName,
+      result,
+    });
+  };
+
+  const listMcpResources = async ({ server, cursor } = {}) => {
+    onToolStart?.("list_mcp_resources", { server, cursor });
+    ensureMcp();
+    const resources = await mcpHub.listResources({
+      server: server || null,
+      cursor: cursor || null,
+    });
+    if (!Array.isArray(resources) || resources.length === 0) return "No MCP resources available.";
+    return formatStructuredResult({ resources });
+  };
+
+  const listMcpResourceTemplates = async ({ server, cursor } = {}) => {
+    onToolStart?.("list_mcp_resource_templates", { server, cursor });
+    ensureMcp();
+    const templates = await mcpHub.listResourceTemplates({
+      server: server || null,
+      cursor: cursor || null,
+    });
+    if (!Array.isArray(templates) || templates.length === 0) return "No MCP resource templates available.";
+    return formatStructuredResult({ templates });
+  };
+
+  const readMcpResource = async ({ server, uri } = {}) => {
+    onToolStart?.("read_mcp_resource", { server, uri });
+    ensureMcp();
+    const serverName = String(server || "").trim();
+    const resourceUri = String(uri || "").trim();
+    if (!serverName) throw new Error("Missing required parameter: server");
+    if (!resourceUri) throw new Error("Missing required parameter: uri");
+    const result = await mcpHub.readResource({
+      server: serverName,
+      uri: resourceUri,
+    });
+    return formatStructuredResult({
+      server: serverName,
+      uri: resourceUri,
+      result,
+    });
+  };
+
   return {
     shell: runShell,
     read_file: readFile,
@@ -366,6 +490,12 @@ export function createToolset({
     todo_write: todoWrite,
     todowrite: todoWrite,
     search_files: searchFiles,
+    list_mcp_servers: listMcpServers,
+    list_mcp_tools: listMcpTools,
+    mcp_call_tool: callMcpTool,
+    list_mcp_resources: listMcpResources,
+    list_mcp_resource_templates: listMcpResourceTemplates,
+    read_mcp_resource: readMcpResource,
   };
 }
 

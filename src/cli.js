@@ -26,6 +26,7 @@ import { SimpleTui } from "./lib/tui.js";
 import { Display } from "./lib/display.js";
 import { consumeMouseWheelDeltas, stripMouseInputNoise } from "./lib/mouse.js";
 import { TuiLineEditor } from "./lib/tuiLineEditor.js";
+import { McpHub, mergeCommonMcpServers } from "./lib/mcp.js";
 import { classifyShellCommand } from "./lib/tools.js";
 import { applyFileMentionSelection, getFileMentionSuggestions, isGitRelatedPath } from "./lib/fileMentions.js";
 
@@ -117,12 +118,12 @@ function getSettingsFilePath() {
   return path.join(os.homedir(), ".piecode", "settings.json");
 }
 
-async function loadSettings(filePath) {
+async function loadSettings(filePath, { workspaceDir = process.cwd() } = {}) {
   try {
     const raw = await fs.readFile(filePath, "utf8");
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    return parsed;
+    return mergeCommonMcpServers(parsed, { workspaceDir });
   } catch {
     return {};
   }
@@ -460,6 +461,9 @@ Environment:
   PIECODE_TOOL_BUDGET     Optional (default 6, range 1-12)
   PIECODE_VERBOSE_TOOL_LOGS Optional (set 1 for full tool input details in logs)
   PIECODE_SETTINGS_FILE Optional (default ~/.piecode/settings.json)
+  PIECODE_MCP_IMPORT Optional (default 1; set 0 to disable shared MCP config import)
+  PIECODE_MCP_CONFIG_PATHS Optional (comma-separated JSON config paths with mcpServers)
+  MCP via settings       Configure mcpServers in ~/.piecode/settings.json (overrides imported configs)
   PIECODE_SKILLS_DIR Optional (comma-separated skill root directories)
   PIECODE_HISTORY_FILE Optional (default ~/.piecode_history)
 
@@ -909,7 +913,7 @@ async function runDirectShellCommand(command, { workspaceDir, logLine, tui, disp
   }
 }
 
-function maybeHandleLocalInfoTask(input, { logLine, tui, display } = {}) {
+function maybeHandleLocalInfoTask(input, { logLine, tui, display, mcpHub = null } = {}) {
   const text = String(input || "").trim().toLowerCase();
   const askTools =
     /^(what|which)\s+tools?\s+(do\s+you\s+have|are\s+available)/i.test(text) ||
@@ -926,6 +930,16 @@ function maybeHandleLocalInfoTask(input, { logLine, tui, display } = {}) {
     "- `search_files`: Search file contents (ripgrep/grep/native)",
     "- `todo_write` / `todowrite`: Update task todo list",
   ];
+  if (mcpHub && typeof mcpHub.hasServers === "function" && mcpHub.hasServers()) {
+    const names = mcpHub.getServerNames();
+    lines.push("- `list_mcp_servers`: List configured MCP servers");
+    lines.push("- `list_mcp_tools`: List tools exposed by MCP servers");
+    lines.push("- `mcp_call_tool`: Call a specific MCP tool");
+    lines.push("- `list_mcp_resources`: List resources from MCP servers");
+    lines.push("- `list_mcp_resource_templates`: List resource templates from MCP servers");
+    lines.push("- `read_mcp_resource`: Read a resource by URI from an MCP server");
+    if (names.length > 0) lines.push(`- MCP servers: ${names.join(", ")}`);
+  }
   const message = lines.join("\n");
   logLine(`[response] ${message}`);
   logLine("[result] done | time: 0ms | tok ↑0 ↓0");
@@ -2078,7 +2092,8 @@ async function main() {
   }
 
   const settingsFile = getSettingsFilePath();
-  const settings = await loadSettings(settingsFile);
+  const workspaceDir = process.cwd();
+  const settings = await loadSettings(settingsFile, { workspaceDir });
   const planModeRef = { value: process.env.PIECODE_PLAN_MODE === "1" };
   const settingsModelSuggestions = collectModelsFromSettings(settings);
   const modelCatalogRef = {
@@ -2107,7 +2122,6 @@ async function main() {
 
   const providerOptionsRef = { value: resolveProviderOptions(args, settings) };
   const providerRef = { value: getProvider(providerOptionsRef.value) };
-  const workspaceDir = process.cwd();
   const projectInstructionsLoaded = await loadProjectInstructions(workspaceDir);
   const projectInstructionsRef = { value: projectInstructionsLoaded.instructions };
   const projectInstructionsStatusRef = { value: projectInstructionsLoaded.status };
@@ -2926,6 +2940,16 @@ async function main() {
     return ans === "y" || ans === "yes";
   };
 
+  const mcpHub = new McpHub({
+    workspaceDir,
+    settings,
+    onLog: (line) => logLine(line),
+  });
+  if (mcpHub.hasServers()) {
+    const names = mcpHub.getServerNames();
+    logLine(`[mcp] configured servers: ${names.join(", ")}`);
+  }
+
   const agent = new Agent({
     provider: providerRef.value,
     workspaceDir,
@@ -2933,6 +2957,7 @@ async function main() {
     askApproval,
     activeSkillsRef,
     projectInstructionsRef,
+    mcpHub,
     onTodoWrite: (nextTodos) => {
       todosRef.value = normalizeTodos(nextTodos);
       todoAutoTrackRef.value = false;
@@ -3203,48 +3228,50 @@ async function main() {
   });
 
   if (args.prompt !== null) {
-    startTaskTrace(taskTraceRef, { input: args.prompt, kind: "agent" });
-    const localInfo = maybeHandleLocalInfoTask(args.prompt, { logLine, tui, display });
-    if (localInfo.handled) {
-      const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done" });
-      if (saved) console.log(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
+    try {
+      startTaskTrace(taskTraceRef, { input: args.prompt, kind: "agent" });
+      const localInfo = maybeHandleLocalInfoTask(args.prompt, { logLine, tui, display, mcpHub });
+      if (localInfo.handled) {
+        const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done" });
+        if (saved) console.log(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
+        return;
+      }
+      if (tui) tui.setProjectInstructionsVisible(false);
+      if (startupAutoSkills.enabled.length > 0) {
+        console.log(`auto-loaded skills: ${startupAutoSkills.enabled.join(", ")}`);
+      }
+      if (startupAutoSkills.missing.length > 0) {
+        console.error(`warning: auto-load skills missing: ${startupAutoSkills.missing.join(", ")}`);
+      }
+
+      const autoSkillResult = await autoEnableSkills(args.prompt, activeSkillsRef, skillIndex);
+      if (autoSkillResult.enabled.length > 0) {
+        console.log(`auto-enabled skills: ${autoSkillResult.enabled.join(", ")}`);
+      }
+
+      try {
+        const result = await agent.runTurn(args.prompt, { planOnly: planModeRef.value });
+        const output = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+        if (display) {
+          display.onResponse(output);
+        } else {
+          console.log(`\n${output}`);
+        }
+        const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done" });
+        if (saved) console.log(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
+      } catch (err) {
+        const saved = await finishTaskTrace(taskTraceRef, workspaceDir, {
+          status: "error",
+          error: String(err?.message || "error"),
+        });
+        if (saved) console.error(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
+        throw err;
+      }
+    } finally {
+      await mcpHub.close();
       await saveHistory(historyFile, rl.history);
       rl.close();
-      return;
     }
-    if (tui) tui.setProjectInstructionsVisible(false);
-    if (startupAutoSkills.enabled.length > 0) {
-      console.log(`auto-loaded skills: ${startupAutoSkills.enabled.join(", ")}`);
-    }
-    if (startupAutoSkills.missing.length > 0) {
-      console.error(`warning: auto-load skills missing: ${startupAutoSkills.missing.join(", ")}`);
-    }
-
-    const autoSkillResult = await autoEnableSkills(args.prompt, activeSkillsRef, skillIndex);
-    if (autoSkillResult.enabled.length > 0) {
-      console.log(`auto-enabled skills: ${autoSkillResult.enabled.join(", ")}`);
-    }
-
-    try {
-      const result = await agent.runTurn(args.prompt, { planOnly: planModeRef.value });
-      const output = typeof result === "string" ? result : JSON.stringify(result, null, 2);
-      if (display) {
-        display.onResponse(output);
-      } else {
-        console.log(`\n${output}`);
-      }
-      const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done" });
-      if (saved) console.log(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
-    } catch (err) {
-      const saved = await finishTaskTrace(taskTraceRef, workspaceDir, {
-        status: "error",
-        error: String(err?.message || "error"),
-      });
-      if (saved) console.error(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
-      throw err;
-    }
-    await saveHistory(historyFile, rl.history);
-    rl.close();
     return;
   }
 
@@ -3447,7 +3474,7 @@ async function main() {
       continue;
     }
 
-    const localTask = maybeHandleLocalInfoTask(finalInput, { logLine, tui, display });
+    const localTask = maybeHandleLocalInfoTask(finalInput, { logLine, tui, display, mcpHub });
     if (localTask.handled) {
       const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done" });
       if (saved) logLine(`[trace] session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
@@ -3502,6 +3529,7 @@ async function main() {
   try {
     await saveHistory(historyFile, rl.history);
   } finally {
+    await mcpHub.close();
     if (onKeypress && keypressSource && typeof keypressSource.off === "function") {
       keypressSource.off("keypress", onKeypress);
     }

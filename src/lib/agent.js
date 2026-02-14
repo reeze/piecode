@@ -12,6 +12,7 @@ export class Agent {
     activeSkillsRef,
     onTodoWrite,
     projectInstructionsRef,
+    mcpHub = null,
   }) {
     this.provider = provider;
     this.workspaceDir = workspaceDir;
@@ -20,6 +21,7 @@ export class Agent {
     this.onEvent = onEvent;
     this.activeSkillsRef = activeSkillsRef || { value: [] };
     this.projectInstructionsRef = projectInstructionsRef || { value: null };
+    this.mcpHub = mcpHub && typeof mcpHub.hasServers === "function" ? mcpHub : null;
     this.history = [];
     this.tools = createToolset({
       workspaceDir,
@@ -27,6 +29,7 @@ export class Agent {
       askApproval,
       onToolStart: (tool, input) => this.onEvent?.({ type: "tool_start", tool, input }),
       onTodoWrite,
+      mcpHub: this.mcpHub,
     });
     this.enablePlanner = process.env.PIECODE_ENABLE_PLANNER === "1";
     this.taskPlanner = this.enablePlanner ? new TaskPlanner(this) : null;
@@ -474,6 +477,8 @@ export class Agent {
     let activePlan = null;
     let turnPolicy = this.detectTurnPolicy(userMessage);
     const planOnly = Boolean(options?.planOnly);
+    const mcpEnabled = Boolean(this.mcpHub?.hasServers?.());
+    const mcpServerNames = mcpEnabled ? this.mcpHub.getServerNames() : [];
 
     try {
       this.throwIfAborted(signal);
@@ -486,7 +491,21 @@ export class Agent {
         turnPolicy = {
           name: "plan_mode_safe_tools",
           maxToolCalls: planBudget,
-          allowedTools: ["shell", "read_file", "list_files", "search_files"],
+          allowedTools: [
+            "shell",
+            "read_file",
+            "list_files",
+            "search_files",
+            ...(mcpEnabled
+              ? [
+                  "list_mcp_servers",
+                  "list_mcp_tools",
+                  "list_mcp_resources",
+                  "list_mcp_resource_templates",
+                  "read_mcp_resource",
+                ]
+              : []),
+          ],
           disableTodos: true,
           forceFinalizeAfterTool: false,
           note:
@@ -559,12 +578,17 @@ export class Agent {
             projectInstructions: this.projectInstructionsRef?.value?.content || null,
             nativeTools: useNativeTools,
             turnPolicy,
+            mcpEnabled,
+            mcpServerNames,
           });
 
           this.onEvent?.({ type: "model_call", provider: this.provider.kind, model: this.provider.model });
           if (useNativeTools) {
             const messages = buildMessages({ history: this.history, format: nativeFormat });
-            const tools = buildToolDefinitions(nativeFormat);
+            const tools = buildToolDefinitions(nativeFormat, {
+              mcpEnabled,
+              mcpServerNames,
+            });
             const messagesDump = JSON.stringify(messages, null, 2);
             const toolsDump = JSON.stringify(tools, null, 2);
             this.onEvent?.({
