@@ -134,11 +134,12 @@ export function buildSystemPrompt({
     "- Before finalizing, confirm deliverables, mention validation status, and clearly call out remaining risks",
 
     "SEARCH BEST PRACTICES:",
-    "- Use search_files to find code patterns, function definitions, or references",
-    "- Use file_pattern to narrow search (e.g., '*.js' for JavaScript files only)",
+    "- Use rg to find code patterns, function definitions, or references",
+    "- Use search_files only as a compatibility alias for rg",
+    "- Use file_pattern/glob to narrow search (e.g., '*.js' for JavaScript files only)",
     "- Use case_sensitive: true only when exact case matters",
     "- Keep regex patterns simple for better performance",
-    "- Use search_files before read_file when you don't know the exact file location",
+    "- Use rg before read_file when you don't know the exact file location",
   ];
 
   if (!nativeTools) {
@@ -152,6 +153,8 @@ export function buildSystemPrompt({
       "list_files",
       "glob_files",
       "find_files",
+      "rg",
+      "grep",
       "search_files",
       "git_status",
       "git_diff",
@@ -192,7 +195,9 @@ export function buildSystemPrompt({
       "- list_files: { path?: string, max_entries?: number, include_hidden?: boolean, include_ignored?: boolean } - List files in a directory (hidden/ignored skipped by default)",
       "- glob_files: { path?: string, pattern?: string, max_results?: number, include_hidden?: boolean } - Find files by glob pattern",
       "- find_files: { path?: string, query: string, max_results?: number, include_hidden?: boolean } - Fuzzy-find files by path text",
-      "- search_files: { path?: string, regex?: string, query?: string, file_pattern?: string, max_results?: number, case_sensitive?: boolean } - Search for patterns in files using ripgrep/grep (query is accepted as alias)",
+      "- rg: { pattern?: string, regex?: string, query?: string, path?: string, glob?: string, file_pattern?: string, max_results?: number, case_sensitive?: boolean, fixed_strings?: boolean, context_lines?: number } - Fast code search using ripgrep semantics; prefer this for codebase search",
+      "- grep: alias for rg",
+      "- search_files: compatibility alias for rg",
       "- git_status: { porcelain?: boolean } - Show current git status",
       "- git_diff: { path?: string, staged?: boolean, context?: number } - Show git diff",
       "- run_tests: { command?: string, timeout_ms?: number } - Run test command and return parsed summary",
@@ -211,9 +216,9 @@ export function buildSystemPrompt({
         : []),
 
       "EXAMPLES:",
-      'Find all uses of a function: {"type":"tool_use","tool":"search_files","input":{"regex":"functionName\\(","path":"src","file_pattern":"*.js"},"reason":"Find all calls to functionName in JS files"}',
-      'Search for TODO comments: {"type":"tool_use","tool":"search_files","input":{"regex":"TODO|FIXME|XXX","max_results":20},"reason":"Find all TODO comments in the codebase"}',
-      'Find class definitions: {"type":"tool_use","tool":"search_files","input":{"regex":"class\\s+\\w+","file_pattern":"*.ts"},"reason":"Find all class definitions in TypeScript files"}',
+      'Find all uses of a function: {"type":"tool_use","tool":"rg","input":{"pattern":"functionName\\(","path":"src","glob":"*.js"},"reason":"Find all calls to functionName in JS files"}',
+      'Search for TODO comments: {"type":"tool_use","tool":"rg","input":{"pattern":"TODO|FIXME|XXX","max_results":20},"reason":"Find all TODO comments in the codebase"}',
+      'Find class definitions: {"type":"tool_use","tool":"rg","input":{"pattern":"class\\s+\\w+","glob":"*.ts"},"reason":"Find all class definitions in TypeScript files"}',
 
       "CRITICAL:",
       "- Your entire response must be valid JSON",
@@ -289,6 +294,8 @@ const KNOWN_TOOL_NAMES = new Set([
   "list_files",
   "glob_files",
   "find_files",
+  "rg",
+  "grep",
   "search_files",
   "git_status",
   "git_diff",
@@ -372,6 +379,13 @@ function normalizeParsedAction(parsed = null) {
     };
   }
 
+  if (type === "tool_uses" && Array.isArray(parsed.calls)) {
+    const calls = parsed.calls
+      .map((call) => normalizeParsedAction({ ...call, type: "tool_use" }))
+      .filter((call) => call?.type === "tool_use");
+    if (calls.length > 0) return { type: "tool_uses", calls };
+  }
+
   if (KNOWN_TOOL_NAMES.has(type)) {
     return {
       type: "tool_use",
@@ -425,6 +439,23 @@ export function formatHistory(messages) {
         const resultText = toJsonText(parsed.result);
         lines.push(`${role}: Tool Result: ${toolName} (result chars: ${resultText.length})`);
         lines.push(truncateForHistory(resultText, maxToolResultChars));
+        continue;
+      }
+
+      if (type === "tool_uses" && Array.isArray(parsed.calls)) {
+        const names = parsed.calls.map((call) => String(call?.tool || "unknown")).join(", ");
+        lines.push(`${role}: Tool Uses: ${names}`);
+        continue;
+      }
+
+      if (type === "tool_results" && Array.isArray(parsed.results)) {
+        lines.push(`${role}: Tool Results: ${parsed.results.length} result(s)`);
+        for (const item of parsed.results.slice(0, 8)) {
+          const toolName = String(item?.tool || "unknown");
+          const resultText = toJsonText(item?.result);
+          lines.push(`- ${toolName} (result chars: ${resultText.length})`);
+          lines.push(truncateForHistory(resultText, maxToolResultChars));
+        }
         continue;
       }
 
@@ -717,12 +748,85 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
       },
     },
     {
-      name: "search_files",
+      name: "rg",
       description:
-        "Search for patterns in files using ripgrep (preferred) or grep. Fast code search with context. Excludes node_modules, .git, dist, build directories automatically.",
+        "Fast codebase search using ripgrep semantics. Prefer this for finding symbols, definitions, references, strings, and TODOs. Excludes node_modules, .git, dist, build directories automatically.",
       input_schema: {
         type: "object",
         properties: {
+          pattern: {
+            type: "string",
+            description: "Search pattern. Regex by default; set fixed_strings for literal search.",
+          },
+          regex: {
+            type: "string",
+            description: "Alias for pattern.",
+          },
+          query: {
+            type: "string",
+            description: "Alias for pattern.",
+          },
+          path: {
+            type: "string",
+            description: "Relative path to search in (default: workspace root).",
+          },
+          glob: {
+            type: "string",
+            description: "Glob pattern to filter files (e.g., '*.js', '**/*.ts').",
+          },
+          file_pattern: {
+            type: "string",
+            description: "Alias for glob.",
+          },
+          max_results: {
+            type: "integer",
+            description: "Maximum matches to return (default: 50, max: 200).",
+          },
+          case_sensitive: {
+            type: "boolean",
+            description: "Case-sensitive search (default: false).",
+          },
+          fixed_strings: {
+            type: "boolean",
+            description: "Treat pattern as literal text instead of regex (default: false).",
+          },
+          context_lines: {
+            type: "integer",
+            description: "Context lines around matches (default: 2, max: 10).",
+          },
+        },
+      },
+    },
+    {
+      name: "grep",
+      description: "Alias for rg. Fast codebase search by pattern.",
+      input_schema: {
+        type: "object",
+        properties: {
+          pattern: { type: "string", description: "Search pattern" },
+          regex: { type: "string", description: "Alias for pattern" },
+          query: { type: "string", description: "Alias for pattern" },
+          path: { type: "string", description: "Relative path to search in" },
+          glob: { type: "string", description: "Glob pattern to filter files" },
+          file_pattern: { type: "string", description: "Alias for glob" },
+          max_results: { type: "integer", description: "Maximum matches to return" },
+          case_sensitive: { type: "boolean", description: "Case-sensitive search" },
+          fixed_strings: { type: "boolean", description: "Literal search instead of regex" },
+          context_lines: { type: "integer", description: "Context lines around matches" },
+        },
+      },
+    },
+    {
+      name: "search_files",
+      description:
+        "Compatibility alias for rg. Search for patterns in files using ripgrep (preferred) or grep.",
+      input_schema: {
+        type: "object",
+        properties: {
+          pattern: {
+            type: "string",
+            description: "Search pattern. Regex by default; set fixed_strings for literal search.",
+          },
           path: {
             type: "string",
             description: "Relative path to search in (default: workspace root)",
@@ -739,6 +843,10 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
             type: "string",
             description: "Glob pattern to filter files (e.g., '*.js', '*.ts')",
           },
+          glob: {
+            type: "string",
+            description: "Alias for file_pattern",
+          },
           max_results: {
             type: "integer",
             description: "Maximum results to return (default: 50, max: 200)",
@@ -746,6 +854,14 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
           case_sensitive: {
             type: "boolean",
             description: "Case-sensitive search (default: false)",
+          },
+          fixed_strings: {
+            type: "boolean",
+            description: "Treat pattern as literal text instead of regex",
+          },
+          context_lines: {
+            type: "integer",
+            description: "Context lines around matches (default: 2, max: 10)",
           },
         },
       },
@@ -890,7 +1006,80 @@ export function buildMessages(arg1 = {}, arg2 = {}) {
     const textContent = toText(rawContent);
     const toolCall = asObject(msg?.toolCall);
     const toolResult = asObject(msg?.toolResult);
+    const toolCalls = Array.isArray(msg?.toolCalls) ? msg.toolCalls : [];
+    const toolResults = Array.isArray(msg?.toolResults) ? msg.toolResults : [];
     const parsed = parseMaybeJson(rawContent);
+
+    if (toolCalls.length > 0) {
+      const calls = toolCalls
+        .map((call) => ({
+          id: String(call?.id || ""),
+          name: String(call?.name || ""),
+          input: asObject(call?.input),
+        }))
+        .filter((call) => call.name);
+      if (calls.length > 0) {
+        if (!openaiMode) {
+          const blocks = [];
+          const preface = textContent && textContent !== "{}" ? textContent : "";
+          if (preface) blocks.push({ type: "text", text: preface });
+          for (const call of calls) {
+            blocks.push({
+              type: "tool_use",
+              id: call.id,
+              name: call.name,
+              input: call.input || {},
+            });
+          }
+          messages.push({ role: "assistant", content: blocks });
+        } else {
+          messages.push({
+            role: "assistant",
+            content: null,
+            tool_calls: calls.map((call) => ({
+              id: call.id,
+              type: "function",
+              function: {
+                name: call.name,
+                arguments: JSON.stringify(call.input || {}),
+              },
+            })),
+          });
+        }
+        continue;
+      }
+    }
+
+    if (toolResults.length > 0) {
+      const results = toolResults
+        .map((item) => ({
+          id: String(item?.toolCallId || item?.id || ""),
+          name: String(item?.name || ""),
+          result: item?.result ?? "",
+        }))
+        .filter((item) => item.id);
+      if (results.length > 0) {
+        if (!openaiMode) {
+          messages.push({
+            role: "user",
+            content: results.map((item) => ({
+              type: "tool_result",
+              tool_use_id: item.id,
+              content: toText(item.result),
+            })),
+          });
+        } else {
+          for (const item of results) {
+            messages.push({
+              role: "tool",
+              tool_call_id: item.id,
+              content: toText(item.result),
+            });
+          }
+        }
+        continue;
+      }
+    }
 
     const legacyToolUse =
       parsed && String(parsed?.type || "").toLowerCase() === "tool_use"
@@ -1006,16 +1195,21 @@ export function parseNativeResponse(response, format = "anthropic") {
 
   if (format === "anthropic") {
     const content = Array.isArray(response.content) ? response.content : [];
-    const toolUse = content.find((b) => b?.type === "tool_use");
-    if (toolUse) {
+    const toolUses = content.filter((b) => b?.type === "tool_use");
+    if (toolUses.length > 0) {
       const textBlock = content.find((b) => b?.type === "text");
-      return {
+      const calls = toolUses.map((toolUse) => ({
         type: "tool_use",
         tool: toolUse.name,
         input: toolUse.input && typeof toolUse.input === "object" ? toolUse.input : {},
         reason: typeof textBlock?.text === "string" ? textBlock.text : "",
         thought: "",
         _callId: toolUse.id || "",
+      }));
+      if (calls.length > 1) return { type: "tool_uses", calls };
+      return {
+        type: "tool_use",
+        ...calls[0],
       };
     }
     const textBlock = content.find((b) => b?.type === "text");

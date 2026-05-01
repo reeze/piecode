@@ -414,6 +414,33 @@ describe('Prompt functions', () => {
       expect(messages[2].content).toBe('file contents');
     });
 
+    test('converts batched toolCalls and toolResults to OpenAI messages', () => {
+      const history = [
+        { role: 'user', content: 'Read two files' },
+        {
+          role: 'assistant',
+          toolCalls: [
+            { id: 'call_1', name: 'read_file', input: { path: 'a.txt' } },
+            { id: 'call_2', name: 'read_file', input: { path: 'b.txt' } },
+          ],
+        },
+        {
+          role: 'user',
+          toolResults: [
+            { toolCallId: 'call_1', name: 'read_file', result: 'a' },
+            { toolCallId: 'call_2', name: 'read_file', result: 'b' },
+          ],
+        },
+      ];
+
+      const messages = buildMessages(history, { format: 'openai' });
+      expect(messages).toHaveLength(4);
+      expect(messages[1].role).toBe('assistant');
+      expect(messages[1].tool_calls).toHaveLength(2);
+      expect(messages[2]).toMatchObject({ role: 'tool', tool_call_id: 'call_1', content: 'a' });
+      expect(messages[3]).toMatchObject({ role: 'tool', tool_call_id: 'call_2', content: 'b' });
+    });
+
     test('falls back to parsing content JSON for legacy history entries', () => {
       const history = [
         {
@@ -479,6 +506,23 @@ describe('Prompt functions', () => {
       expect(action.tool).toBe('shell');
       expect(action._callId).toBe('toolu_02');
       expect(action.reason).toBe('');
+    });
+
+    test('parses Anthropic response with multiple tool_use blocks', () => {
+      const response = {
+        content: [
+          { type: 'text', text: 'read both' },
+          { type: 'tool_use', id: 'toolu_01', name: 'read_file', input: { path: 'a.txt' } },
+          { type: 'tool_use', id: 'toolu_02', name: 'read_file', input: { path: 'b.txt' } },
+        ],
+        stop_reason: 'tool_use',
+      };
+
+      const action = parseNativeResponse(response, 'anthropic');
+      expect(action.type).toBe('tool_uses');
+      expect(action.calls).toHaveLength(2);
+      expect(action.calls[0]._callId).toBe('toolu_01');
+      expect(action.calls[1].input).toEqual({ path: 'b.txt' });
     });
 
     test('parses OpenAI tool_calls response', () => {

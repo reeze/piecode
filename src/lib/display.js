@@ -28,6 +28,23 @@ function truncateLine(line, maxLen = 120) {
   return `${line.slice(0, maxLen - 3)}...`;
 }
 
+function summarizeToolInput(tool, input, maxLen = 80) {
+  const safe = input && typeof input === "object" ? input : {};
+  let text = "";
+  if (tool === "shell") text = safe.command || "";
+  else if (tool === "read_file" || tool === "write_file" || tool === "edit_file" || tool === "apply_patch") text = safe.path || "";
+  else if (tool === "read_files") text = Array.isArray(safe.paths) ? `${safe.paths.length} files` : "";
+  else if (tool === "list_files") text = safe.path || ".";
+  else if (tool === "glob_files") text = `${safe.path || "."} ${safe.pattern || "**/*"}`;
+  else if (tool === "find_files") text = `${safe.path || "."} ${safe.query || ""}`;
+  else if (tool === "rg" || tool === "grep" || tool === "search_files") {
+    text = `${safe.pattern || safe.regex || safe.query || ""}${safe.glob || safe.file_pattern ? ` in ${safe.glob || safe.file_pattern}` : ""}`;
+  } else if (tool === "git_diff") text = `${safe.staged ? "--staged " : ""}${safe.path || ""}`.trim();
+  else if (tool === "run_tests") text = safe.command || "npm test";
+  else text = JSON.stringify(safe);
+  return truncateLine(String(text || "").replace(/\s+/g, " ").trim(), maxLen);
+}
+
 class Spinner {
   constructor() {
     this.index = 0;
@@ -351,6 +368,28 @@ export class Display {
     }
   }
 
+  onToolBatchUse(calls = []) {
+    this.onThinkingDone();
+    const list = Array.isArray(calls) ? calls : [];
+    const groups = new Map();
+    for (const call of list) {
+      const key = String(call?.tool || "tool");
+      groups.set(key, (groups.get(key) || 0) + 1);
+    }
+    const label = [...groups.entries()].map(([tool, count]) => `${tool}${count > 1 ? ` x${count}` : ""}`).join(", ");
+    process.stdout.write(`\n  ${c(COLORS.cyan, `> Tools: ${label || `${list.length} calls`}`)}\n`);
+    const previews = list
+      .map((call) => summarizeToolInput(call?.tool, call?.input, 90))
+      .filter(Boolean)
+      .slice(0, 4);
+    for (const item of previews) {
+      process.stdout.write(`  ${c(COLORS.dim, `- ${item}`)}\n`);
+    }
+    if (list.length > previews.length) {
+      process.stdout.write(`  ${c(COLORS.dim, `- ... ${list.length - previews.length} more`)}\n`);
+    }
+  }
+
   onToolStart(tool, input) {
     this.currentToolStart = Date.now();
     const label = this._formatRunLabel(tool, input);
@@ -425,6 +464,10 @@ export class Display {
         return `> Glob ${input?.pattern || "**/*"}`;
       case "find_files":
         return `> Find "${input?.query || ""}"`;
+      case "rg":
+      case "grep":
+      case "search_files":
+        return `> Search "${input?.pattern || input?.regex || input?.query || ""}"`;
       case "git_status":
         return "> Git status";
       case "git_diff":
@@ -459,6 +502,9 @@ export class Display {
         return `Listing ${input?.path || "."}...`;
       case "glob_files":
       case "find_files":
+      case "rg":
+      case "grep":
+      case "search_files":
         return "Scanning files...";
       case "git_status":
       case "git_diff":
@@ -540,6 +586,16 @@ export class Display {
         const preview = entries.slice(0, 12).map((l) => `    ${dim(l)}`);
         if (entries.length > 12) {
           preview.push(`    ${dim(`... (${entries.length - 12} more)`)}`);
+        }
+        return preview.join("\n");
+      }
+      case "rg":
+      case "grep":
+      case "search_files": {
+        const lines = text.split("\n").filter(Boolean);
+        const preview = lines.slice(0, 16).map((l) => `    ${dim(truncateLine(l, 160))}`);
+        if (lines.length > 16) {
+          preview.push(`    ${dim(`... (${lines.length - 16} more)`)}`);
         }
         return preview.join("\n");
       }

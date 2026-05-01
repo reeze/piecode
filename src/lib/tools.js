@@ -1190,29 +1190,41 @@ export function createToolset({
   // Search files using ripgrep, grep, or native implementation
   const searchFiles = async ({
     path: searchPath = ".",
+    pattern: patternAlias,
     regex,
     query,
+    glob,
     file_pattern: filePattern,
     max_results: maxResults = 50,
     case_sensitive: caseSensitive = false,
+    fixed_strings: fixedStrings = false,
+    context_lines: contextLines = 2,
+    _toolName = "search_files",
   } = {}) => {
     const pattern =
       typeof regex === "string" && regex.trim()
         ? regex
+        : typeof patternAlias === "string" && patternAlias.trim()
+          ? patternAlias
         : typeof query === "string"
           ? query
           : "";
-    onToolStart?.("search_files", {
+    const resolvedFilePattern = filePattern || glob;
+    const resolvedContextLines = Math.min(Math.max(Number(contextLines) || 2, 0), 10);
+    onToolStart?.(_toolName, {
       path: searchPath,
       regex: pattern,
       query,
-      file_pattern: filePattern,
+      pattern,
+      file_pattern: resolvedFilePattern,
       max_results: maxResults,
       case_sensitive: caseSensitive,
+      fixed_strings: fixedStrings,
+      context_lines: resolvedContextLines,
     });
 
     if (!pattern || typeof pattern !== "string") {
-      throw new Error("Missing required parameter: regex or query (search pattern)");
+      throw new Error("Missing required parameter: pattern, regex, or query (search pattern)");
     }
 
     const absPath = resolveInsideRoot(workspaceDir, searchPath);
@@ -1224,9 +1236,11 @@ export function createToolset({
         workspaceDir,
         absPath,
         regex: pattern,
-        filePattern,
+        filePattern: resolvedFilePattern,
         limit,
         caseSensitive,
+        fixedStrings: Boolean(fixedStrings),
+        contextLines: resolvedContextLines,
       });
     }
 
@@ -1236,9 +1250,11 @@ export function createToolset({
         workspaceDir,
         absPath,
         regex: pattern,
-        filePattern,
+        filePattern: resolvedFilePattern,
         limit,
         caseSensitive,
+        fixedStrings: Boolean(fixedStrings),
+        contextLines: resolvedContextLines,
       });
     }
 
@@ -1247,11 +1263,28 @@ export function createToolset({
       workspaceDir,
       absPath,
       regex: pattern,
-      filePattern,
+      filePattern: resolvedFilePattern,
       limit,
       caseSensitive,
+      fixedStrings: Boolean(fixedStrings),
     });
   };
+
+  const rgTool = async (input = {}) =>
+    searchFiles({
+      ...asObject(input),
+      regex: input?.regex ?? input?.pattern ?? input?.query,
+      file_pattern: input?.file_pattern ?? input?.glob,
+      _toolName: "rg",
+    });
+
+  const grepTool = async (input = {}) =>
+    searchFiles({
+      ...asObject(input),
+      regex: input?.regex ?? input?.pattern ?? input?.query,
+      file_pattern: input?.file_pattern ?? input?.glob,
+      _toolName: "grep",
+    });
 
   const listMcpServers = async () => {
     onToolStart?.("list_mcp_servers", {});
@@ -1359,6 +1392,8 @@ export function createToolset({
     run_tests: runTests,
     todo_write: todoWrite,
     todowrite: todoWrite,
+    rg: rgTool,
+    grep: grepTool,
     search_files: searchFiles,
     list_mcp_servers: listMcpServers,
     list_mcp_tools: listMcpTools,
@@ -1376,9 +1411,12 @@ async function searchWithRipgrep({
   filePattern,
   limit,
   caseSensitive,
+  fixedStrings = false,
+  contextLines = 2,
 }) {
   const baseArgs = [];
   if (!caseSensitive) baseArgs.push("-i");
+  if (fixedStrings) baseArgs.push("--fixed-strings");
   if (filePattern) baseArgs.push("-g", filePattern);
   baseArgs.push(
     "-g", "!node_modules",
@@ -1400,14 +1438,15 @@ async function searchWithRipgrep({
     "--max-depth",
     "20",
     "-C",
-    "2",
+    String(contextLines),
     ...baseArgs,
+    "--",
     regex,
     absPath,
   ];
 
   try {
-    const { stdout } = await exec(`rg ${args.map((a) => `"${a}"`).join(" ")}`, {
+    const { stdout } = await execFile("rg", args, {
       cwd: workspaceDir,
       maxBuffer: 10 * 1024 * 1024,
     });
@@ -1423,11 +1462,12 @@ async function searchWithRipgrep({
         "--max-depth",
         "20",
         ...baseArgs,
+        "--",
         regex,
         absPath,
       ];
       try {
-        const { stdout } = await exec(`rg ${compactArgs.map((a) => `"${a}"`).join(" ")}`, {
+        const { stdout } = await execFile("rg", compactArgs, {
           cwd: workspaceDir,
           maxBuffer: 10 * 1024 * 1024,
         });
@@ -1464,16 +1504,21 @@ async function searchWithGrep({
   filePattern,
   limit,
   caseSensitive,
+  fixedStrings = false,
+  contextLines = 2,
 }) {
   const grepArgs = [
     "-r",
     "-n",
     "-H",
-    "-C", "2", // 2 lines of context
+    "-C", String(contextLines),
   ];
 
   if (!caseSensitive) {
     grepArgs.push("-i");
+  }
+  if (fixedStrings) {
+    grepArgs.push("-F");
   }
 
   if (filePattern) {
@@ -1490,13 +1535,12 @@ async function searchWithGrep({
     "--exclude-dir=coverage"
   );
 
-  // Escape regex for grep
-  const escapedRegex = regex.replace(/"/g, '\\"');
-  grepArgs.push(escapedRegex);
+  grepArgs.push("--");
+  grepArgs.push(regex);
   grepArgs.push(absPath);
 
   try {
-    const { stdout, stderr } = await exec(`grep ${grepArgs.map(a => `"${a}"`).join(" ")}`, {
+    const { stdout, stderr } = await execFile("grep", grepArgs, {
       cwd: workspaceDir,
       maxBuffer: 10 * 1024 * 1024,
     });
@@ -1519,10 +1563,12 @@ async function searchNative({
   filePattern,
   limit,
   caseSensitive,
+  fixedStrings = false,
 }) {
   const results = [];
   const flags = caseSensitive ? "" : "i";
-  const pattern = new RegExp(regex, flags);
+  const pattern = fixedStrings ? null : new RegExp(regex, flags);
+  const literalNeedle = caseSensitive ? String(regex) : String(regex).toLowerCase();
 
   const globPattern = filePattern || "*";
   const isMatch = (filename) => {
@@ -1563,14 +1609,16 @@ async function searchNative({
         lines.forEach((line, index) => {
           if (results.length >= limit) return;
 
-          if (pattern.test(line)) {
+          const haystack = caseSensitive ? line : line.toLowerCase();
+          const matched = fixedStrings ? haystack.includes(literalNeedle) : pattern.test(line);
+          if (matched) {
             const contextBefore = lines.slice(Math.max(0, index - 2), index);
             const contextAfter = lines.slice(index + 1, Math.min(lines.length, index + 3));
 
             results.push({
               file: relPath,
               line: index + 1,
-              column: line.search(pattern) + 1,
+              column: fixedStrings ? haystack.indexOf(literalNeedle) + 1 : line.search(pattern) + 1,
               match: line.trim(),
               contextBefore,
               contextAfter,

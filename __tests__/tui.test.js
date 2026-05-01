@@ -121,7 +121,9 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines("[run] shell echo hi")[0])).toContain("[~]");
     expect(tui.formatTimelineLines("[tool] shell (echo hi)")).toEqual([]);
     expect(tui.formatTimelineLines("[tool] todo_write (3 todos)")).toEqual([]);
-    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("Tool: read_file");
+    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("[tool] Read README.md");
+    expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).toContain("[tool] Search targetSymbol in *.js");
+    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - a.txt; b.txt")[0])).toContain("[tools] read_file x2 - a.txt; b.txt");
     expect(stripAnsi(tui.formatTimelineLines("[result] done")[0])).toContain("[ok] done");
     expect(stripAnsi(tui.formatTimelineLines("[result] shell failed | time: 2s")[0])).toContain(
       "[x] shell failed | time: 2s"

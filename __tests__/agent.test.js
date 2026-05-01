@@ -198,6 +198,36 @@ describe("agent context controls", () => {
     expect(writeCalls).toBe(0);
   });
 
+  test("getCachedSystemPrompt reuses identical prompt inputs", () => {
+    const agent = createAgentWithProvider();
+
+    const first = agent.getCachedSystemPrompt({
+      workspaceDir: process.cwd(),
+      autoApprove: false,
+      activeSkills: [],
+      activePlan: null,
+      projectInstructions: null,
+      nativeTools: false,
+      turnPolicy: null,
+      mcpEnabled: false,
+      mcpServerNames: [],
+    });
+    const second = agent.getCachedSystemPrompt({
+      workspaceDir: process.cwd(),
+      autoApprove: false,
+      activeSkills: [],
+      activePlan: null,
+      projectInstructions: null,
+      nativeTools: false,
+      turnPolicy: null,
+      mcpEnabled: false,
+      mcpServerNames: [],
+    });
+
+    expect(first).toBe(second);
+    expect(agent.systemPromptCache.size).toBe(1);
+  });
+
   test("plan-only mode blocks unsafe tools", async () => {
     let completeCalls = 0;
     const agent = createAgentWithProvider({
@@ -496,6 +526,69 @@ describe("agent context controls", () => {
     expect(calls).toBe(2);
     expect(toolResults).toHaveLength(2);
     expect(result).toContain("done");
+  });
+
+  test("runs safe native tool call batches in parallel", async () => {
+    let calls = 0;
+    let activeTools = 0;
+    let maxActiveTools = 0;
+    const agent = new Agent({
+      provider: {
+        kind: "openrouter-compatible",
+        model: "test-model",
+        supportsNativeTools: true,
+        async complete() {
+          calls += 1;
+          if (calls === 1) {
+            return {
+              message: {
+                role: "assistant",
+                content: "",
+                tool_calls: [
+                  {
+                    id: "read:0",
+                    type: "function",
+                    function: { name: "read_file", arguments: "{\"path\":\"a.txt\"}" },
+                  },
+                  {
+                    id: "read:1",
+                    type: "function",
+                    function: { name: "read_file", arguments: "{\"path\":\"b.txt\"}" },
+                  },
+                ],
+              },
+              finishReason: "tool_calls",
+            };
+          }
+          return {
+            message: { role: "assistant", content: "done" },
+            finishReason: "stop",
+          };
+        },
+      },
+      workspaceDir: process.cwd(),
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      activeSkillsRef: { value: [] },
+      projectInstructionsRef: { value: null },
+    });
+
+    agent.tools.read_file = async ({ path: relPath }) => {
+      activeTools += 1;
+      maxActiveTools = Math.max(maxActiveTools, activeTools);
+      await new Promise((resolve) => setTimeout(resolve, 30));
+      activeTools -= 1;
+      return `content:${relPath}`;
+    };
+
+    const result = await agent.runTurn("read both files");
+    const batchedAssistant = agent.history.find((m) => Array.isArray(m.toolCalls));
+    const batchedResults = agent.history.find((m) => Array.isArray(m.toolResults));
+
+    expect(result).toContain("done");
+    expect(maxActiveTools).toBe(2);
+    expect(batchedAssistant?.toolCalls).toHaveLength(2);
+    expect(batchedResults?.toolResults).toHaveLength(2);
   });
 
   test("native llm_request logs full messages including user prompt", async () => {

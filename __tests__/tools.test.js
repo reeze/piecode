@@ -108,6 +108,9 @@ describe("tools usability", () => {
     expect(typeof tools.read_files).toBe("function");
     expect(typeof tools.glob_files).toBe("function");
     expect(typeof tools.find_files).toBe("function");
+    expect(typeof tools.rg).toBe("function");
+    expect(typeof tools.grep).toBe("function");
+    expect(typeof tools.search_files).toBe("function");
     expect(typeof tools.edit_file).toBe("function");
     expect(typeof tools.apply_patch).toBe("function");
     expect(typeof tools.replace_in_files).toBe("function");
@@ -390,6 +393,34 @@ describe("tools usability", () => {
 
     const result = await tools.search_files({ query: "todo_write", path: "." });
     expect(result).toContain("sample.js");
+  });
+
+  test("rg searches code with ripgrep-style aliases without shell approval", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    await fs.mkdir(path.join(dir, "src"), { recursive: true });
+    await fs.writeFile(path.join(dir, "src", "alpha.js"), "export function targetSymbol() {}\n", "utf8");
+    await fs.writeFile(path.join(dir, "src", "beta.txt"), "targetSymbol in text\n", "utf8");
+    let approvalCalls = 0;
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: false },
+      askApproval: async () => {
+        approvalCalls += 1;
+        return false;
+      },
+    });
+
+    const result = await tools.rg({
+      pattern: "targetSymbol",
+      path: "src",
+      glob: "*.js",
+      fixed_strings: true,
+      max_results: 10,
+    });
+
+    expect(approvalCalls).toBe(0);
+    expect(result).toContain("src/alpha.js");
+    expect(result).not.toContain("src/beta.txt");
   });
 
   test("git_status and git_diff return graceful output outside git repo", async () => {

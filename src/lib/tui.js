@@ -921,6 +921,44 @@ export class SimpleTui {
   }
 
   formatTimelineLines(line) {
+    const toolLabel = (tool, details = "") => {
+      const name = String(tool || "tool");
+      const body = String(details || "").trim();
+      const clean = body ? body.replace(/^\((.*)\)$/, "$1").trim() : "";
+      const suffix = clean ? ` ${color(clean, "2;37")}` : "";
+      switch (name) {
+        case "read_file":
+          return `${color("Read", "36")}${suffix}`;
+        case "read_files":
+          return `${color("Read files", "36")}${suffix}`;
+        case "list_files":
+          return `${color("List", "36")}${suffix}`;
+        case "glob_files":
+          return `${color("Glob", "36")}${suffix}`;
+        case "find_files":
+          return `${color("Find", "36")}${suffix}`;
+        case "rg":
+        case "grep":
+        case "search_files":
+          return `${color("Search", "36")}${suffix}`;
+        case "git_status":
+          return color("Git status", "36");
+        case "git_diff":
+          return `${color("Git diff", "36")}${suffix}`;
+        case "run_tests":
+          return `${color("Test", "36")}${suffix}`;
+        case "edit_file":
+          return `${color("Edit", "36")}${suffix}`;
+        case "write_file":
+          return `${color("Write", "36")}${suffix}`;
+        case "apply_patch":
+          return `${color("Patch", "36")}${suffix}`;
+        case "replace_in_files":
+          return `${color("Replace", "36")}${suffix}`;
+        default:
+          return `${color(name, "36")}${suffix}`;
+      }
+    };
     const padLeft = (text) => {
       const s = String(text || "");
       if (!s) return s;
@@ -993,7 +1031,12 @@ export class SimpleTui {
         // Keep todo changes in status bar only.
         return [];
       }
-      return padAll([color(`Tool: ${body}`, "36")]);
+      const match = body.match(/^([a-zA-Z0-9_.-]+)\s*(.*)$/);
+      return padAll([`${color("[tool]", "2;36")} ${toolLabel(match?.[1] || body, match?.[2] || "")}`]);
+    }
+    if (line.startsWith("[tools] ")) {
+      const body = line.slice(8).trim();
+      return padAll([`${color("[tools]", "1;36")} ${body}`, ""]);
     }
     if (line.startsWith("[response] ")) {
       const text = trimWorkspaceText(line.slice(11).trim(), 8000).text;

@@ -1,8 +1,5 @@
-import { createInterface } from "node:readline/promises";
-import { stdin, stdout } from "node:process";
-
 /**
- * 任务类型枚举
+ * Task type enum
  */
 export const TaskType = {
   ANALYSIS: 'analysis',
@@ -11,20 +8,97 @@ export const TaskType = {
   REFACTORING: 'refactoring',
   TESTING: 'testing',
   DOCUMENTATION: 'documentation',
-  OTHER: 'other'
+  OTHER: 'other',
 };
 
 /**
- * 任务难度级别
+ * Task difficulty enum
  */
 export const TaskDifficulty = {
   SIMPLE: 'simple',
   MEDIUM: 'medium',
-  COMPLEX: 'complex'
+  COMPLEX: 'complex',
 };
 
+const DEFAULT_TEST_COMMAND = 'npm test -- --watchAll=false';
+
+const TASK_PROFILES = [
+  {
+    type: TaskType.ANALYSIS,
+    difficulty: TaskDifficulty.MEDIUM,
+    keywords: ['analyze', 'analyse', 'review', 'inspect', 'examine', 'audit', 'evaluate'],
+    subTasks: [
+      { id: 'analyze-code', description: 'Analyze the current codebase structure and files' },
+      { id: 'identify-issues', description: 'Identify potential issues or areas for improvement' },
+      { id: 'review-architecture', description: 'Review code architecture and design patterns' },
+      { id: 'generate-report', description: 'Generate analysis report with findings' },
+    ],
+    requiredTools: ['list_files', 'read_file', 'search_files'],
+  },
+  {
+    type: TaskType.DEBUGGING,
+    difficulty: TaskDifficulty.MEDIUM,
+    keywords: ['debug', 'fix', 'error', 'bug', 'troubleshoot', 'resolve'],
+    subTasks: [
+      { id: 'reproduce-error', description: 'Inspect failing behavior' },
+      { id: 'locate-bug', description: 'Locate the bug in the codebase' },
+      { id: 'fix-bug', description: 'Implement a fix for the bug' },
+      { id: 'test-fix', description: 'Test the fix to ensure it works' },
+    ],
+    requiredTools: ['git_status', 'search_files', 'run_tests'],
+  },
+  {
+    type: TaskType.IMPLEMENTATION,
+    difficulty: TaskDifficulty.MEDIUM,
+    keywords: ['implement', 'add', 'create', 'build', 'develop', 'feature', 'functionality'],
+    subTasks: [
+      { id: 'analyze-requirements', description: 'Analyze task requirements' },
+      { id: 'design-solution', description: 'Design the implementation approach' },
+      { id: 'write-code', description: 'Write the implementation code' },
+      { id: 'test-code', description: 'Test the implementation' },
+      { id: 'document', description: 'Document the implementation' },
+    ],
+    requiredTools: ['list_files', 'read_file', 'glob_files'],
+  },
+  {
+    type: TaskType.REFACTORING,
+    difficulty: TaskDifficulty.MEDIUM,
+    keywords: ['refactor', 'improve', 'optimize', 'restructure', 'rewrite'],
+    subTasks: [
+      { id: 'analyze-current', description: 'Analyze current implementation' },
+      { id: 'identify-issues', description: 'Identify issues and optimization opportunities' },
+      { id: 'implement-refactor', description: 'Implement refactoring changes' },
+      { id: 'test-changes', description: 'Test the refactored code' },
+    ],
+    requiredTools: ['list_files', 'read_file', 'run_tests'],
+  },
+  {
+    type: TaskType.TESTING,
+    difficulty: TaskDifficulty.MEDIUM,
+    keywords: ['test', 'verify', 'check', 'validate', 'coverage'],
+    subTasks: [
+      { id: 'run-tests', description: 'Run existing tests' },
+      { id: 'analyze-coverage', description: 'Analyze test coverage' },
+      { id: 'add-tests', description: 'Add new tests if needed' },
+      { id: 'fix-failing', description: 'Fix failing tests' },
+    ],
+    requiredTools: ['run_tests', 'list_files', 'find_files'],
+  },
+  {
+    type: TaskType.DOCUMENTATION,
+    difficulty: TaskDifficulty.SIMPLE,
+    keywords: ['document', 'comment', 'writeup', 'readme', 'docs'],
+    subTasks: [
+      { id: 'review-code', description: 'Review the codebase' },
+      { id: 'write-docs', description: 'Write documentation' },
+      { id: 'verify-docs', description: 'Verify documentation accuracy' },
+    ],
+    requiredTools: ['glob_files', 'read_file', 'search_files'],
+  },
+];
+
 /**
- * 任务步骤
+ * Task step
  */
 export class TaskStep {
   constructor(id, description, tool, input = {}, dependencies = []) {
@@ -38,20 +112,28 @@ export class TaskStep {
   }
 
   async execute() {
-    // 这会在Agent中实现
     throw new Error('TaskStep.execute() must be implemented');
   }
 }
 
 /**
- * 任务规划器
+ * Task planner
  */
 export class TaskPlanner {
   constructor(agent) {
     this.agent = agent;
   }
 
+  createStep(id, description, tool, input = {}, dependencies = []) {
+    return new TaskStep(id, description, tool, input, dependencies);
+  }
+
   async analyzeTask(description) {
+    const heuristic = this.getDefaultAnalysis(description);
+    if (!this.shouldRefineAnalysis(description, heuristic)) {
+      return heuristic;
+    }
+
     const analysis = await this.agent.provider.complete({
       systemPrompt: `You are a task analyzer. Your job is to analyze software engineering tasks and determine:
 1. The task type (analysis, debugging, implementation, refactoring, testing, documentation, other)
@@ -68,7 +150,7 @@ Please think through your analysis step by step. Consider:
 - What potential challenges could arise?
 - What's the most efficient way to approach this task?
 
-Your analysis should follow these principles (from Claude Code):
+Your analysis should follow these principles:
 - Keep solutions simple and focused
 - Avoid over-engineering
 - Maintain existing coding style
@@ -87,97 +169,96 @@ Respond with JSON in this format:
   "goal": "main task objective",
   "subTasks": [
     {"id": "step1", "description": "first sub-task"},
-    {"id": "step2", "description": "second sub-task"},
-    {"id": "step3", "description": "third sub-task"}
+    {"id": "step2", "description": "second sub-task"}
   ],
-  "requiredTools": ["shell", "read_file", "write_file", "list_files"],
+  "requiredTools": ["read_file", "list_files", "search_files", "run_tests"],
   "challenges": ["potential challenge 1", "potential challenge 2"]
 }`,
-      prompt: `Analyze the task: "${description}"`
+      prompt: `Analyze the task: "${description}"`,
     });
 
     try {
-      const parsed = JSON.parse(analysis);
-      return parsed;
+      return this.normalizeAnalysisResult(JSON.parse(analysis), heuristic);
     } catch (error) {
       console.error('Error parsing task analysis:', error);
-      return this.getDefaultAnalysis(description);
+      return heuristic;
     }
   }
 
-  getDefaultAnalysis(description) {
-    const hasKeywords = (keywords) => {
-      const desc = description.toLowerCase();
-      return keywords.some(keyword => desc.includes(keyword.toLowerCase()));
-    };
+  shouldRefineAnalysis(description, heuristic) {
+    const text = String(description || '').trim();
+    if (!text) return false;
+    if (heuristic.taskType === TaskType.OTHER) return true;
+    if (text.length >= 220) return true;
 
-    let taskType = TaskType.OTHER;
-    let difficulty = TaskDifficulty.MEDIUM;
-    let subTasks = [];
-    let requiredTools = [];
+    const lower = text.toLowerCase();
+    const matchedTypes = TASK_PROFILES.filter((profile) =>
+      profile.keywords.some((keyword) => lower.includes(keyword))
+    );
 
-    if (hasKeywords(['analyze', 'review', 'inspect', 'examine', 'audit', 'evaluate'])) {
-      taskType = TaskType.ANALYSIS;
-      subTasks = [
-        { id: 'analyze-code', description: 'Analyze the current codebase structure and files' },
-        { id: 'identify-issues', description: 'Identify potential issues or areas for improvement' },
-        { id: 'review-architecture', description: 'Review code architecture and design patterns' },
-        { id: 'generate-report', description: 'Generate analysis report with findings' }
-      ];
-      requiredTools = ['shell', 'read_file', 'list_files'];
-    } else if (hasKeywords(['debug', 'fix', 'error', 'bug', 'troubleshoot', 'resolve'])) {
-      taskType = TaskType.DEBUGGING;
-      subTasks = [
-        { id: 'reproduce-error', description: 'Reproduce the error scenario' },
-        { id: 'locate-bug', description: 'Locate the bug in the codebase' },
-        { id: 'fix-bug', description: 'Implement a fix for the bug' },
-        { id: 'test-fix', description: 'Test the fix to ensure it works' }
-      ];
-      requiredTools = ['shell', 'read_file', 'write_file'];
-    } else if (hasKeywords(['implement', 'add', 'create', 'build', 'develop', 'feature', 'functionality'])) {
-      taskType = TaskType.IMPLEMENTATION;
-      subTasks = [
-        { id: 'analyze-requirements', description: 'Analyze task requirements' },
-        { id: 'design-solution', description: 'Design the implementation approach' },
-        { id: 'write-code', description: 'Write the implementation code' },
-        { id: 'test-code', description: 'Test the implementation' },
-        { id: 'document', description: 'Document the implementation' }
-      ];
-      requiredTools = ['shell', 'read_file', 'write_file', 'list_files'];
-    } else if (hasKeywords(['refactor', 'improve', 'optimize', 'restructure', 'rewrite'])) {
-      taskType = TaskType.REFACTORING;
-      subTasks = [
-        { id: 'analyze-current', description: 'Analyze current implementation' },
-        { id: 'identify-issues', description: 'Identify issues and optimization opportunities' },
-        { id: 'implement-refactor', description: 'Implement refactoring changes' },
-        { id: 'test-changes', description: 'Test the refactored code' }
-      ];
-      requiredTools = ['shell', 'read_file', 'write_file'];
-    } else if (hasKeywords(['test', 'verify', 'check', 'validate', 'coverage'])) {
-      taskType = TaskType.TESTING;
-      subTasks = [
-        { id: 'run-tests', description: 'Run existing tests' },
-        { id: 'analyze-coverage', description: 'Analyze test coverage' },
-        { id: 'add-tests', description: 'Add new tests if needed' },
-        { id: 'fix-failing', description: 'Fix failing tests' }
-      ];
-      requiredTools = ['shell', 'read_file', 'write_file'];
-    } else if (hasKeywords(['document', 'comment', 'writeup', 'readme', 'docs'])) {
-      taskType = TaskType.DOCUMENTATION;
-      subTasks = [
-        { id: 'review-code', description: 'Review the codebase' },
-        { id: 'write-docs', description: 'Write documentation' },
-        { id: 'verify-docs', description: 'Verify documentation accuracy' }
-      ];
-      requiredTools = ['shell', 'read_file', 'write_file'];
-    } else {
-      taskType = TaskType.OTHER;
-      difficulty = TaskDifficulty.SIMPLE;
-      subTasks = [
-        { id: 'execute-task', description: 'Execute the requested task' }
-      ];
-      requiredTools = ['shell', 'read_file', 'write_file', 'list_files'];
+    if (matchedTypes.length >= 2) return true;
+    if (/\b(first|then|next|after that|finally|step\s+\d+)\b/.test(lower)) return true;
+    return false;
+  }
+
+  normalizeAnalysisResult(raw, fallback) {
+    const allowedTypes = new Set(Object.values(TaskType));
+    const allowedDifficulty = new Set(Object.values(TaskDifficulty));
+    const safeFallback = fallback || this.getDefaultAnalysis('');
+
+    if (!raw || typeof raw !== 'object') {
+      return safeFallback;
     }
+
+    const taskType = allowedTypes.has(raw.taskType) ? raw.taskType : safeFallback.taskType;
+    const difficulty = allowedDifficulty.has(raw.difficulty) ? raw.difficulty : safeFallback.difficulty;
+    const goal = String(raw.goal || safeFallback.goal || '').trim() || safeFallback.goal;
+    const subTasks = Array.isArray(raw.subTasks) && raw.subTasks.length > 0
+      ? raw.subTasks
+          .map((step, index) => {
+            if (!step || typeof step !== 'object') return null;
+            const description = String(step.description || '').trim();
+            if (!description) return null;
+            return {
+              id: String(step.id || `step${index + 1}`),
+              description,
+            };
+          })
+          .filter(Boolean)
+      : safeFallback.subTasks;
+    const requiredTools = Array.isArray(raw.requiredTools) && raw.requiredTools.length > 0
+      ? raw.requiredTools.map((tool) => String(tool || '').trim()).filter(Boolean)
+      : safeFallback.requiredTools;
+    const challenges = Array.isArray(raw.challenges)
+      ? raw.challenges.map((item) => String(item || '').trim()).filter(Boolean)
+      : safeFallback.challenges;
+
+    return {
+      type: 'analysis_result',
+      taskType,
+      difficulty,
+      goal,
+      subTasks,
+      requiredTools,
+      challenges,
+    };
+  }
+
+  getDefaultAnalysis(description) {
+    const desc = String(description || '').toLowerCase();
+    const scoredProfiles = TASK_PROFILES
+      .map((profile) => ({
+        profile,
+        score: profile.keywords.reduce((count, keyword) => count + (desc.includes(keyword) ? 1 : 0), 0),
+      }))
+      .filter((entry) => entry.score > 0)
+      .sort((a, b) => b.score - a.score);
+
+    const selectedProfile = scoredProfiles[0]?.profile || null;
+    const taskType = selectedProfile?.type || TaskType.OTHER;
+    const difficulty = selectedProfile?.difficulty || TaskDifficulty.SIMPLE;
+    const subTasks = selectedProfile?.subTasks || [{ id: 'execute-task', description: 'Execute the requested task' }];
+    const requiredTools = selectedProfile?.requiredTools || ['list_files', 'read_file'];
 
     return {
       type: 'analysis_result',
@@ -186,7 +267,7 @@ Respond with JSON in this format:
       goal: description,
       subTasks,
       requiredTools,
-      challenges: []
+      challenges: [],
     };
   }
 
@@ -196,194 +277,267 @@ Respond with JSON in this format:
 
     switch (taskType) {
       case TaskType.ANALYSIS:
-        plan.push(...this.createAnalysisPlan(taskAnalysis));
+        plan.push(...this.createAnalysisPlan());
         break;
       case TaskType.DEBUGGING:
-        plan.push(...this.createDebuggingPlan(taskAnalysis));
+        plan.push(...this.createDebuggingPlan());
         break;
       case TaskType.IMPLEMENTATION:
-        plan.push(...this.createImplementationPlan(taskAnalysis));
+        plan.push(...this.createImplementationPlan());
         break;
       case TaskType.REFACTORING:
-        plan.push(...this.createRefactoringPlan(taskAnalysis));
+        plan.push(...this.createRefactoringPlan());
         break;
       case TaskType.TESTING:
-        plan.push(...this.createTestingPlan(taskAnalysis));
+        plan.push(...this.createTestingPlan());
         break;
       case TaskType.DOCUMENTATION:
-        plan.push(...this.createDocumentationPlan(taskAnalysis));
+        plan.push(...this.createDocumentationPlan());
         break;
       default:
-        plan.push(...this.createDefaultPlan(taskAnalysis));
+        plan.push(...this.createDefaultPlan());
     }
 
     return plan;
   }
 
-  createAnalysisPlan(taskAnalysis) {
+  createAnalysisPlan() {
     return [
-      new TaskStep('analyze-code', 'Analyze current directory structure', 'list_files', {
+      this.createStep('analyze-code', 'Analyze current directory structure', 'list_files', {
         path: '.',
-        max_entries: 20
+        max_entries: 40,
       }),
-      new TaskStep('read-package', 'Read package.json and project metadata', 'read_file', {
-        path: 'package.json'
+      this.createStep('read-package', 'Read package.json and project metadata', 'read_file', {
+        path: 'package.json',
       }),
-      new TaskStep('read-readme', 'Read project documentation', 'read_file', {
-        path: 'README.md'
+      this.createStep('read-readme', 'Read project documentation', 'read_file', {
+        path: 'README.md',
       }),
-      new TaskStep('check-src-structure', 'Check source code structure', 'list_files', {
-        path: 'src'
-      })
+      this.createStep('check-src-structure', 'Check source code structure', 'list_files', {
+        path: 'src',
+        max_entries: 80,
+      }),
     ];
   }
 
-  createDebuggingPlan(taskAnalysis) {
+  createDebuggingPlan() {
     return [
-      new TaskStep('check-files', 'Check relevant files in project', 'shell', {
-        command: 'ls -la'
+      this.createStep('check-git-status', 'Check git status and current changes', 'git_status', {
+        porcelain: false,
       }),
-      new TaskStep('run-tests', 'Run existing tests if available', 'shell', {
-        command: 'npm test -- --watchAll=false'
+      this.createStep('run-tests', 'Run existing tests if available', 'run_tests', {
+        command: DEFAULT_TEST_COMMAND,
+        timeout_ms: 120000,
       }),
-      new TaskStep('check-git-status', 'Check git status and changes', 'shell', {
-        command: 'git status && git diff'
+      this.createStep('identify-problem', 'Find bug markers and error handling hotspots', 'search_files', {
+        path: 'src',
+        regex: 'TODO|FIXME|BUG|throw new Error|catch\\s*\\(',
+        file_pattern: '*.js',
+        max_results: 40,
       }),
-      new TaskStep('identify-problem', 'Identify potential problem areas', 'shell', {
-        command: 'grep -r "TODO\\|FIXME\\|BUG" . --include="*.js" --include="*.ts" --include="*.json" | head -20'
-      })
+      this.createStep('inspect-diff', 'Review current diff for suspicious changes', 'git_diff', {
+        context: 3,
+      }),
     ];
   }
 
-  createImplementationPlan(taskAnalysis) {
+  createImplementationPlan() {
     return [
-      new TaskStep('check-files', 'Check current project structure', 'shell', {
-        command: 'ls -la'
+      this.createStep('check-files', 'Check current project structure', 'list_files', {
+        path: '.',
+        max_entries: 60,
       }),
-      new TaskStep('read-package', 'Read package.json dependencies and scripts', 'read_file', {
-        path: 'package.json'
+      this.createStep('read-package', 'Read package.json dependencies and scripts', 'read_file', {
+        path: 'package.json',
       }),
-      new TaskStep('check-config', 'Check project configuration files', 'list_files', {
-        path: '.'
+      this.createStep('check-config', 'Check top-level project configuration files', 'glob_files', {
+        path: '.',
+        pattern: '*.json',
+        max_results: 20,
       }),
-      new TaskStep('read-source', 'Read existing source files', 'shell', {
-        command: 'find src -name "*.js" -o -name "*.ts" -o -name "*.json" | head -10'
-      })
+      this.createStep('read-source', 'Inspect existing source files', 'glob_files', {
+        path: 'src',
+        pattern: '**/*',
+        max_results: 30,
+      }),
     ];
   }
 
-  createRefactoringPlan(taskAnalysis) {
+  createRefactoringPlan() {
     return [
-      new TaskStep('analyze-code', 'Analyze current code structure', 'shell', {
-        command: 'ls -la src/'
+      this.createStep('analyze-code', 'Analyze current code structure', 'list_files', {
+        path: 'src',
+        max_entries: 80,
       }),
-      new TaskStep('check-quality', 'Check existing code quality tools', 'read_file', {
-        path: 'package.json'
+      this.createStep('check-quality', 'Check existing code quality tools', 'read_file', {
+        path: 'package.json',
       }),
-      new TaskStep('run-linting', 'Run linting if available', 'shell', {
-        command: 'npm run lint'
+      this.createStep('run-linting', 'Run linting if available', 'run_tests', {
+        command: 'npm run lint',
+        timeout_ms: 120000,
       }),
-      new TaskStep('run-tests', 'Run existing tests', 'shell', {
-        command: 'npm test -- --watchAll=false'
-      })
+      this.createStep('run-tests', 'Run existing tests', 'run_tests', {
+        command: DEFAULT_TEST_COMMAND,
+        timeout_ms: 120000,
+      }),
     ];
   }
 
-  createTestingPlan(taskAnalysis) {
+  createTestingPlan() {
     return [
-      new TaskStep('run-tests', 'Run existing test suite', 'shell', {
-        command: 'npm test -- --watchAll=false'
+      this.createStep('run-tests', 'Run existing test suite', 'run_tests', {
+        command: DEFAULT_TEST_COMMAND,
+        timeout_ms: 120000,
       }),
-      new TaskStep('check-coverage', 'Check test coverage if available', 'shell', {
-        command: 'npm run test:coverage'
+      this.createStep('check-coverage', 'Check test coverage if available', 'run_tests', {
+        command: 'npm run test:coverage',
+        timeout_ms: 180000,
       }),
-      new TaskStep('check-test-files', 'Check test file structure', 'list_files', {
-        path: 'test'
+      this.createStep('check-test-files', 'Check test file structure', 'list_files', {
+        path: '__tests__',
+        max_entries: 80,
       }),
-      new TaskStep('analyze-coverage', 'Analyze coverage reports', 'shell', {
-        command: 'cat coverage/lcov-report/index.html 2>/dev/null || echo "No coverage report found"'
-      })
+      this.createStep('analyze-coverage', 'Locate coverage-related artifacts', 'find_files', {
+        path: '.',
+        query: 'coverage',
+        max_results: 20,
+      }),
     ];
   }
 
-  createDocumentationPlan(taskAnalysis) {
+  createDocumentationPlan() {
     return [
-      new TaskStep('check-docs', 'Check existing documentation files', 'shell', {
-        command: 'find . -name "*.md" -o -name "*.rst" -o -name "*.txt" | grep -v node_modules | head -20'
+      this.createStep('check-docs', 'Check existing documentation files', 'glob_files', {
+        path: '.',
+        pattern: '**/*.md',
+        max_results: 40,
       }),
-      new TaskStep('read-readme', 'Read project README', 'read_file', {
-        path: 'README.md'
+      this.createStep('read-readme', 'Read project README', 'read_file', {
+        path: 'README.md',
       }),
-      new TaskStep('check-code-docs', 'Check if code has comments or JSDoc', 'shell', {
-        command: 'grep -r "/\\*\\*" src --include="*.js" --include="*.ts" | head -10'
-      })
+      this.createStep('check-code-docs', 'Check if code has comments or JSDoc', 'search_files', {
+        path: 'src',
+        regex: '/\\*\\*',
+        file_pattern: '*.js',
+        max_results: 20,
+      }),
     ];
   }
 
-  createDefaultPlan(taskAnalysis) {
+  createDefaultPlan() {
     return [
-      new TaskStep('execute-task', 'Execute the requested task', 'shell', {
-        command: 'echo "Task execution started. Please provide more specific instructions for detailed processing."'
-      })
+      this.createStep('inspect-workspace', 'Inspect workspace structure', 'list_files', {
+        path: '.',
+        max_entries: 40,
+      }),
+      this.createStep('inspect-package', 'Read package metadata when available', 'read_file', {
+        path: 'package.json',
+      }),
     ];
   }
 }
 
 /**
- * 任务执行器
+ * Task executor
  */
 export class TaskExecutor {
-  constructor(agent, plan) {
+  constructor(agent, plan, hooks = {}) {
     this.agent = agent;
     this.plan = plan;
     this.currentStep = 0;
+    this.hooks = hooks && typeof hooks === "object" ? hooks : {};
+  }
+
+  log(message) {
+    if (typeof this.hooks.onLog === "function") {
+      this.hooks.onLog(message);
+      return;
+    }
+    console.log(message);
+  }
+
+  warn(message, error = null) {
+    if (typeof this.hooks.onWarn === "function") {
+      this.hooks.onWarn(message, error);
+      return;
+    }
+    console.warn(message, error || "");
+  }
+
+  error(message, error = null) {
+    if (typeof this.hooks.onError === "function") {
+      this.hooks.onError(message, error);
+      return;
+    }
+    console.error(message, error || "");
   }
 
   async executePlan() {
     const results = [];
 
-    for (let i = 0; i < this.plan.length; i++) {
+    for (let i = 0; i < this.plan.length; i += 1) {
       const step = this.plan[i];
-      console.log(`[Task] Step ${i + 1}/${this.plan.length}: ${step.description}`);
+      this.currentStep = i;
+      this.log(`[Task] Step ${i + 1}/${this.plan.length}: ${step.description}`);
+      this.hooks.onStepStart?.(step, { index: i, total: this.plan.length });
 
       try {
-        // 检查依赖项是否已完成
         const dependencies = step.dependencies || [];
-        const allDependenciesMet = dependencies.every(depId => {
-          return results.some(result => result.step.id === depId && result.success);
+        const allDependenciesMet = dependencies.every((depId) => {
+          return results.some((result) => result.step.id === depId && result.success);
         });
 
         if (!allDependenciesMet) {
-          console.log(`[Task] Skipping step ${step.id} - dependencies not met`);
+          this.log(`[Task] Skipping step ${step.id} - dependencies not met`);
           results.push({
             step,
             success: false,
             result: 'Dependencies not met',
-            error: 'Dependencies not met'
+            error: 'Dependencies not met',
+          });
+          this.hooks.onStepEnd?.(step, {
+            index: i,
+            total: this.plan.length,
+            success: false,
+            result: 'Dependencies not met',
+            error: 'Dependencies not met',
           });
           continue;
         }
 
-        // 执行步骤
         await this.executeStep(step);
+        const skipped = step.status === 'skipped';
         results.push({
           step,
-          success: true,
-          result: step.result
+          success: !skipped,
+          result: step.result,
+          skipped,
         });
-
+        this.hooks.onStepEnd?.(step, {
+          index: i,
+          total: this.plan.length,
+          success: !skipped,
+          result: step.result,
+          error: skipped ? step.result : null,
+        });
       } catch (error) {
-        console.error(`[Task] Step ${step.id} failed:`, error);
+        this.error(`[Task] Step ${step.id} failed:`, error);
         results.push({
           step,
           success: false,
           result: null,
-          error: error.message
+          error: error.message,
+        });
+        this.hooks.onStepEnd?.(step, {
+          index: i,
+          total: this.plan.length,
+          success: false,
+          result: null,
+          error: error.message,
         });
 
-        // 对于关键步骤失败，可能需要停止
         if (this.isCriticalStep(step)) {
-          console.log('[Task] Critical step failed, stopping execution');
+          this.log('[Task] Critical step failed, stopping execution');
           break;
         }
       }
@@ -394,69 +548,69 @@ export class TaskExecutor {
 
   isCriticalStep(step) {
     const criticalKeywords = [
-      'install', 'setup', 'configure', 'remove', 'delete', 'rm', 'mv',
-      'npm install', 'npm uninstall', 'git reset', 'git push', 'git pull',
-      'sudo', 'chmod', 'chown', 'rm -rf', 'force', 'overwrite', 'destroy',
-      'drop', 'truncate', 'erase', 'format', 'init', 'clone', 'fetch'
+      'install', 'remove', 'delete', 'rm', 'mv', 'reset', 'push', 'pull',
+      'sudo', 'chmod', 'chown', 'overwrite', 'destroy', 'drop', 'truncate',
     ];
-    return criticalKeywords.some(keyword =>
-      step.description.toLowerCase().includes(keyword.toLowerCase()) ||
-      (step.input?.command && step.input.command.toLowerCase().includes(keyword.toLowerCase()))
-    );
+    const description = String(step?.description || '').toLowerCase();
+    const command = String(step?.input?.command || '').toLowerCase();
+    const tool = String(step?.tool || '').toLowerCase();
+    if (['write_file', 'edit_file', 'replace_in_files', 'apply_patch'].includes(tool)) return true;
+    return criticalKeywords.some((keyword) => description.includes(keyword) || command.includes(keyword));
   }
 
   async executeStep(step) {
-    // 更新步骤状态
     step.status = 'running';
 
     try {
-      // 检查是否是关键步骤
       if (this.isCriticalStep(step)) {
-        console.log(`[Task] Step ${step.id} is critical and requires approval - skipping`);
+        this.log(`[Task] Step ${step.id} is critical and requires approval - skipping`);
         step.status = 'skipped';
         step.result = 'Critical step requires user approval - skipped';
         return step.result;
       }
 
-      // 执行步骤
-      if (step.tool === 'shell') {
-        // 检查是否有自动批准
-        if (this.agent.autoApproveRef.value) {
-          step.result = await this.agent.tools.shell(step.input);
-        } else {
-          // 如果需要用户批准，跳过这个步骤
-          console.log(`[Task] Step ${step.id} requires user approval - skipping`);
-          step.status = 'skipped';
-          step.result = 'Requires user approval - skipped';
-          return step.result;
-        }
-      } else if (step.tool === 'read_file') {
-        step.result = await this.agent.tools.read_file(step.input);
-      } else if (step.tool === 'write_file') {
-        step.result = await this.agent.tools.write_file(step.input);
-      } else if (step.tool === 'list_files') {
-        step.result = await this.agent.tools.list_files(step.input);
-      } else {
+      const toolFn = this.agent.tools?.[step.tool];
+      if (typeof toolFn !== 'function') {
         throw new Error(`Unknown tool: ${step.tool}`);
       }
 
+      if (step.tool === 'shell' && !this.agent.autoApproveRef.value) {
+        this.log(`[Task] Step ${step.id} requires user approval - skipping`);
+        step.status = 'skipped';
+        step.result = 'Requires user approval - skipped';
+        return step.result;
+      }
+
+      step.result = await toolFn(step.input);
       step.status = 'completed';
+      this.agent.onEvent?.({
+        type: "tool_end",
+        tool: step.tool,
+        result: String(step.result || ""),
+        error: null,
+      });
       return step.result;
-
     } catch (error) {
-      console.warn(`[Task] Step ${step.id} failed: ${error.message}`);
+      this.warn(`[Task] Step ${step.id} failed: ${error.message}`);
 
-      // 如果是 readline 错误，尝试跳过
-      if (error.code === 'ERR_USE_AFTER_CLOSE' ||
-          error.message.includes('readline') ||
-          error.message.includes('closed')) {
-        console.log(`[Task] Step ${step.id} failed due to readline issues - skipping`);
+      if (
+        error.code === 'ERR_USE_AFTER_CLOSE' ||
+        error.message.includes('readline') ||
+        error.message.includes('closed')
+      ) {
+        this.log(`[Task] Step ${step.id} failed due to readline issues - skipping`);
         step.status = 'skipped';
         step.result = 'Readline error - skipped';
         return step.result;
       }
 
       step.status = 'failed';
+      this.agent.onEvent?.({
+        type: "tool_end",
+        tool: step.tool,
+        result: String(step.result || ""),
+        error: error.message,
+      });
       throw error;
     }
   }

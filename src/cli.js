@@ -939,6 +939,23 @@ function formatToolInputSummary(tool, input, maxLen = 120) {
   return summarizeForLog(JSON.stringify(safe), maxLen);
 }
 
+function formatToolBatchSummary(calls = [], maxLen = 180) {
+  const list = Array.isArray(calls) ? calls : [];
+  if (list.length === 0) return "0 tools";
+  const counts = new Map();
+  for (const call of list) {
+    const tool = String(call?.tool || "tool");
+    counts.set(tool, (counts.get(tool) || 0) + 1);
+  }
+  const names = [...counts.entries()].map(([tool, count]) => `${tool}${count > 1 ? ` x${count}` : ""}`).join(", ");
+  const previews = list
+    .map((call) => formatToolInputSummary(call?.tool, call?.input, 70))
+    .filter((item) => item && item !== "<empty>")
+    .slice(0, 3);
+  const suffix = previews.length > 0 ? ` - ${previews.join("; ")}` : "";
+  return summarizeForLog(`${names}${suffix}`, maxLen);
+}
+
 function formatToolResultLinesForTimeline(tool, result, error) {
   if (error) return [];
   if (tool !== "edit_file") return [];
@@ -1080,7 +1097,9 @@ function maybeHandleLocalInfoTask(input, { logLine, tui, display, mcpHub = null 
     "- `list_files`: List files/directories",
     "- `glob_files`: Find files by glob pattern",
     "- `find_files`: Fuzzy-find files by path text",
-    "- `search_files`: Search file contents (ripgrep/grep/native)",
+    "- `rg`: Search file contents with ripgrep semantics",
+    "- `grep`: Alias for `rg`",
+    "- `search_files`: Compatibility alias for `rg`",
     "- `git_status`: Show git status",
     "- `git_diff`: Show git diff",
     "- `run_tests`: Run tests with structured summary",
@@ -4341,6 +4360,11 @@ async function main() {
         if (display) display.onThought(evt.content);
         logLine(`[thought] ${evt.content}`);
       }
+      if (evt.type === "tool_batch_start") {
+        recordTaskEvent(taskTraceRef, evt);
+        if (display) display.onToolBatchUse(evt.calls);
+        logLine(`[tools] ${formatToolBatchSummary(evt.calls)}`);
+      }
       if (evt.type === "tool_use") {
         recordTaskEvent(taskTraceRef, evt);
         const isTodoTool = evt.tool === "todo_write" || evt.tool === "todowrite";
@@ -4364,10 +4388,12 @@ async function main() {
         if (tui && evt.reason) {
           tui.setLiveThought(String(evt.reason));
         }
-        if (display) display.onToolUse(evt.tool, evt.input, evt.reason);
+        if (display && !evt.parallel) display.onToolUse(evt.tool, evt.input, evt.reason);
         const summary = formatToolInputSummary(evt.tool, evt.input, 100);
         if (isTodoTool) {
           // keep todo activity in status bar only
+        } else if (evt.parallel) {
+          // batch header already logged by tool_batch_start
         } else if (verboseToolLogs) {
           const details = Object.entries(evt.input || {})
             .map(([k, v]) => `${k}=${JSON.stringify(v)}`)

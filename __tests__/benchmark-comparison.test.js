@@ -542,6 +542,6 @@ describe("Benchmark 6: end-to-end overhead summary", () => {
     console.log("  - System prompt rebuilt from scratch (not cached)");
     console.log("  - Full history serialized to text string (not native messages)");
     console.log("  - Response parsed from raw text JSON (not structured API response)");
-    console.log("  - No parallel tool execution support");
+    console.log("  - Parallel tool execution is limited to safe read-only batches");
   });
 });
