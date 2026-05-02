@@ -18,6 +18,7 @@ export class Agent {
     webSearch = null,
     contextWindowRef = null,
     shellPermissionRef = null,
+    subagentDepth = 0,
   }) {
     this.provider = provider;
     this.workspaceDir = workspaceDir;
@@ -31,6 +32,7 @@ export class Agent {
     this.webSearch = webSearch && typeof webSearch === "object" ? webSearch : null;
     this.contextWindowRef = contextWindowRef && typeof contextWindowRef === "object" ? contextWindowRef : { value: 0 };
     this.shellPermissionRef = shellPermissionRef && typeof shellPermissionRef === "object" ? shellPermissionRef : { value: {} };
+    this.subagentDepth = Math.max(0, Number.parseInt(String(subagentDepth), 10) || 0);
     this.history = [];
     this.rebuildToolset();
     this.enablePlanner = process.env.PIECODE_ENABLE_PLANNER === "1";
@@ -62,6 +64,7 @@ export class Agent {
       mcpHub: this.mcpHub,
       webSearch: this.webSearch,
       shellPermissionRef: this.shellPermissionRef,
+      runSubagent: (input, options) => this.runSubagent(input, options),
     });
   }
 
@@ -315,6 +318,102 @@ export class Agent {
 
   getActiveSkills() {
     return Array.isArray(this.activeSkillsRef?.value) ? this.activeSkillsRef.value : [];
+  }
+
+  buildSubagentPrompt({ task, context = "", mode = "analysis" } = {}) {
+    const recentContext = formatHistory(this.history.slice(-8)).slice(0, 12000);
+    return [
+      "You are a read-only subagent spawned by the main PieCode agent.",
+      "Investigate the assigned task and return concise findings for the main agent.",
+      "Do not edit files. Do not write files. Do not run commands that modify repository or system state.",
+      "Prefer read_file, read_files, list_files, glob_files, find_files, rg, git_status, and git_diff.",
+      "If shell is needed, use only read-only inspection commands.",
+      "",
+      `Mode: ${String(mode || "analysis")}`,
+      `Task:\n${String(task || "")}`,
+      context ? `Additional context:\n${String(context)}` : "",
+      recentContext ? `Recent parent context:\n${recentContext}` : "",
+      "",
+      "Return findings with file paths, relevant symbols, and any uncertainty. Do not make changes.",
+    ].filter(Boolean).join("\n\n");
+  }
+
+  async runSubagent({ task, context = "", mode = "analysis", toolBudget = 3 } = {}, options = {}) {
+    const normalizedTask = String(task || "").trim();
+    if (!normalizedTask) throw new Error("Missing required parameter: task");
+    if (this.subagentDepth >= 1) {
+      return "Subagent skipped: nested subagents are disabled.";
+    }
+
+    const subagentId = `subagent-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`;
+    const childEvents = [];
+    this.onEvent?.({
+      type: "subagent_start",
+      id: subagentId,
+      task: normalizedTask,
+      mode,
+      toolBudget: Math.min(Math.max(Number(toolBudget) || 3, 1), 6),
+    });
+    const child = new Agent({
+      provider: this.provider,
+      workspaceDir: this.workspaceDir,
+      autoApproveRef: { value: false },
+      askApproval: this.askApproval,
+      onEvent: (evt) => {
+        if (evt?.type === "tool_use" || evt?.type === "tool_end") {
+          childEvents.push(evt);
+        }
+        this.onEvent?.({ type: "subagent_event", id: subagentId, task: normalizedTask, event: evt });
+      },
+      activeSkillsRef: this.activeSkillsRef,
+      onTodoWrite: null,
+      projectInstructionsRef: this.projectInstructionsRef,
+      mcpHub: this.mcpHub,
+      webSearch: this.webSearch,
+      contextWindowRef: this.contextWindowRef,
+      shellPermissionRef: this.shellPermissionRef,
+      subagentDepth: this.subagentDepth + 1,
+    });
+
+    const blockedReadOnlyTool = async () => "Tool error: subagent is read-only and cannot modify files or todos.";
+    child.tools.write_file = blockedReadOnlyTool;
+    child.tools.edit_file = blockedReadOnlyTool;
+    child.tools.apply_patch = blockedReadOnlyTool;
+    child.tools.replace_in_files = blockedReadOnlyTool;
+    child.tools.todo_write = blockedReadOnlyTool;
+    child.tools.todowrite = blockedReadOnlyTool;
+    child.tools.subagent = async () => "Tool error: nested subagents are disabled.";
+    child.defaultToolBudget = Math.min(Math.max(Number(toolBudget) || 3, 1), 6);
+    child.enablePlanner = false;
+    child.taskPlanner = null;
+    child.planFirstEnabled = false;
+
+    const prompt = this.buildSubagentPrompt({ task: normalizedTask, context, mode });
+    try {
+      const result = await child.runTurn(prompt, { signal: options?.signal || null });
+      const toolSummary = childEvents
+        .filter((evt) => evt?.type === "tool_use")
+        .map((evt) => String(evt.tool || "unknown"))
+        .slice(0, 12);
+      const toolLine = toolSummary.length > 0 ? `\n\nSubagent tools used: ${toolSummary.join(", ")}` : "";
+      this.onEvent?.({
+        type: "subagent_end",
+        id: subagentId,
+        task: normalizedTask,
+        status: "done",
+        tools: toolSummary,
+      });
+      return `Subagent result:\n${String(result || "").trim()}${toolLine}`;
+    } catch (err) {
+      this.onEvent?.({
+        type: "subagent_end",
+        id: subagentId,
+        task: normalizedTask,
+        status: "error",
+        error: String(err?.message || err),
+      });
+      throw err;
+    }
   }
 
   stableStringify(value) {

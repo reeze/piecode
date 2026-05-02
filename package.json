@@ -9,6 +9,7 @@
   "scripts": {
     "start": "node src/cli.js",
     "agent": "node src/cli.js --tui",
+    "web": "node src/web/server.js",
     "help": "node src/cli.js --help",
     "build": "node scripts/build.mjs",
     "install:local": "node scripts/install-local.mjs",

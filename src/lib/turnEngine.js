@@ -19,6 +19,7 @@ export class TurnEngine {
     this.activePlan = null;
     this.turnPolicy = this.detectTurnPolicy(userMessage);
     this.planOnly = Boolean(options?.planOnly);
+    this.attachments = Array.isArray(options?.attachments) ? options.attachments : [];
     this.mcpEnabled = Boolean(agent.mcpHub?.hasServers?.());
     this.mcpServerNames = this.mcpEnabled ? agent.mcpHub.getServerNames() : [];
     this.toolCalls = 0;
@@ -719,7 +720,11 @@ export class TurnEngine {
 
   async run() {
     const signal = this.agent.activeAbortController.signal;
-    this.agent.history.push({ role: "user", content: this.userMessage });
+    this.agent.history.push({
+      role: "user",
+      content: this.userMessage,
+      ...(this.attachments.length > 0 ? { attachments: this.attachments } : {}),
+    });
 
     this.agent.throwIfAborted(signal);
     if (this.planOnly) {

@@ -625,6 +625,7 @@ export function createToolset({
   mcpHub = null,
   webSearch = null,
   shellPermissionRef = null,
+  runSubagent = null,
 }) {
   let lastTodoSignature = "";
   const mcpAvailable = () => Boolean(mcpHub && typeof mcpHub.hasServers === "function" && mcpHub.hasServers());
@@ -1451,6 +1452,36 @@ export function createToolset({
     throw new Error(`Web search failed: ${lastError?.message || "unknown error"}`);
   };
 
+  const subagentTool = async ({
+    task,
+    context = "",
+    mode = "analysis",
+    tool_budget: toolBudget = 3,
+  } = {}, options = {}) => {
+    const normalizedTask = String(task || "").trim();
+    const normalizedMode = String(mode || "analysis").trim().toLowerCase();
+    const budget = Math.min(Math.max(Number(toolBudget) || 3, 1), 6);
+    onToolStart?.("subagent", {
+      task: normalizedTask,
+      context,
+      mode: normalizedMode,
+      tool_budget: budget,
+    });
+    if (!normalizedTask) throw new Error("Missing required parameter: task");
+    if (typeof runSubagent !== "function") {
+      throw new Error("Subagent support is not configured for this session.");
+    }
+    return await runSubagent(
+      {
+        task: normalizedTask,
+        context: String(context || ""),
+        mode: normalizedMode,
+        toolBudget: budget,
+      },
+      options
+    );
+  };
+
   const listMcpServers = async () => {
     onToolStart?.("list_mcp_servers", {});
     if (!mcpAvailable()) return "No MCP servers configured.";
@@ -1562,6 +1593,7 @@ export function createToolset({
     search_files: searchFiles,
     web_search: webSearchTool,
     search_web: webSearchTool,
+    subagent: subagentTool,
     list_mcp_servers: listMcpServers,
     list_mcp_tools: listMcpTools,
     mcp_call_tool: callMcpTool,

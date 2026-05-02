@@ -179,6 +179,15 @@ describe('Prompt functions', () => {
       expect(result.input).toEqual({ todos: [{ content: 'step a', status: 'in_progress' }] });
     });
 
+    test('should parse subagent shorthand tool type', () => {
+      const result = parseModelAction(
+        '{"type":"subagent","input":{"task":"inspect auth flow","tool_budget":2}}'
+      );
+      expect(result.type).toBe('tool_use');
+      expect(result.tool).toBe('subagent');
+      expect(result.input).toEqual({ task: 'inspect auth flow', tool_budget: 2 });
+    });
+
     test('should parse tool_use with todowrite alias as tool field', () => {
       const result = parseModelAction(
         '{"type":"tool_use","tool":"todowrite","input":{"todos":[{"content":"step b","status":"completed"}]}}'
@@ -208,6 +217,16 @@ describe('Prompt functions', () => {
       const result = parseModelAction('Invalid JSON response');
       expect(result.type).toBe('final');
       expect(result.message).toBe('Invalid JSON response');
+    });
+  });
+
+  describe('buildToolDefinitions', () => {
+    test('should expose subagent in native tool definitions', () => {
+      const tools = buildToolDefinitions('openai');
+      const names = tools.map((tool) => tool.function?.name || tool.name);
+      expect(names).toContain('subagent');
+      const subagent = tools.find((tool) => tool.function?.name === 'subagent');
+      expect(subagent.function.parameters.required).toContain('task');
     });
   });
 
@@ -349,6 +368,38 @@ describe('Prompt functions', () => {
       expect(messages).toHaveLength(2);
       expect(messages[0]).toEqual({ role: 'user', content: 'Hello' });
       expect(messages[1]).toEqual({ role: 'assistant', content: 'Hi there!' });
+    });
+
+    test('converts image attachments to Anthropic image blocks', () => {
+      const history = [
+        {
+          role: 'user',
+          content: 'Describe this screenshot',
+          attachments: [{ type: 'image', mimeType: 'image/png', data: 'abc123', bytes: 12 }],
+        },
+      ];
+
+      const messages = buildMessages(history, { format: 'anthropic' });
+      expect(messages[0].content).toEqual([
+        { type: 'text', text: 'Describe this screenshot' },
+        { type: 'image', source: { type: 'base64', media_type: 'image/png', data: 'abc123' } },
+      ]);
+    });
+
+    test('converts image attachments to OpenAI image_url parts', () => {
+      const history = [
+        {
+          role: 'user',
+          content: 'Describe this screenshot',
+          attachments: [{ type: 'image', mimeType: 'image/jpeg', data: 'def456', bytes: 34 }],
+        },
+      ];
+
+      const messages = buildMessages(history, { format: 'openai' });
+      expect(messages[0].content).toEqual([
+        { type: 'text', text: 'Describe this screenshot' },
+        { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,def456' } },
+      ]);
     });
 
     test('converts structured toolCall entries to Anthropic tool_use blocks', () => {

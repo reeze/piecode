@@ -81,6 +81,20 @@ describe("tui line editor", () => {
     rl.close();
   });
 
+  test("handleKeypress can collect and submit input without a pending question", () => {
+    const source = new EventEmitter();
+    const rl = new TuiLineEditor({ keypressSource: source });
+
+    rl.handleKeypress("/", { name: "/" }, { allowWithoutPending: true });
+    rl.handleKeypress("a", { name: "a" }, { allowWithoutPending: true });
+    rl.handleKeypress("g", { name: "g" }, { allowWithoutPending: true });
+    const submitted = rl.handleKeypress("\r", { name: "enter" }, { allowWithoutPending: true });
+
+    expect(submitted).toEqual({ submitted: true, value: "/ag" });
+    expect(rl.line).toBe("");
+    rl.close();
+  });
+
   test("history up/down recalls previous entries", async () => {
     const source = new EventEmitter();
     const rl = new TuiLineEditor({ keypressSource: source, history: ["second", "first"] });

@@ -18,15 +18,48 @@ const {
   extractTriggers,
   extractSkillNamesFromInstructions,
   autoLoadSkillsFromInstructions,
+  resolveSkillRoots,
   findTriggeredSkills,
   findMentionedSkills,
   autoEnableSkills,
 } = await import('../src/lib/skills.js');
 
 describe('Skills trigger system', () => {
+  const originalSkillsDir = process.env.PIECODE_SKILLS_DIR;
+
   beforeEach(() => {
+    process.env.PIECODE_SKILLS_DIR = originalSkillsDir;
     mockReadFile.mockReset();
     mockReadFile.mockResolvedValue('# Skill content');
+  });
+
+  afterAll(() => {
+    process.env.PIECODE_SKILLS_DIR = originalSkillsDir;
+  });
+
+  describe('resolveSkillRoots', () => {
+    test('includes project-local and global skill roots', () => {
+      delete process.env.PIECODE_SKILLS_DIR;
+      const roots = resolveSkillRoots({}, '/workspace/project');
+
+      expect(roots).toEqual(expect.arrayContaining([
+        '/workspace/project/AGENTS/skills',
+        '/workspace/project/Agents/skills',
+        '/workspace/project/agents/skills',
+        '/workspace/project/.skills',
+        '/workspace/project/.piecode/skills',
+      ]));
+      expect(roots.some((root) => root.endsWith('/.agents/skills'))).toBe(true);
+      expect(roots.some((root) => root.endsWith('/.codex/skills'))).toBe(true);
+    });
+
+    test('keeps configured roots and resolves relative paths against workspace', () => {
+      process.env.PIECODE_SKILLS_DIR = 'env-skills';
+      const roots = resolveSkillRoots({ skills: { paths: ['settings-skills'] } }, '/workspace/project');
+
+      expect(roots).toContain('/workspace/project/env-skills');
+      expect(roots).toContain('/workspace/project/settings-skills');
+    });
   });
 
   describe('parseFrontmatter', () => {

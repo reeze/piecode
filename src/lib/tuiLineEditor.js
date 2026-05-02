@@ -83,10 +83,10 @@ export class TuiLineEditor {
     }
   }
 
-  _submitCurrentLine() {
+  _submitCurrentLine({ allowWithoutPending = false } = {}) {
     const value = this.line;
     const pending = this.pending;
-    if (!pending) return;
+    if (!pending && !allowWithoutPending) return { submitted: false, value: "" };
     this.pending = null;
     if (value.trim()) {
       if (this.removeHistoryDuplicates) {
@@ -101,7 +101,8 @@ export class TuiLineEditor {
     this.cursor = 0;
     this.historyIndex = -1;
     this.historyScratch = "";
-    pending.resolve(value);
+    if (pending) pending.resolve(value);
+    return { submitted: true, value };
   }
 
   _abortCurrentLine(reason, code = "ABORT_ERR") {
@@ -140,8 +141,8 @@ export class TuiLineEditor {
     this.cursor = this.line.length;
   }
 
-  _onKeypress(str, key = {}) {
-    if (!this.pending || this.closed) return;
+  handleKeypress(str, key = {}, { allowWithoutPending = false } = {}) {
+    if ((!this.pending && !allowWithoutPending) || this.closed) return { submitted: false, value: "" };
     if (this.shouldHandleKeypress && this.shouldHandleKeypress(str, key) === false) return;
     const name = String(key?.name || "").toLowerCase();
     const ctrl = Boolean(key?.ctrl);
@@ -167,6 +168,13 @@ export class TuiLineEditor {
     if (ctrl && name === "e") {
       this.cursor = this.line.length;
       return;
+    }
+    if (ctrl && name === "u") {
+      this.line = "";
+      this.cursor = 0;
+      this.historyIndex = -1;
+      this.historyScratch = "";
+      return { submitted: false, value: "" };
     }
 
     if (name === "left") {
@@ -208,8 +216,7 @@ export class TuiLineEditor {
     }
 
     if ((name === "return" || name === "enter") && !meta && !ctrl) {
-      this._submitCurrentLine();
-      return;
+      return this._submitCurrentLine({ allowWithoutPending });
     }
     if (name === "return" || name === "enter") {
       // Modified Enter variants are handled by the outer TUI multiline handler.
@@ -235,5 +242,10 @@ export class TuiLineEditor {
       this.line = `${head}${str}${tail}`;
       this.cursor += str.length;
     }
+    return { submitted: false, value: "" };
+  }
+
+  _onKeypress(str, key = {}) {
+    this.handleKeypress(str, key);
   }
 }

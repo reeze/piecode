@@ -193,6 +193,57 @@ describe("agent context controls", () => {
     await expect(turnPromise).rejects.toMatchObject({ code: "TASK_ABORTED" });
   });
 
+  test("runSubagent executes an isolated read-only child turn", async () => {
+    const events = [];
+    const agent = createAgentWithProvider({
+      async complete() {
+        return JSON.stringify({ type: "final", message: "provider logic lives in src/lib/providers.js" });
+      },
+    });
+    agent.onEvent = (evt) => events.push(evt);
+    agent.history = [{ role: "user", content: "parent context stays intact" }];
+
+    const result = await agent.runSubagent({
+      task: "Find provider logic",
+      context: "Only report paths",
+      toolBudget: 2,
+    });
+
+    expect(result).toContain("Subagent result:");
+    expect(result).toContain("src/lib/providers.js");
+    expect(agent.history).toEqual([{ role: "user", content: "parent context stays intact" }]);
+    expect(events.some((evt) => evt?.type === "subagent_event")).toBe(true);
+    expect(events.some((evt) => evt?.type === "subagent_start" && evt.task === "Find provider logic")).toBe(true);
+    expect(events.some((evt) => evt?.type === "subagent_end" && evt.status === "done")).toBe(true);
+  });
+
+  test("runSubagent blocks child write tools", async () => {
+    const dir = await mkdtemp(path.join(os.tmpdir(), "piecode-subagent-"));
+    let calls = 0;
+    const agent = createAgentWithProvider({
+      async complete() {
+        calls += 1;
+        if (calls === 1) {
+          return JSON.stringify({
+            type: "tool_use",
+            tool: "write_file",
+            input: { path: "blocked.txt", content: "nope" },
+            reason: "prove read-only behavior",
+          });
+        }
+        return JSON.stringify({ type: "final", message: "write was blocked" });
+      },
+    });
+    agent.workspaceDir = dir;
+    agent.rebuildToolset();
+
+    const result = await agent.runSubagent({ task: "Try a forbidden write", toolBudget: 2 });
+
+    expect(result).toContain("write was blocked");
+    await expect(readFile(path.join(dir, "blocked.txt"), "utf8")).rejects.toMatchObject({ code: "ENOENT" });
+    await rm(dir, { recursive: true, force: true });
+  });
+
   test("plan-only mode returns a plan without executing tools", async () => {
     let completeCalls = 0;
     const agent = createAgentWithProvider({

@@ -115,6 +115,10 @@ export function buildSystemPrompt({
     "- Use search_files/grep only as compatibility aliases for rg.",
     "- Narrow searches with path plus glob/file_pattern; use fixed_strings for literal text.",
     "- Use web_search only for current external information and cite returned URLs.",
+
+    "ATTACHMENTS:",
+    "- Users may attach clipboard images. Inspect attached images when relevant to the request.",
+    "- If an attached image is not relevant, briefly mention it was ignored.",
   ];
 
   if (!nativeTools) {
@@ -133,6 +137,7 @@ export function buildSystemPrompt({
       "search_files",
       "web_search",
       "search_web",
+      "subagent",
       "git_status",
       "git_diff",
       "run_tests",
@@ -176,6 +181,7 @@ export function buildSystemPrompt({
       "- grep/search_files: aliases for rg.",
       "- web_search: { query, max_results?, site?, recency_days?, provider? } - Current external information; cite URLs.",
       "- search_web: alias for web_search.",
+      "- subagent: { task, context?, mode?, tool_budget? } - Spawn a read-only subagent for independent codebase investigation.",
       "- git_status: { porcelain? } - Show git status.",
       "- git_diff: { path?, staged?, context? } - Show git diff.",
       "- run_tests: { command?, timeout_ms? } - Run tests and return parsed summary.",
@@ -194,6 +200,7 @@ export function buildSystemPrompt({
       "EXAMPLES:",
       'Code search: {"type":"tool_use","tool":"rg","input":{"pattern":"functionName\\(","path":"src","glob":"*.js"},"reason":"Find references before editing"}',
       'Web lookup: {"type":"tool_use","tool":"web_search","input":{"query":"OpenAI latest API model docs","max_results":5},"reason":"Need current external documentation"}',
+      'Subagent: {"type":"tool_use","tool":"subagent","input":{"task":"Inspect how provider selection works","tool_budget":3},"reason":"Delegate independent investigation"}',
 
       "CRITICAL:",
       "- Your entire response must be valid JSON",
@@ -274,6 +281,7 @@ const KNOWN_TOOL_NAMES = new Set([
   "search_files",
   "web_search",
   "search_web",
+  "subagent",
   "git_status",
   "git_diff",
   "run_tests",
@@ -498,7 +506,14 @@ export function formatHistory(messages) {
       }
     }
 
-    lines.push(`${role}: ${truncateForHistory(text, maxMessageChars)}`);
+    const attachments = Array.isArray(msg?.attachments) ? msg.attachments.filter((item) => item?.type === "image") : [];
+    if (attachments.length > 0) {
+      const summaries = attachments.map((item) => `${item.mimeType || "image"} ${item.bytes || 0} bytes`).join(", ");
+      lines.push(`${role}: ${truncateForHistory(text, maxMessageChars)}`);
+      lines.push(`${role}: Attachments: ${summaries}`);
+    } else {
+      lines.push(`${role}: ${truncateForHistory(text, maxMessageChars)}`);
+    }
   }
 
   return lines.join("\n");
@@ -928,6 +943,34 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
       },
     },
     {
+      name: "subagent",
+      description:
+        "Spawn a read-only subagent to investigate an independent codebase question and return concise findings. Use for parallelizable analysis; subagents cannot modify files.",
+      input_schema: {
+        type: "object",
+        properties: {
+          task: {
+            type: "string",
+            description: "Specific investigation task for the subagent.",
+          },
+          context: {
+            type: "string",
+            description: "Optional focused context or constraints for the subagent.",
+          },
+          mode: {
+            type: "string",
+            enum: ["analysis", "readonly"],
+            description: "Read-only investigation mode (default: analysis).",
+          },
+          tool_budget: {
+            type: "integer",
+            description: "Maximum child tool budget, 1-6 (default: 3).",
+          },
+        },
+        required: ["task"],
+      },
+    },
+    {
       name: "git_status",
       description: "Show git status for the current workspace.",
       input_schema: {
@@ -1030,6 +1073,41 @@ export function buildMessages(arg1 = {}, arg2 = {}) {
     prompt = arg1?.prompt || "";
     format = arg1?.format || "anthropic";
   }
+
+  const normalizeAttachments = (value) => (Array.isArray(value) ? value.filter((item) => item?.type === "image") : []);
+  const toOpenAIContent = (role, content, attachments) => {
+    const images = normalizeAttachments(attachments);
+    if (images.length === 0) return content;
+    const parts = [];
+    const text = String(content ?? "");
+    if (text) parts.push({ type: "text", text });
+    for (const image of images) {
+      parts.push({
+        type: "image_url",
+        image_url: { url: `data:${image.mimeType};base64,${image.data}` },
+      });
+    }
+    if (parts.length === 0) return "";
+    return parts;
+  };
+  const toAnthropicContent = (role, content, attachments) => {
+    const images = normalizeAttachments(attachments);
+    if (images.length === 0) return content;
+    const parts = [];
+    const text = String(content ?? "");
+    if (text) parts.push({ type: "text", text });
+    for (const image of images) {
+      parts.push({
+        type: "image",
+        source: {
+          type: "base64",
+          media_type: image.mimeType,
+          data: image.data,
+        },
+      });
+    }
+    return parts.length > 0 ? parts : "";
+  };
 
   const toText = (value) => {
     if (typeof value === "string") return value;
@@ -1210,7 +1288,10 @@ export function buildMessages(arg1 = {}, arg2 = {}) {
         });
         continue;
       }
-      messages.push({ role, content: textContent });
+      const content = normalizeAttachments(msg?.attachments).length > 0
+        ? toAnthropicContent(role, textContent, msg?.attachments)
+        : textContent;
+      messages.push({ role, content });
       continue;
     }
 
@@ -1239,7 +1320,10 @@ export function buildMessages(arg1 = {}, arg2 = {}) {
       });
       continue;
     }
-    messages.push({ role, content: textContent });
+    const content = normalizeAttachments(msg?.attachments).length > 0
+      ? toOpenAIContent(role, textContent, msg?.attachments)
+      : textContent;
+    messages.push({ role, content });
   }
 
   if (prompt) {

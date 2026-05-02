@@ -96,6 +96,11 @@ node src/cli.js --prompt "use $vercel-react-best-practices to optimize this Reac
 
 # start simple full-screen TUI mode
 node src/cli.js --tui
+
+# start the Web UI (LAN accessible by default)
+npm run web
+# optional overrides:
+PIECODE_WEB_PORT=3737 PIECODE_WEB_HOST=0.0.0.0 npm run web
 ```
 
 Build and release:
@@ -118,6 +123,8 @@ npm run release -- --publish
 ```
 
 TUI includes live model status (running/idle/error), last turn duration, and last tool used.
+
+Web UI is available with `npm run web`. It serves a browser-based agent workspace on `0.0.0.0` by default so other devices on the same LAN can open the printed network URL. The Web UI reuses the same Agent, provider, tool, MCP, skills, and approval backend as the CLI/TUI, with chat timeline, live tool status, TODOs, plan mode, abort, and shell approval controls. Web sessions are saved under `.piecode/web-sessions/`; use `/sessions` to list recent sessions and `/resume <short-id|session-id>` to restore one.
 
 The agent now performs a lightweight pre-plan before execution (default on) to reduce unnecessary tool calls. If the first plan underestimates the work, it auto-replans and continues.
 
@@ -174,6 +181,7 @@ DOCKER_HOST=unix:///Users/$USER/.orbstack/run/docker.sock ./scripts/run-terminal
 - `/skills off <name>` disable a skill
 - `/skills clear` disable all skills
 - `/use <name>` alias for enabling a skill
+- `/attach image` attach the current clipboard image to the next prompt
 
 You can also mention `$skill-name` in a prompt to auto-enable that skill for the current session.
 
@@ -196,6 +204,7 @@ You can also mention `$skill-name` in a prompt to auto-enable that skill for the
   - `list_mcp_resource_templates`
   - `read_mcp_resource`
 - Provider selection order is: CLI args -> `~/.piecode/settings.json` -> env vars -> Codex CLI session -> Codex auth file.
+- Clipboard image attachments are supported in interactive mode via `/attach image` (macOS, Windows, and Linux with `xclip`). They are sent to vision-capable native-tool providers with the next prompt.
 - `seed` provider is OpenAI-compatible and can be selected with `"provider": "seed"` (or `--provider seed`).
 - Codex OAuth tokens may not include all API scopes; if needed, set `OPENAI_API_KEY`.
 - Interactive prompt history is persisted to `~/.piecode_history` by default.

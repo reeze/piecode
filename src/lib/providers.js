@@ -779,7 +779,21 @@ function responsesItemIdFromToolCallId(id) {
 }
 
 function normalizeResponsesInputContent(role, content) {
-  if (Array.isArray(content)) return content;
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (part?.type === 'text') {
+          return { type: role === 'assistant' ? 'output_text' : 'input_text', text: String(part.text || '') };
+        }
+        if (part?.type === 'image_url' && role !== 'assistant') {
+          const url = String(part?.image_url?.url || '');
+          if (url) return { type: 'input_image', image_url: url };
+        }
+        if (part?.type === 'input_text' || part?.type === 'output_text' || part?.type === 'input_image') return part;
+        return null;
+      })
+      .filter(Boolean);
+  }
   const text = String(content ?? '');
   if (role === 'assistant') {
     return [{ type: 'output_text', text }];

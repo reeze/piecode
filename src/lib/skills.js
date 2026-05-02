@@ -9,7 +9,7 @@ function toArray(value) {
   return [];
 }
 
-export function resolveSkillRoots(settings = {}) {
+export function resolveSkillRoots(settings = {}, workspaceDir = process.cwd()) {
   const envRoots = toArray(process.env.PIECODE_SKILLS_DIR)
     .flatMap((entry) => String(entry).split(","))
     .map((entry) => entry.trim())
@@ -20,12 +20,21 @@ export function resolveSkillRoots(settings = {}) {
     ...toArray(settings?.skillPaths),
   ];
 
+  const workspaceRoot = path.resolve(workspaceDir || process.cwd());
+  const projectRoots = [
+    path.join(workspaceRoot, "AGENTS", "skills"),
+    path.join(workspaceRoot, "Agents", "skills"),
+    path.join(workspaceRoot, "agents", "skills"),
+    path.join(workspaceRoot, ".skills"),
+    path.join(workspaceRoot, ".piecode", "skills"),
+  ];
   const defaults = [
+    ...projectRoots,
     path.join(os.homedir(), ".agents", "skills"),
     path.join(os.homedir(), ".codex", "skills"),
   ];
 
-  return [...new Set([...envRoots, ...settingsRoots, ...defaults].map((p) => path.resolve(p)))];
+  return [...new Set([...envRoots, ...settingsRoots, ...defaults].map((p) => path.resolve(workspaceRoot, p)))];
 }
 
 async function pathExists(targetPath) {

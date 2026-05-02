@@ -113,12 +113,48 @@ describe("tools usability", () => {
     expect(typeof tools.search_files).toBe("function");
     expect(typeof tools.web_search).toBe("function");
     expect(typeof tools.search_web).toBe("function");
+    expect(typeof tools.subagent).toBe("function");
     expect(typeof tools.edit_file).toBe("function");
     expect(typeof tools.apply_patch).toBe("function");
     expect(typeof tools.replace_in_files).toBe("function");
     expect(typeof tools.git_status).toBe("function");
     expect(typeof tools.git_diff).toBe("function");
     expect(typeof tools.run_tests).toBe("function");
+  });
+
+  test("subagent delegates to configured runner with normalized input", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    const starts = [];
+    const calls = [];
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      onToolStart: (tool, input) => starts.push({ tool, input }),
+      runSubagent: async (input) => {
+        calls.push(input);
+        return "subagent findings";
+      },
+    });
+
+    const result = await tools.subagent({
+      task: " inspect providers ",
+      context: "focus on auth",
+      mode: "readonly",
+      tool_budget: 99,
+    });
+
+    expect(result).toBe("subagent findings");
+    expect(starts[0]).toMatchObject({ tool: "subagent" });
+    expect(starts[0].input.tool_budget).toBe(6);
+    expect(calls).toEqual([
+      {
+        task: "inspect providers",
+        context: "focus on auth",
+        mode: "readonly",
+        toolBudget: 6,
+      },
+    ]);
   });
 
   test("read_files reads multiple files with structured output", async () => {

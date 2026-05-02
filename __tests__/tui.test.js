@@ -153,10 +153,12 @@ describe("tui usability", () => {
     );
     expect(stripAnsi(tui.formatTimelineLines("[banner-1] ██████")[0])).toContain("██████");
     expect(stripAnsi(tui.formatTimelineLines("[banner-meta] model: seed:model")[0])).toContain("model: seed:model");
-    expect(stripAnsi(tui.formatTimelineLines("[banner-hint] keys: CTRL+L")[0])).toContain("keys: CTRL+L");
+    expect(stripAnsi(tui.formatTimelineLines("[banner-hint] keys: CTRL+L | !cmd shell")[0])).toContain("keys: CTRL+L");
+    expect(stripAnsi(tui.formatTimelineLines("[banner-hint] keys: CTRL+L | !cmd shell")[0])).toContain("!cmd shell");
     expect(tui.formatTimelineLines("[thinking] internal details")).toEqual([]);
     expect(tui.formatTimelineLines("[thinking] request:turn payload-here")).toEqual([]);
     expect(stripAnsi(tui.formatTimelineLines("[thought] I should inspect files first")[0])).toContain("Update: I should inspect files first");
+    expect(stripAnsi(tui.formatTimelineLines("[agent] start subagent-1: inspect providers")[0])).toContain("[agent] start subagent-1");
     const markdownResponse = stripAnsi(
       tui.formatTimelineLines("[response] ## Title\n- **bold** and `code`")[1]
     );
@@ -533,6 +535,25 @@ describe("tui usability", () => {
     expect(frame).not.toContain("AGENTS.md: loaded");
   });
 
+  test("task context remains visible after task starts", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.event("[task] create a small CLI calculator");
+    tui.onToolUse("write_file");
+    const frame = latestFrame(out);
+    expect(frame).toContain("Task");
+    expect(frame).toContain("create a small CLI calculator");
+    expect(frame).toContain("Using tool: write_file");
+  });
+
   test("running indicator is rendered in workspace while thinking", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
@@ -652,7 +673,7 @@ describe("tui usability", () => {
     expect(lastWrite).toContain(`\x1b[${tui.lastInputRow};10H`);
   });
 
-  test("live thought content is rendered in workspace", () => {
+  test("live thought content is rendered in status bar, not workspace", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
       out,
@@ -667,9 +688,10 @@ describe("tui usability", () => {
     let frame = latestFrame(out);
     expect(frame).toContain("Update:");
     expect(frame).toContain("inspect files first");
+    expect(tui.thoughtStreamVisible).toBe(false);
     tui.clearLiveThought();
     frame = latestFrame(out);
-    expect(frame).not.toContain("inspect files first");
+    expect(tui.thoughtStreamVisible).toBe(false);
     tui.stop();
   });
 

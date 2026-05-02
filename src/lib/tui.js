@@ -273,6 +273,8 @@ export class SimpleTui {
     this.lastError = "";
     this.lastTool = "";
     this.lastStatus = "Ready";
+    this.taskStartedAt = 0;
+    this.taskCompletedAt = 0;
     this.thinking = false;
     this.thinkingStage = "";
     this.contextUsed = 0;
@@ -358,6 +360,8 @@ export class SimpleTui {
   event(line) {
     if (String(line || "").startsWith("[task] ")) {
       this.currentTaskText = String(line).slice(7).trim();
+      this.taskStartedAt = Date.now();
+      this.taskCompletedAt = 0;
       this.scrollOffset = 0;
     }
     const timestamp = new Date().toLocaleTimeString();
@@ -422,6 +426,7 @@ export class SimpleTui {
   }
 
   onTurnSuccess(durationMs) {
+    this.taskCompletedAt = Date.now();
     this.modelState = "idle";
     this.thinking = false;
     this.thinkingStage = "";
@@ -433,6 +438,7 @@ export class SimpleTui {
   }
 
   onTurnError(errorMessage, durationMs) {
+    this.taskCompletedAt = Date.now();
     this.modelState = "error";
     this.thinking = false;
     this.thinkingStage = "";
@@ -478,9 +484,19 @@ export class SimpleTui {
   }
 
   formatElapsedSinceTurnStart() {
-    if (!this.turnStartedAt) return "0.0s";
-    const ms = Math.max(0, Date.now() - this.turnStartedAt);
+    const startedAt = this.turnStartedAt || this.taskStartedAt;
+    if (!startedAt) return "0.0s";
+    const endedAt = this.thinking || this.modelState === "running" ? Date.now() : this.taskCompletedAt || Date.now();
+    const ms = Math.max(0, endedAt - startedAt);
     return `${(ms / 1000).toFixed(1)}s`;
+  }
+
+  formatTaskContextLine(width) {
+    const task = String(this.currentTaskText || "").replace(/\s+/g, " ").trim();
+    if (!task) return "";
+    const elapsed = this.formatElapsedSinceTurnStart();
+    const parts = [color("Task", "1;36"), truncateLine(task, Math.max(16, width - 28)), color(elapsed, "2;37")];
+    return truncateLine(` ${parts.join(" · ")}`, width);
   }
 
   setLlmDebugEnabled(enabled) {
@@ -516,8 +532,9 @@ export class SimpleTui {
 
   setLiveThought(content) {
     const text = String(content || "").replace(/\s+/g, " ").trim();
-    this.thoughtStreamVisible = Boolean(text);
+    this.thoughtStreamVisible = false;
     this.thoughtStreamText = text ? `Update: ${text}` : "";
+    if (text) this.lastStatus = truncateLine(`Update: ${text}`, 120);
     this.render();
   }
 
@@ -997,6 +1014,8 @@ export class SimpleTui {
         case "web_search":
         case "search_web":
           return `${color("Web search", "36")}${suffix}`;
+        case "subagent":
+          return `${color("Subagent", "36")}${suffix}`;
         case "git_status":
           return color("Git status", "36");
         case "git_diff":
@@ -1094,6 +1113,9 @@ export class SimpleTui {
       const body = line.slice(8).trim();
       const clean = this.showRawLogs ? body : body.split(" - ")[0].trim();
       return padAll([`${color("[tools]", "1;36")} ${clean}`, ""]);
+    }
+    if (line.startsWith("[agent] ")) {
+      return padAll([`${color("[agent]", "1;35")} ${trimWorkspaceText(line.slice(8).trim(), 600).text}`]);
     }
     if (line.startsWith("[response] ")) {
       const text = trimWorkspaceText(line.slice(11).trim(), 8000).text;
@@ -1409,9 +1431,11 @@ export class SimpleTui {
         (modelSuggestionViewport.hiddenBelow > 0 ? 1 : 0)
       : 0;
     const hintLines = this.inputHint ? 1 : 0;
+    const taskContextLine = this.formatTaskContextLine(width);
+    const taskContextLines = taskContextLine ? 1 : 0;
     const thinkingLines = this.thinking ? 1 : 0;
-    const thoughtWrapped = this.thoughtStreamVisible ? wrapText(this.thoughtStreamText, width) : [];
-    const thoughtStreamLines = this.thoughtStreamVisible ? thoughtWrapped.length : 0;
+    const thoughtWrapped = [];
+    const thoughtStreamLines = 0;
     const inputState = this.buildInputState(this.currentInput, width, cursorIndex);
     const inputLineCount = Math.max(1, inputState.lines.length);
     const bottomLines = inputLineCount + 3 + commandSuggestionLines + modelSuggestionLines + hintLines; // input + pickers + status/hint
@@ -1419,6 +1443,7 @@ export class SimpleTui {
       headerLines +
       todoBlockLines +
       approvalLines +
+      taskContextLines +
       thinkingLines +
       thoughtStreamLines +
       bottomLines;
@@ -1474,17 +1499,14 @@ export class SimpleTui {
           : `${" ".repeat(Math.max(0, width - raw.length))}${raw}`;
     }
     const approvalBlock = this.approvalPrompt ? [sep, ...approvalContentLines] : [];
+    const taskContextBlock = taskContextLine ? [taskContextLine] : [];
     const thinkingColors = ["82", "118", "154", "190", "201"];
     const thinkingColor = thinkingColors[this.thinkingTick % thinkingColors.length];
     const spinFrames = ["|", "/", "-", "\\"];
     const spin = spinFrames[this.thinkingTick % spinFrames.length];
     const runningLine = `↳ | ${spin} running | ${this.formatElapsedSinceTurnStart()} | tok ↑${formatCompactNumber(this.turnTokensSent)} ↓${formatCompactNumber(this.turnTokensReceived)}`;
     const thinkingBlock = this.thinking ? [color(runningLine, `1;${thinkingColor}`)] : [];
-    const thoughtStreamBlock = this.thoughtStreamVisible
-      ? (() => {
-          return thoughtWrapped.map((line) => color(line, "35"));
-        })()
-      : [];
+    const thoughtStreamBlock = [];
 
     const todoMark = (status) =>
       status === "completed" ? "[x]" : status === "in_progress" ? "[~]" : "[ ]";
@@ -1540,6 +1562,7 @@ export class SimpleTui {
       ...visibleLogs,
       ...todoLinesBlock,
       ...approvalBlock,
+      ...taskContextBlock,
       ...thinkingBlock,
       ...thoughtStreamBlock,
       sep, // separator directly above input

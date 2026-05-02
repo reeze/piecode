@@ -32,6 +32,15 @@ import { McpHub, mergeCommonMcpServers, resolveMcpServerConfigs } from "./lib/mc
 import { AgentSessionState, SessionEventBus, createJsonlSessionSink } from "./lib/sessionProtocol.js";
 import { classifyShellCommand } from "./lib/tools.js";
 import { applyFileMentionSelection, getFileMentionSuggestions, isGitRelatedPath } from "./lib/fileMentions.js";
+import { formatAttachmentSummary, readClipboardImage } from "./lib/attachments.js";
+import {
+  listResumableSessions,
+  loadResumableSession,
+  makeSessionId as makeResumableSessionId,
+  resolveResumableSessionId,
+  saveResumableSession,
+  shortSessionId,
+} from "./lib/resumableSessions.js";
 
 const HISTORY_MAX = 500;
 const execAsync = promisify(execCb);
@@ -44,6 +53,10 @@ const SLASH_COMMANDS = [
   "/quit",
   "/clear",
   "/compact",
+  "/sessions",
+  "/resume",
+  "/status",
+  "/agents",
   "/plan",
   "/approve",
   "/trace",
@@ -65,6 +78,7 @@ const SLASH_COMMANDS = [
   "/use",
   "/skill-creator",
   "/workspace",
+  "/attach image",
 ];
 
 const DEFAULT_CONTEXT_WINDOW = 128000;
@@ -191,12 +205,7 @@ function getHistoryFilePath() {
 }
 
 function makeSessionId() {
-  const now = new Date();
-  const pad = (n, w = 2) => String(n).padStart(w, "0");
-  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(
-    now.getHours()
-  )}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
-  return `session-${stamp}`;
+  return makeResumableSessionId();
 }
 
 function clipText(value, max = 12000) {
@@ -508,6 +517,10 @@ Slash commands in interactive mode:
   /quit                Quit (alias)
   /clear               Clear all turn context (history + todos)
   /compact             Compact older context and keep recent turns
+  /sessions            List recent saved sessions
+  /resume <id>         Resume a saved session by full or short id
+  /status              Show current task/model/subagent status
+  /agents              Show active and recent subagents
   /plan on|off         Toggle plan mode (safe read-only tools allowed; no file changes)
   /plan                Show current plan mode
   /approve on|off      Toggle shell auto-approval
@@ -533,6 +546,7 @@ Slash commands in interactive mode:
   /use <name>          Alias for /skills use <name>
   /skill-creator       Interactive skill creation tool
   /workspace           Return to workspace timeline view
+  /attach image        Attach the current clipboard image to the next prompt
   CTRL+D               Press twice on empty input to exit (TUI mode)
   CTRL+C               Clear current input (TUI mode)
   UP/DOWN              Scroll timeline when input is empty (TUI mode)
@@ -945,6 +959,9 @@ function formatToolInputSummary(tool, input, maxLen = 120) {
   }
   if (tool === "web_search" || tool === "search_web") {
     return summarizeForLog(safe.query || safe.q || "", maxLen);
+  }
+  if (tool === "subagent") {
+    return summarizeForLog(safe.task || "", maxLen);
   }
   if (tool === "git_status") {
     return Boolean(safe.porcelain) ? "porcelain" : "full";
@@ -1725,6 +1742,46 @@ function advanceTodosOnTurnDone(todos) {
   return next;
 }
 
+function formatSessionListForDisplay(sessions) {
+  const list = Array.isArray(sessions) ? sessions : [];
+  if (list.length === 0) return "No resumable sessions yet.";
+  return [
+    "## Recent Sessions",
+    ...list.map((item, index) => {
+      const shortId = item.shortId || shortSessionId(item.sessionId);
+      const updated = item.updatedAt ? new Date(item.updatedAt).toLocaleString() : "unknown time";
+      return `${index + 1}. \`${shortId}\` — ${item.summary || "PieCode session"}\n   ${updated} · ${item.messageCount || 0} messages · ${item.toolCount || 0} tools\n   Resume: \`/resume ${shortId}\` or \`/resume ${item.sessionId}\``;
+    }),
+  ].join("\n");
+}
+
+async function saveCliResumableSession({ workspaceDir, taskTraceRef, agent, todosRef, providerRef, logLine = null }) {
+  if (!agent || !Array.isArray(agent.history) || agent.history.length === 0) return null;
+  const messages = agent.history
+    .filter((msg) => msg?.role === "user" || msg?.role === "assistant")
+    .map((msg, index) => ({
+      id: `msg-${index + 1}`,
+      type: "message",
+      role: msg.role,
+      content: String(msg.content || ""),
+      at: new Date().toISOString(),
+    }));
+  const saved = await saveResumableSession(workspaceDir, {
+    sessionId: taskTraceRef?.sessionId || makeSessionId(),
+    providerLabel: providerRef?.value ? formatProviderModel(providerRef.value) : "",
+    messages,
+    timeline: messages,
+    todos: todosRef?.value || [],
+    agentHistory: agent.history,
+  });
+  const shortId = shortSessionId(saved.sessionId);
+  if (typeof logLine === "function") {
+    logLine(`[session] saved ${saved.sessionId}`);
+    logLine(`[session] resume with /resume ${shortId} or /resume ${saved.sessionId}`);
+  }
+  return { ...saved, shortId };
+}
+
 function formatSkillLabel(activeSkillsRef) {
   const skills = activeSkillsRef.value.map((s) => s.name);
   return skills.length > 0 ? skills.join(",") : "none";
@@ -1811,7 +1868,7 @@ function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
     `[banner-title-inline] ${center(" Pie Code  let's cook")}`,
     `[banner-meta] ${center(`model: ${formatProviderModel(provider)}`)}`,
     `[banner-meta] ${center(`workspace: ${shortWorkspace}`)}`,
-    `[banner-hint] ${center("keys: CTRL+L logs | CTRL+O llm debug | CTRL+T todos")}`,
+    `[banner-hint] ${center("keys: CTRL+L logs | CTRL+T todos | CTRL+O llm debug | /attach image")}`,
   ];
   for (const line of logoLines) {
     tui.event(line);
@@ -2140,6 +2197,7 @@ async function maybeAutoEnableSkills(input, activeSkillsRef, skillIndex, logLine
 async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef, workspaceDir, options = {}) {
   const startedAt = Date.now();
   const planOnly = Boolean(options?.planOnly);
+  const attachments = Array.isArray(options?.attachments) ? options.attachments : [];
   if (tui) tui.beginTurn();
   const beforeGitSet = getGitChangedFileSet(workspaceDir);
   const beforeGitNumstat = getGitNumstatMap(workspaceDir);
@@ -2151,7 +2209,7 @@ async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef,
     turnSummaryRef.value.beforeGitNumstat = beforeGitNumstat;
   }
   try {
-    const result = await agent.runTurn(input, { planOnly });
+    const result = await agent.runTurn(input, { planOnly, attachments });
     const durationMs = Date.now() - startedAt;
     if (tui) tui.onTurnSuccess(durationMs);
     const afterGitSet = getGitChangedFileSet(workspaceDir);
@@ -2219,6 +2277,103 @@ async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef,
   }
 }
 
+function formatSubagentLines(subagentsRef) {
+  const state = subagentsRef?.value || {};
+  const active = state.active instanceof Map ? [...state.active.values()] : [];
+  const completed = Array.isArray(state.completed) ? state.completed : [];
+  const lines = [];
+  lines.push(`subagents: ${active.length} active, ${completed.length} completed`);
+  for (const item of active) {
+    const elapsed = item.startedAt ? formatReadableDuration(Date.now() - item.startedAt) : "-";
+    const tool = item.lastTool ? ` | tool=${item.lastTool}` : "";
+    lines.push(`- running ${item.id}: ${summarizeForLog(item.task, 90)} | ${elapsed}${tool}`);
+  }
+  for (const item of completed.slice(-5).reverse()) {
+    const elapsed = item.startedAt && item.endedAt ? formatReadableDuration(item.endedAt - item.startedAt) : "-";
+    const status = item.status || "done";
+    const tools = Array.isArray(item.tools) && item.tools.length > 0 ? ` | tools=${item.tools.join(",")}` : "";
+    lines.push(`- ${status} ${item.id}: ${summarizeForLog(item.task, 90)} | ${elapsed}${tools}`);
+  }
+  return lines;
+}
+
+function updateSubagentState(subagentsRef, evt) {
+  if (!subagentsRef?.value || !evt || typeof evt !== "object") return;
+  const state = subagentsRef.value;
+  if (!(state.active instanceof Map)) state.active = new Map();
+  if (!Array.isArray(state.completed)) state.completed = [];
+  const id = String(evt.id || "").trim();
+  if (!id) return;
+  if (evt.type === "subagent_start") {
+    state.active.set(id, {
+      id,
+      task: String(evt.task || ""),
+      mode: String(evt.mode || "analysis"),
+      status: "running",
+      startedAt: Date.now(),
+      lastTool: "",
+    });
+    return;
+  }
+  if (evt.type === "subagent_event") {
+    const item = state.active.get(id);
+    const child = evt.event && typeof evt.event === "object" ? evt.event : {};
+    if (item && child.type === "tool_use") {
+      item.lastTool = String(child.tool || "");
+      item.lastUpdateAt = Date.now();
+    }
+    return;
+  }
+  if (evt.type === "subagent_end") {
+    const current = state.active.get(id) || {
+      id,
+      task: String(evt.task || ""),
+      startedAt: Date.now(),
+    };
+    state.active.delete(id);
+    state.completed.push({
+      ...current,
+      status: String(evt.status || "done"),
+      error: String(evt.error || ""),
+      tools: Array.isArray(evt.tools) ? evt.tools : [],
+      endedAt: Date.now(),
+    });
+    if (state.completed.length > 20) state.completed = state.completed.slice(-20);
+  }
+}
+
+async function handleNonInterruptingCommand(input, ctx = {}) {
+  const raw = String(input || "").trim();
+  const lower = raw.replace(/\s+/g, " ").toLowerCase();
+  const logLine = ctx.logLine || (() => {});
+  if (!raw.startsWith("/")) {
+    logLine("task is running; only non-interrupting slash commands are accepted now");
+    return true;
+  }
+  if (lower === "/agents" || lower === "/subagents") {
+    for (const line of formatSubagentLines(ctx.subagentsRef)) logLine(line);
+    return true;
+  }
+  if (lower === "/status") {
+    const active = ctx.subagentsRef?.value?.active instanceof Map ? ctx.subagentsRef.value.active.size : 0;
+    const model = ctx.providerRef?.value ? formatProviderModel(ctx.providerRef.value) : "unknown";
+    logLine(`status: task running | model=${model} | subagents=${active} active`);
+    return true;
+  }
+  if (lower === "/help") {
+    logLine("running commands: /status, /agents, /debug llm, /help");
+    logLine("other commands are deferred until the current task finishes");
+    return true;
+  }
+  if (lower === "/debug llm") {
+    openLlmDebugOverlay({ tui: ctx.tui, llmHistoryRef: ctx.llmHistoryRef, llmLastRef: ctx.llmLastRef, logLine });
+    return true;
+  }
+  logLine(`command not available while task is running: ${raw}`);
+  logLine("available now: /status, /agents, /debug llm, /help");
+  return true;
+}
+
 async function handleSlashCommand(input, ctx) {
   const {
     agent,
@@ -2247,6 +2402,7 @@ async function handleSlashCommand(input, ctx) {
     llmHistoryRef,
     sessionBus,
     refreshTuiContextUsage,
+    pendingAttachmentsRef,
   } = ctx;
 
   const raw = String(input || "").trim();
@@ -2355,6 +2511,10 @@ async function handleSlashCommand(input, ctx) {
         "/exit | /quit",
         "/clear",
         "/compact",
+        "/sessions",
+        "/resume <id>",
+        "/status",
+        "/agents",
         "/plan",
         "/approve on|off",
         "/trace on|off",
@@ -2375,6 +2535,7 @@ async function handleSlashCommand(input, ctx) {
         "/skills clear",
         "/use <name>",
         "/skill-creator",
+        "/attach image",
       ];
       for (const line of helpLines) logLine(line);
     } else {
@@ -2395,6 +2556,41 @@ async function handleSlashCommand(input, ctx) {
       ctx.tui.render("", "context cleared");
     }
     logLine("all context cleared");
+    return { done: false, handled: true };
+  }
+  if (lower === "/status") {
+    const active = ctx.subagentsRef?.value?.active instanceof Map ? ctx.subagentsRef.value.active.size : 0;
+    logLine(`status: idle | model=${formatProviderModel(providerRef.value)} | subagents=${active} active`);
+    return { done: false, handled: true };
+  }
+  if (lower === "/agents" || lower === "/subagents") {
+    for (const line of formatSubagentLines(ctx.subagentsRef)) logLine(line);
+    return { done: false, handled: true };
+  }
+  if (lower === "/sessions") {
+    const sessions = await listResumableSessions(workspaceDir, 10);
+    logLine(formatSessionListForDisplay(sessions));
+    return { done: false, handled: true };
+  }
+  if (lower.startsWith("/resume")) {
+    const query = normalized.split(/\s+/).slice(1).join(" ").trim();
+    if (!query) {
+      logLine("usage: /resume <session-id|short-id>");
+      return { done: false, handled: true };
+    }
+    try {
+      const sessionId = await resolveResumableSessionId(workspaceDir, query);
+      const session = await loadResumableSession(workspaceDir, sessionId);
+      agent.history = Array.isArray(session.agentHistory) ? session.agentHistory : [];
+      if (ctx.todosRef) ctx.todosRef.value = Array.isArray(session.todos) ? session.todos : [];
+      if (tui) {
+        tui.setTodos(ctx.todosRef?.value || []);
+        refreshTuiContextUsage?.();
+      }
+      logLine(`resumed session ${session.sessionId} (${session.messages?.length || agent.history.length} messages)`);
+    } catch (err) {
+      logLine(`resume failed: ${String(err?.message || err)}`);
+    }
     return { done: false, handled: true };
   }
   if (lower === "/compact") {
@@ -2811,6 +3007,23 @@ async function handleSlashCommand(input, ctx) {
   if (lower === "/workspace") {
     if (tui) tui.setRawLogsVisible(false);
     logLine("workspace timeline view");
+    return { done: false, handled: true };
+  }
+  if (lower === "/attach image" || lower === "/image" || lower === "/paste image") {
+    if (!pendingAttachmentsRef) {
+      logLine("attachments are unavailable in this mode");
+      return { done: false, handled: true };
+    }
+    try {
+      const image = await readClipboardImage();
+      pendingAttachmentsRef.value = [...(pendingAttachmentsRef.value || []), image];
+      logLine(`attached clipboard image: ${formatAttachmentSummary(image)} (will be sent with next prompt)`);
+    } catch (err) {
+      logLine(`attach image failed: ${String(err?.message || err)}`);
+      if (process.platform === "linux") {
+        logLine("hint: install xclip and copy an image to the clipboard");
+      }
+    }
     return { done: false, handled: true };
   }
 
@@ -3322,7 +3535,7 @@ async function main() {
   };
   const modelContextWindowsRef = { value: new Map() };
   const modelContextMetadataRef = { value: new Set() };
-  const skillRoots = resolveSkillRoots(settings);
+  const skillRoots = resolveSkillRoots(settings, workspaceDir);
   let skillIndex = await discoverSkills(skillRoots);
   const refreshSkillIndex = async () => {
     skillIndex = await discoverSkills(skillRoots);
@@ -3382,6 +3595,7 @@ async function main() {
     value: { active: false, tools: [], filesChanged: new Set(), beforeGitSet: null },
   };
   const taskTraceRef = { seq: 0, current: null, sessionId: makeSessionId(), sessionDir: "" };
+  const subagentsRef = { value: { active: new Map(), completed: [] } };
   const sessionBus = new SessionEventBus({ sessionId: taskTraceRef.sessionId });
   const sessionState = new AgentSessionState({ sessionId: taskTraceRef.sessionId });
   sessionBus.subscribe((event) => sessionState.apply(event));
@@ -3400,6 +3614,7 @@ async function main() {
   const commandPickerRef = { active: false, mode: "command", options: [], index: 0 };
   const mcpHubRef = { value: null };
   const commandRunRef = { value: null };
+  const pendingAttachmentsRef = { value: [] };
   const getMcpServerNamesForSuggestions = () => {
     const names = new Set([...getLocalMcpServerKeySet(settings)]);
     if (mcpHubRef.value && typeof mcpHubRef.value.hasServers === "function" && mcpHubRef.value.hasServers()) {
@@ -3795,6 +4010,39 @@ async function main() {
             tui.clearInputHint();
           }, 1200);
           return;
+        }
+        if (taskRunningRef.value) {
+          const editableDuringRun =
+            enterPressed ||
+            keyName === "backspace" ||
+            keyName === "delete" ||
+            keyName === "left" ||
+            keyName === "right" ||
+            keyName === "home" ||
+            keyName === "end" ||
+            (key.ctrl && (keyName === "a" || keyName === "e" || keyName === "u")) ||
+            (!key.ctrl && !key.meta && typeof str === "string" && str && str !== "\r" && str !== "\n");
+          if (editableDuringRun && rl && typeof rl.handleKeypress === "function") {
+            const submitted = rl.handleKeypress(str, key, { allowWithoutPending: true }) || {};
+            currentInputRef.value = String(rl.line || "");
+            if (tui) tui.renderInput(currentInputRef.value, Number.isFinite(rl.cursor) ? rl.cursor : null);
+            if (submitted.submitted) {
+              const commandText = stripMouseInputNoise(String(submitted.value || "")).trim();
+              currentInputRef.value = "";
+              if (tui) tui.renderInput("");
+              if (commandText) {
+                void handleNonInterruptingCommand(commandText, {
+                  logLine,
+                  tui,
+                  providerRef,
+                  subagentsRef,
+                  llmHistoryRef,
+                  llmLastRef,
+                }).catch((err) => logLine(`command failed: ${String(err?.message || err)}`));
+              }
+            }
+            return;
+          }
         }
         if (!key.ctrl && !key.meta && key.name === "escape" && (modelPickerRef.active || commandPickerRef.active)) {
           modelPickerRef.active = false;
@@ -4307,6 +4555,21 @@ async function main() {
     onEvent: (evt) => {
       if (evt && typeof evt === "object") {
         sessionBus.emit(`agent.${String(evt.type || "event")}`, evt);
+      }
+      if (evt.type === "subagent_start") {
+        recordTaskEvent(taskTraceRef, evt);
+        updateSubagentState(subagentsRef, evt);
+        logLine(`[agent] start ${evt.id}: ${summarizeForLog(evt.task, 120)}`);
+      }
+      if (evt.type === "subagent_event") {
+        recordTaskEvent(taskTraceRef, evt);
+        updateSubagentState(subagentsRef, evt);
+      }
+      if (evt.type === "subagent_end") {
+        recordTaskEvent(taskTraceRef, evt);
+        updateSubagentState(subagentsRef, evt);
+        const suffix = evt.error ? ` error=${summarizeForLog(evt.error, 120)}` : "";
+        logLine(`[agent] ${evt.status || "done"} ${evt.id}: ${summarizeForLog(evt.task, 120)}${suffix}`);
       }
       if (evt.type === "model_call") {
         recordTaskEvent(taskTraceRef, evt);
@@ -4916,8 +5179,20 @@ async function main() {
       sessionBus,
       refreshTuiContextUsage,
       commandRunRef,
+      subagentsRef,
+      pendingAttachmentsRef,
     });
-    if (slash.done) break;
+    if (slash.done) {
+      await saveCliResumableSession({
+        workspaceDir,
+        taskTraceRef,
+        agent,
+        todosRef,
+        providerRef,
+        logLine,
+      });
+      break;
+    }
     if (slash.handled) {
       if (display) display.clearSuggestions();
       currentInputRef.value = "";
@@ -4943,6 +5218,11 @@ async function main() {
     }
 
     await maybeAutoEnableSkills(agentInput, activeSkillsRef, skillIndex, logLine);
+    const turnAttachments = Array.isArray(pendingAttachmentsRef.value) ? pendingAttachmentsRef.value : [];
+    pendingAttachmentsRef.value = [];
+    if (turnAttachments.length > 0) {
+      logLine(`[attachments] ${turnAttachments.map((item) => formatAttachmentSummary(item)).join(", ")}`);
+    }
     taskRunningRef.value = true;
     try {
       clearPendingRequestTokens();
@@ -4954,7 +5234,7 @@ async function main() {
         display,
         turnSummaryRef,
         workspaceDir,
-        { planOnly: planModeRef.value }
+        { planOnly: planModeRef.value, attachments: turnAttachments }
       );
       const saved = await finishTaskTrace(taskTraceRef, workspaceDir, {
         status: turnResult?.ok ? "done" : turnResult?.aborted ? "aborted" : "error",
@@ -4973,6 +5253,14 @@ async function main() {
       }
       if (tui) tui.clearInputHint();
     }
+    await saveCliResumableSession({
+      workspaceDir,
+      taskTraceRef,
+      agent,
+      todosRef,
+      providerRef,
+      logLine: traceRef.value ? logLine : null,
+    });
     if (traceRef.value) {
       const elapsed = traceStateRef.value.turnStartedAt
         ? Date.now() - traceStateRef.value.turnStartedAt

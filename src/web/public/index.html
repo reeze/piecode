@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PieCode Web</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div id="app">
+      <aside class="sidebar">
+        <div class="brand">
+          <div class="logo">π</div>
+          <div>
+            <h1>PieCode</h1>
+            <p>Web coding workspace</p>
+          </div>
+        </div>
+
+        <section class="card status-card">
+          <div class="status-row">
+            <span id="statusDot" class="dot idle"></span>
+            <div>
+              <strong id="statusText">Connecting</strong>
+              <small id="activeTask">Waiting for session</small>
+            </div>
+          </div>
+          <div class="meta-grid">
+            <span>Model</span><b id="modelLabel">-</b>
+            <span>Workspace</span><b id="workspaceLabel">-</b>
+            <span>MCP</span><b id="mcpLabel">-</b>
+          </div>
+        </section>
+
+        <section class="card">
+          <div class="card-title">Session parameters</div>
+          <label class="switch-line">
+            <input id="planOnly" type="checkbox" />
+            <span>Plan mode</span>
+          </label>
+          <label class="switch-line">
+            <input id="autoApprove" type="checkbox" />
+            <span>Auto approve non-danger shell</span>
+          </label>
+          <button id="abortBtn" class="secondary" disabled>Abort current task</button>
+          <div class="session-help">
+            <button id="slashHelpBtn" class="ghost" type="button">Slash commands</button>
+            <small>Type <code>/</code> in the composer for suggestions.</small>
+          </div>
+        </section>
+
+        <section class="card sessions">
+          <div class="card-title">Sessions</div>
+          <div class="session-current">Current: <code id="sessionIdLabel">-</code></div>
+          <div id="recentSessions" class="muted">No previous sessions</div>
+        </section>
+
+        <section class="card approvals" id="approvalPanel">
+          <div class="card-title">Approvals</div>
+          <div id="approvalList" class="muted">No pending approvals</div>
+        </section>
+
+        <section class="card todos">
+          <div class="card-title">Todos</div>
+          <div id="todoList" class="muted">No todos yet</div>
+        </section>
+      </aside>
+
+      <main class="main">
+        <header class="topbar">
+          <div>
+            <h2>Agent timeline</h2>
+            <p>Same PieCode backend, with a calmer web workflow.</p>
+          </div>
+          <div id="connection" class="pill">offline</div>
+        </header>
+
+        <section id="messages" class="messages"></section>
+
+        <section class="composer-wrap">
+          <div id="eventStrip" class="event-strip"></div>
+          <form id="composer" class="composer">
+            <div class="input-shell">
+              <textarea id="messageInput" rows="3" placeholder="Ask PieCode to inspect, edit, test, or explain this workspace..."></textarea>
+              <button id="sendBtn" type="submit" aria-label="Send message">Send</button>
+              <div id="slashSuggestions" class="slash-suggestions" hidden></div>
+            </div>
+          </form>
+          <div class="hint">Shift+Enter for newline · tool approvals will appear on the left</div>
+        </section>
+      </main>
+    </div>
+    <script src="/app.js"></script>
+  </body>
+</html>
