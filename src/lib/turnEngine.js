@@ -650,6 +650,7 @@ export class TurnEngine {
       turnPolicy: this.turnPolicy,
       mcpEnabled: this.mcpEnabled,
       mcpServerNames: this.mcpServerNames,
+      agentDefinitions: this.agent.getAgentDefinitions(),
     });
 
     this.agent.onEvent?.({ type: "model_call", provider: this.agent.provider.kind, model: this.agent.provider.model });
@@ -658,6 +659,7 @@ export class TurnEngine {
       const tools = buildToolDefinitions(nativeFormat, {
         mcpEnabled: this.mcpEnabled,
         mcpServerNames: this.mcpServerNames,
+        agentDefinitions: this.agent.getAgentDefinitions(),
       });
       const payloadTokens = this.agent.estimatePayloadTokens(systemPrompt, messages, tools);
       const compacted = await this.agent.maybeAutoCompactForPayload({

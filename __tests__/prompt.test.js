@@ -62,6 +62,20 @@ describe('Prompt functions', () => {
       expect(nativePrompt.length).toBeLessThan(textPrompt.length);
     });
 
+    test('should include configured project agents', () => {
+      const prompt = buildSystemPrompt({
+        workspaceDir: '/test/workspace',
+        autoApprove: false,
+        agentDefinitions: [
+          { name: 'security-reviewer', description: 'Security and sandbox review' },
+        ],
+      });
+
+      expect(prompt).toContain('CONFIGURED PROJECT AGENTS');
+      expect(prompt).toContain('security-reviewer');
+      expect(prompt).toContain('role, agent, or name');
+    });
+
     test('should include active skills instructions', () => {
       const prompt = buildSystemPrompt({
         workspaceDir: '/test/workspace',
@@ -227,6 +241,9 @@ describe('Prompt functions', () => {
       expect(names).toContain('subagent');
       const subagent = tools.find((tool) => tool.function?.name === 'subagent');
       expect(subagent.function.parameters.required).toContain('task');
+      expect(subagent.function.parameters.properties.role).toBeDefined();
+      expect(subagent.function.parameters.properties.agent).toBeDefined();
+      expect(subagent.function.parameters.properties.name).toBeDefined();
     });
   });
 

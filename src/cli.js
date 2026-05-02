@@ -34,6 +34,7 @@ import { classifyShellCommand } from "./lib/tools.js";
 import { applyFileMentionSelection, getFileMentionSuggestions, isGitRelatedPath } from "./lib/fileMentions.js";
 import { formatAttachmentSummary, readClipboardImage } from "./lib/attachments.js";
 import { loadMemory } from "./lib/memory.js";
+import { loadAgentDefinitions } from "./lib/agentDefinitions.js";
 import {
   listResumableSessions,
   loadResumableSession,
@@ -990,8 +991,12 @@ function formatToolBatchSummary(calls = [], maxLen = 180) {
   }
   const names = [...counts.entries()].map(([tool, count]) => `${tool}${count > 1 ? ` x${count}` : ""}`).join(", ");
   const previews = list
-    .map((call) => formatToolInputSummary(call?.tool, call?.input, 70))
-    .filter((item) => item && item !== "<empty>")
+    .map((call) => {
+      const tool = String(call?.tool || "tool");
+      const summary = formatToolInputSummary(call?.tool, call?.input, 70);
+      return summary && summary !== "<empty>" ? `${tool}(${summary})` : tool;
+    })
+    .filter(Boolean)
     .slice(0, 3);
   const suffix = previews.length > 0 ? ` - ${previews.join("; ")}` : "";
   return summarizeForLog(`${names}${suffix}`, maxLen);
@@ -2302,6 +2307,15 @@ function formatSubagentLines(subagentsRef, agent = null) {
     const tools = Array.isArray(item.tools) && item.tools.length > 0 ? ` | tools=${item.tools.join(",")}` : "";
     lines.push(`- ${status} ${item.id}: ${summarizeForLog(item.task, 90)} | ${elapsed}${tools}`);
   }
+  const definitions = typeof agent?.getAgentDefinitions === "function" ? agent.getAgentDefinitions() : [];
+  if (definitions.length > 0) {
+    lines.push(`configured agents: ${definitions.length}`);
+    for (const definition of definitions) {
+      const color = definition.color ? ` [${definition.color}]` : "";
+      const model = definition.model ? ` ${definition.model}` : "";
+      lines.push(`- ${definition.name}${color}${model}: ${summarizeForLog(definition.description || definition.path, 100)}`);
+    }
+  }
   return lines;
 }
 
@@ -2317,6 +2331,8 @@ function updateSubagentState(subagentsRef, evt) {
       id,
       task: String(evt.task || ""),
       mode: String(evt.mode || "analysis"),
+      role: String(evt.role || ""),
+      agentDefinition: evt.agentDefinition || null,
       status: "running",
       startedAt: Date.now(),
       lastTool: "",
@@ -3642,6 +3658,7 @@ async function main() {
   const projectInstructionsRef = { value: projectInstructionsLoaded.instructions };
   const projectInstructionsStatusRef = { value: projectInstructionsLoaded.status };
   const memoryRef = { value: await loadMemory({ workspaceDir }) };
+  const agentDefinitionsRef = { value: await loadAgentDefinitions({ workspaceDir }) };
   const startupAutoSkills = await autoLoadSkillsFromInstructions(
     projectInstructionsRef.value,
     activeSkillsRef,
@@ -4642,6 +4659,7 @@ async function main() {
     activeSkillsRef,
     projectInstructionsRef,
     memoryRef,
+    agentDefinitionsRef,
     mcpHub: mcpHubRef.value,
     webSearch: settings?.webSearch || settings?.tools?.web?.search || null,
     contextWindowRef,
@@ -4933,7 +4951,7 @@ async function main() {
             `[tool] ${evt.tool}${evt.reason ? ` - ${summarizeForLog(evt.reason, 120)}` : ""}${details ? ` (${details})` : ""}`
           );
         } else {
-          logLine(`[tool] ${evt.tool}`);
+          logLine(`[tool] ${evt.tool}${summary ? ` (${summary})` : ""}`);
         }
       }
       if (evt.type === "tool_start") {

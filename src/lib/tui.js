@@ -1058,7 +1058,7 @@ export class SimpleTui {
       const name = String(tool || "tool");
       const body = String(details || "").trim();
       const clean = body ? body.replace(/^\((.*)\)$/, "$1").trim() : "";
-      const showDetails = this.showRawLogs || /^\[trace\]|\b(?:path|command|query|regex|find|oldText|newText|content|input)=/i.test(clean);
+      const showDetails = this.showRawLogs || Boolean(clean) || /^\[trace\]|\b(?:path|command|query|regex|find|oldText|newText|content|input)=/i.test(clean);
       const suffix = clean && showDetails ? ` ${color(clean, "2;37")}` : "";
       switch (name) {
         case "read_file":
@@ -1175,8 +1175,7 @@ export class SimpleTui {
     }
     if (line.startsWith("[tools] ")) {
       const body = line.slice(8).trim();
-      const clean = this.showRawLogs ? body : body.split(" - ")[0].trim();
-      return padAll([`${color("[tools]", "1;36")} ${clean}`, ""]);
+      return padAll([`${color("[tools]", "1;36")} ${body}`, ""]);
     }
     if (line.startsWith("[agent] ")) {
       return padAll([`${color("[agent]", "1;35")} ${trimWorkspaceText(line.slice(8).trim(), 600).text}`]);

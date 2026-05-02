@@ -1470,15 +1470,20 @@ export function createToolset({
     context = "",
     mode = "analysis",
     tool_budget: toolBudget = 3,
+    role = "",
+    agent = "",
+    name = "",
   } = {}, options = {}) => {
     const normalizedTask = String(task || "").trim();
     const normalizedMode = String(mode || "analysis").trim().toLowerCase();
+    const normalizedRole = String(role || agent || name || "").trim();
     const budget = Math.min(Math.max(Number(toolBudget) || 3, 1), 6);
     onToolStart?.("subagent", {
       task: normalizedTask,
       context,
       mode: normalizedMode,
       tool_budget: budget,
+      ...(normalizedRole ? { role: normalizedRole } : {}),
     });
     if (!normalizedTask) throw new Error("Missing required parameter: task");
     if (typeof runSubagent !== "function") {
@@ -1490,6 +1495,7 @@ export function createToolset({
         context: String(context || ""),
         mode: normalizedMode,
         toolBudget: budget,
+        ...(normalizedRole ? { role: normalizedRole } : {}),
       },
       options
     );

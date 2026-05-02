@@ -104,7 +104,7 @@ describe("tui usability", () => {
     expect(tui.showRawLogs).toBe(true);
   });
 
-  test("raw log mode keeps full tool parameter details visible", () => {
+  test("timeline shows compact tool parameter details", () => {
     const out = createOut();
     const tui = new SimpleTui({
       out,
@@ -114,10 +114,10 @@ describe("tui usability", () => {
       getApprovalLabel: () => "off",
     });
 
-    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - a.txt; b.txt")[0])).not.toContain("a.txt; b.txt");
+    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("read_file(a.txt)");
     tui.setRawLogsVisible(true);
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("README.md");
-    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - a.txt; b.txt")[0])).toContain("a.txt; b.txt");
+    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("read_file(b.txt)");
   });
 
   test("formatTimelineLines maps key event types and hides thinking noise", () => {
@@ -141,12 +141,12 @@ describe("tui usability", () => {
     expect(tui.formatTimelineLines("[tool] shell (echo hi)")).toEqual([]);
     expect(tui.formatTimelineLines("[tool] todo_write (3 todos)")).toEqual([]);
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("[tool] Read");
-    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).not.toContain("README.md");
+    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("README.md");
     expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).toContain("[tool] Search");
-    expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).not.toContain("targetSymbol");
+    expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).toContain("targetSymbol");
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (path=README.md)")[0])).toContain("[tool] Read path=README.md");
-    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - a.txt; b.txt")[0])).toContain("[tools] read_file x2");
-    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - a.txt; b.txt")[0])).not.toContain("a.txt; b.txt");
+    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("[tools] read_file x2");
+    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("read_file(a.txt)");
     expect(stripAnsi(tui.formatTimelineLines("[result] done")[0])).toContain("[ok] done");
     expect(stripAnsi(tui.formatTimelineLines("[result] shell failed | time: 2s")[0])).toContain(
       "[x] shell failed | time: 2s"

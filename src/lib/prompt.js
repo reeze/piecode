@@ -31,6 +31,23 @@ function renderActiveSkillsSection(activeSkills = []) {
   return lines;
 }
 
+function renderAgentDefinitionsSection(agentDefinitions = []) {
+  const definitions = Array.isArray(agentDefinitions) ? agentDefinitions : [];
+  const rows = definitions
+    .map((definition) => ({
+      name: String(definition?.name || "").trim(),
+      description: String(definition?.description || "").replace(/\s+/g, " ").trim(),
+    }))
+    .filter((definition) => definition.name);
+  if (rows.length === 0) return [];
+  return [
+    "",
+    "CONFIGURED PROJECT AGENTS:",
+    ...rows.map((definition) => `- ${definition.name}${definition.description ? `: ${definition.description.slice(0, 220)}` : ""}`),
+    "Use the subagent tool with role, agent, or name to delegate to these .AGENTS definitions when helpful.",
+  ];
+}
+
 function renderMemorySection(memory = null) {
   const text = typeof memory === "string" ? memory.trim() : "";
   if (!text) return [];
@@ -81,6 +98,7 @@ export function buildSystemPrompt({
   turnPolicy = null,
   mcpEnabled = false,
   mcpServerNames = [],
+  agentDefinitions = [],
 }) {
   const sections = [
     "You are a general-purpose command-line agent. Adapt to the user's task, whether it is coding, writing, research, analysis, planning, or troubleshooting.",
@@ -191,6 +209,8 @@ export function buildSystemPrompt({
   if (activeSkills.length > 0) {
     sections.push(...renderActiveSkillsSection(activeSkills));
   }
+
+  sections.push(...renderAgentDefinitionsSection(agentDefinitions));
 
   sections.push(...renderMemorySection(memory));
 
@@ -921,10 +941,22 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
     {
       name: "subagent",
       description:
-        "Spawn a read-only subagent to investigate an independent codebase question and return concise findings. Use for parallelizable analysis; subagents cannot modify files.",
+        "Spawn a read-only subagent to investigate an independent codebase question and return concise findings. Use role/agent/name to delegate to a configured .AGENTS definition; subagents cannot modify files.",
       input_schema: {
         type: "object",
         properties: {
+          role: {
+            type: "string",
+            description: "Optional configured .AGENTS role/name to delegate to, e.g. security-reviewer.",
+          },
+          agent: {
+            type: "string",
+            description: "Alias for role.",
+          },
+          name: {
+            type: "string",
+            description: "Alias for role.",
+          },
           task: {
             type: "string",
             description: "Specific investigation task for the subagent.",

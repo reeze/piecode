@@ -217,6 +217,79 @@ describe("agent context controls", () => {
     expect(events.some((evt) => evt?.type === "subagent_end" && evt.status === "done")).toBe(true);
   });
 
+  test("runSubagent applies named agent definitions", async () => {
+    const events = [];
+    let capturedPrompt = "";
+    const agent = createAgentWithProvider({
+      async complete({ prompt }) {
+        capturedPrompt = prompt;
+        return JSON.stringify({ type: "final", message: "security findings" });
+      },
+    });
+    agent.agentDefinitionsRef = {
+      value: [
+        {
+          name: "security-reviewer",
+          description: "Security review",
+          tools: ["read_file"],
+          model: "inherit",
+          color: "red",
+          path: ".AGENTS/security-reviewer.md",
+          prompt: "You are the security specialist.",
+        },
+      ],
+    };
+    agent.onEvent = (evt) => events.push(evt);
+
+    const result = await agent.runSubagent({ role: "security-reviewer", task: "Review auth" });
+
+    expect(result).toContain("security findings");
+    expect(capturedPrompt).toContain("You are the security specialist.");
+    expect(events.some((evt) => evt?.type === "subagent_start" && evt.role === "security-reviewer" && evt.id.startsWith("security-reviewer-"))).toBe(true);
+  });
+
+  test("runSubagent rejects unknown named agents", async () => {
+    const agent = createAgentWithProvider();
+    agent.agentDefinitionsRef = { value: [] };
+
+    await expect(agent.runSubagent({ role: "missing-reviewer", task: "Review" })).rejects.toThrow(
+      "Unknown agent role: missing-reviewer"
+    );
+  });
+
+  test("runSubagent restricts tools listed by named agent definitions", async () => {
+    let calls = 0;
+    const agent = createAgentWithProvider({
+      async complete() {
+        calls += 1;
+        if (calls === 1) {
+          return JSON.stringify({
+            type: "tool_use",
+            tool: "shell",
+            input: { command: "pwd" },
+            reason: "try disallowed tool",
+          });
+        }
+        return JSON.stringify({ type: "final", message: "blocked and done" });
+      },
+    });
+    agent.agentDefinitionsRef = {
+      value: [
+        {
+          name: "file-reader",
+          description: "Read only files",
+          tools: ["read_file"],
+          prompt: "Only read files.",
+          path: ".AGENTS/file-reader.md",
+        },
+      ],
+    };
+
+    const result = await agent.runSubagent({ role: "file-reader", task: "Try shell" });
+
+    expect(result).toContain("blocked and done");
+  });
+
   test("runSubagent blocks child write tools", async () => {
     const dir = await mkdtemp(path.join(os.tmpdir(), "piecode-subagent-"));
     let calls = 0;

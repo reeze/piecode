@@ -142,17 +142,20 @@ describe("tools usability", () => {
       context: "focus on auth",
       mode: "readonly",
       tool_budget: 99,
+      role: "security-reviewer",
     });
 
     expect(result).toBe("subagent findings");
     expect(starts[0]).toMatchObject({ tool: "subagent" });
     expect(starts[0].input.tool_budget).toBe(6);
+    expect(starts[0].input.role).toBe("security-reviewer");
     expect(calls).toEqual([
       {
         task: "inspect providers",
         context: "focus on auth",
         mode: "readonly",
         toolBudget: 6,
+        role: "security-reviewer",
       },
     ]);
   });

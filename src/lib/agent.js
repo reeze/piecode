@@ -24,6 +24,8 @@ export class Agent {
     shellPermissionRef = null,
     subagentDepth = 0,
     agentManager = null,
+    agentDefinitionsRef = null,
+    currentAgentDefinition = null,
   }) {
     this.provider = provider;
     this.workspaceDir = workspaceDir;
@@ -41,6 +43,8 @@ export class Agent {
     this.shellPermissionRef = shellPermissionRef && typeof shellPermissionRef === "object" ? shellPermissionRef : { value: {} };
     this.subagentDepth = Math.max(0, Number.parseInt(String(subagentDepth), 10) || 0);
     this.agentManager = agentManager instanceof AgentManager ? agentManager : new AgentManager();
+    this.agentDefinitionsRef = agentDefinitionsRef && typeof agentDefinitionsRef === "object" ? agentDefinitionsRef : { value: [] };
+    this.currentAgentDefinition = currentAgentDefinition && typeof currentAgentDefinition === "object" ? currentAgentDefinition : null;
     this.history = [];
     this.rebuildToolset();
     this.enablePlanner = process.env.PIECODE_ENABLE_PLANNER === "1";
@@ -357,13 +361,30 @@ export class Agent {
     return Array.isArray(this.activeSkillsRef?.value) ? this.activeSkillsRef.value : [];
   }
 
-  buildSubagentPrompt({ task, context = "", mode = "analysis" } = {}) {
+  getAgentDefinitions() {
+    return Array.isArray(this.agentDefinitionsRef?.value) ? this.agentDefinitionsRef.value : [];
+  }
+
+  findAgentDefinition(name) {
+    const target = String(name || "").trim();
+    if (!target) return null;
+    return this.getAgentDefinitions().find((definition) => definition?.name === target) || null;
+  }
+
+  buildSubagentPrompt({ task, context = "", mode = "analysis", definition = null } = {}) {
     const recentContext = formatHistory(this.history.slice(-8)).slice(0, 12000);
+    const roleDefinition = definition
+      ? [
+          `You are \`${definition.name}\`, a PieCode project subagent.`,
+          `Role definition from ${definition.path || ".AGENTS"}:`,
+          String(definition.prompt || "").trim(),
+        ].filter(Boolean).join("\n\n")
+      : "You are a read-only subagent spawned by the main PieCode agent.";
     return [
-      "You are a read-only subagent spawned by the main PieCode agent.",
+      roleDefinition,
       "Investigate the assigned task and return concise findings for the main agent.",
       "You share the parent agent's durable MEMORY context and recent conversation context.",
-      "Do not edit files. Do not write files. Do not run commands that modify repository or system state.",
+      "Invariant safety constraints: do not edit files, do not write files, and do not run commands that modify repository or system state.",
       "Prefer read_file, read_files, list_files, glob_files, find_files, rg, git_status, and git_diff.",
       "If shell is needed, use only read-only inspection commands.",
       "",
@@ -419,24 +440,36 @@ export class Agent {
     ].join("\n");
   }
 
-  async runSubagent({ task, context = "", mode = "analysis", toolBudget = 3 } = {}, options = {}) {
+  async runSubagent({ task, context = "", mode = "analysis", toolBudget = 3, role = "", agent = "", name = "" } = {}, options = {}) {
     const normalizedTask = String(task || "").trim();
     if (!normalizedTask) throw new Error("Missing required parameter: task");
-    if (this.subagentDepth >= 1) {
+    const requestedRole = String(role || agent || name || "").trim();
+    const definition = requestedRole ? this.findAgentDefinition(requestedRole) : null;
+    if (requestedRole && !definition) {
+      throw new Error(`Unknown agent role: ${requestedRole}`);
+    }
+    const parentCanDelegate = Array.isArray(this.currentAgentDefinition?.tools) && this.currentAgentDefinition.tools.includes("subagent");
+    if (this.subagentDepth >= 1 && (!parentCanDelegate || this.subagentDepth >= 2)) {
       return "Subagent skipped: nested subagents are disabled.";
     }
+    const effectiveRole = definition?.name || requestedRole || "subagent";
+    const definitionMeta = definition
+      ? { name: definition.name, description: definition.description, color: definition.color, path: definition.path, model: definition.model }
+      : null;
 
     const managed = this.agentManager.start({
       task: normalizedTask,
       mode,
       toolBudget: Math.min(Math.max(Number(toolBudget) || 3, 1), 6),
-      role: "subagent",
+      role: effectiveRole,
     });
     const subagentId = managed.id;
     const childEvents = [];
     this.onEvent?.({
       type: "subagent_start",
       id: subagentId,
+      role: effectiveRole,
+      agentDefinition: definitionMeta,
       task: normalizedTask,
       mode,
       toolBudget: managed.toolBudget,
@@ -452,7 +485,7 @@ export class Agent {
           childEvents.push(evt);
         }
         const state = this.agentManager.recordEvent(subagentId, evt);
-        this.onEvent?.({ type: "subagent_event", id: subagentId, task: normalizedTask, event: evt, state });
+        this.onEvent?.({ type: "subagent_event", id: subagentId, role: effectiveRole, agentDefinition: definitionMeta, task: normalizedTask, event: evt, state });
       },
       activeSkillsRef: this.activeSkillsRef,
       onTodoWrite: null,
@@ -463,6 +496,9 @@ export class Agent {
       contextWindowRef: this.contextWindowRef,
       shellPermissionRef: this.shellPermissionRef,
       subagentDepth: this.subagentDepth + 1,
+      agentManager: this.agentManager,
+      agentDefinitionsRef: this.agentDefinitionsRef,
+      currentAgentDefinition: definition,
     });
 
     const blockedReadOnlyTool = async () => "Tool error: subagent is read-only and cannot modify files or todos.";
@@ -475,13 +511,33 @@ export class Agent {
     child.tools.memory_write = blockedReadOnlyTool;
     child.tools.remember = blockedReadOnlyTool;
     child.tools.collaborate = blockedReadOnlyTool;
-    child.tools.subagent = async () => "Tool error: nested subagents are disabled.";
+    const canDelegate = Boolean(definition?.tools?.includes("subagent") && this.subagentDepth < 1);
+    if (!canDelegate) {
+      child.tools.subagent = async () => "Tool error: nested subagents are disabled.";
+    }
+    if (definition && Array.isArray(definition.tools) && definition.tools.length > 0) {
+      const allowed = new Set(definition.tools);
+      for (const toolName of Object.keys(child.tools)) {
+        if (allowed.has(toolName)) continue;
+        child.tools[toolName] = async () => `Tool error: tool ${toolName} is not allowed for agent ${definition.name}.`;
+      }
+      child.tools.write_file = blockedReadOnlyTool;
+      child.tools.edit_file = blockedReadOnlyTool;
+      child.tools.apply_patch = blockedReadOnlyTool;
+      child.tools.replace_in_files = blockedReadOnlyTool;
+      child.tools.todo_write = blockedReadOnlyTool;
+      child.tools.todowrite = blockedReadOnlyTool;
+      child.tools.memory_write = blockedReadOnlyTool;
+      child.tools.remember = blockedReadOnlyTool;
+      child.tools.collaborate = blockedReadOnlyTool;
+      if (!canDelegate) child.tools.subagent = async () => "Tool error: nested subagents are disabled.";
+    }
     child.defaultToolBudget = Math.min(Math.max(Number(toolBudget) || 3, 1), 6);
     child.enablePlanner = false;
     child.taskPlanner = null;
     child.planFirstEnabled = false;
 
-    const prompt = this.buildSubagentPrompt({ task: normalizedTask, context, mode });
+    const prompt = this.buildSubagentPrompt({ task: normalizedTask, context, mode, definition });
     try {
       const result = await child.runTurn(prompt, { signal: options?.signal || null });
       const toolSummary = childEvents
@@ -492,6 +548,8 @@ export class Agent {
       this.onEvent?.({
         type: "subagent_end",
         id: subagentId,
+        role: effectiveRole,
+        agentDefinition: definitionMeta,
         task: normalizedTask,
         status: "done",
         tools: toolSummary,
@@ -503,6 +561,8 @@ export class Agent {
       this.onEvent?.({
         type: "subagent_end",
         id: subagentId,
+        role: effectiveRole,
+        agentDefinition: definitionMeta,
         task: normalizedTask,
         status: "error",
         error: message,
