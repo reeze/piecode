@@ -121,6 +121,50 @@ describe("agent context controls", () => {
     expect(events.some((evt) => evt?.type === "context_compacted" && evt.reason === "auto")).toBe(true);
   });
 
+  test("auto compact accounts for full native request payload before model call", async () => {
+    const contextWindowRef = { value: 220 };
+    const events = [];
+    let completeCalls = 0;
+    const agent = new Agent({
+      provider: {
+        kind: "test-native-provider",
+        model: "test-model",
+        supportsNativeTools: true,
+        async complete(args = {}) {
+          completeCalls += 1;
+          if (!Array.isArray(args?.messages)) return "- payload summary";
+          return {
+            type: "native",
+            format: "openai",
+            message: { role: "assistant", content: "done" },
+            finishReason: "stop",
+          };
+        },
+      },
+      workspaceDir: process.cwd(),
+      autoApproveRef: { value: false },
+      askApproval: async () => true,
+      activeSkillsRef: { value: [] },
+      projectInstructionsRef: { value: null },
+      contextWindowRef,
+      onEvent: (evt) => events.push(evt),
+    });
+    agent.autoCompactThreshold = 0.5;
+    agent.autoCompactPreserveRecent = 2;
+    agent.history = [
+      { role: "user", content: "old context" },
+      { role: "assistant", content: "old answer" },
+      { role: "user", content: "recent question" },
+    ];
+
+    const result = await agent.runTurn("new request");
+
+    expect(result).toBe("done");
+    expect(completeCalls).toBe(2);
+    expect(agent.history[0].content).toContain("[CONTEXT SUMMARY]");
+    expect(events.some((evt) => evt?.type === "context_compacted" && evt.beforeTokens >= 110)).toBe(true);
+  });
+
   test("requestAbort interrupts an active runTurn", async () => {
     const agent = createAgentWithProvider({
       async complete({ signal }) {

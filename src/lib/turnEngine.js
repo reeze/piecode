@@ -652,11 +652,19 @@ export class TurnEngine {
 
     this.agent.onEvent?.({ type: "model_call", provider: this.agent.provider.kind, model: this.agent.provider.model });
     if (useNativeTools) {
-      const messages = buildMessages({ history: this.agent.history, format: nativeFormat });
+      let messages = buildMessages({ history: this.agent.history, format: nativeFormat });
       const tools = buildToolDefinitions(nativeFormat, {
         mcpEnabled: this.mcpEnabled,
         mcpServerNames: this.mcpServerNames,
       });
+      const payloadTokens = this.agent.estimatePayloadTokens(systemPrompt, messages, tools);
+      const compacted = await this.agent.maybeAutoCompactForPayload({
+        payloadTokens,
+        preserveRecent: this.agent.autoCompactPreserveRecent,
+      });
+      if (compacted?.compacted) {
+        messages = buildMessages({ history: this.agent.history, format: nativeFormat });
+      }
       this.agent.onEvent?.({
         type: "llm_request",
         stage: "turn",
@@ -677,7 +685,15 @@ export class TurnEngine {
       this.agent.emitLlmResponse("turn", JSON.stringify(response));
       action = parseNativeResponse(response, nativeFormat);
     } else {
-      const prompt = formatHistory(this.agent.history);
+      let prompt = formatHistory(this.agent.history);
+      const payloadTokens = this.agent.estimatePayloadTokens(systemPrompt, prompt);
+      const compacted = await this.agent.maybeAutoCompactForPayload({
+        payloadTokens,
+        preserveRecent: this.agent.autoCompactPreserveRecent,
+      });
+      if (compacted?.compacted) {
+        prompt = formatHistory(this.agent.history);
+      }
       this.agent.onEvent?.({
         type: "llm_request",
         stage: "turn",
@@ -704,7 +720,6 @@ export class TurnEngine {
   async run() {
     const signal = this.agent.activeAbortController.signal;
     this.agent.history.push({ role: "user", content: this.userMessage });
-    await this.agent.maybeAutoCompact({ preserveRecent: this.agent.autoCompactPreserveRecent });
 
     this.agent.throwIfAborted(signal);
     if (this.planOnly) {

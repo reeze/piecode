@@ -153,6 +153,23 @@ export class Agent {
     }, 0);
   }
 
+  estimatePayloadTokens(...parts) {
+    let total = 0;
+    for (const part of parts) {
+      if (part == null) continue;
+      if (typeof part === "string") {
+        total += this.estimateTokenCount(part);
+        continue;
+      }
+      try {
+        total += this.estimateTokenCount(JSON.stringify(part));
+      } catch {
+        total += this.estimateTokenCount(String(part));
+      }
+    }
+    return total;
+  }
+
   getContextWindow() {
     const value = Number(this.contextWindowRef?.value);
     return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
@@ -179,6 +196,32 @@ export class Agent {
         afterMessages: result.afterMessages,
         removedMessages: result.removedMessages,
         beforeTokens,
+        afterTokens: this.estimateMessagesTokens(this.history),
+        limit,
+      });
+    }
+    return result;
+  }
+
+  async maybeAutoCompactForPayload({
+    payloadTokens = 0,
+    preserveRecent = this.autoCompactPreserveRecent,
+  } = {}) {
+    const limit = this.getContextWindow();
+    const used = Math.max(0, Math.round(Number(payloadTokens) || 0));
+    if (!limit || this.autoCompactThreshold <= 0) return null;
+    if (this.history.length <= preserveRecent) return null;
+    if (used < limit * this.autoCompactThreshold) return null;
+
+    const result = await this.compactHistory({ preserveRecent, reason: "auto" });
+    if (result?.compacted) {
+      this.onEvent?.({
+        type: "context_compacted",
+        reason: "auto",
+        beforeMessages: result.beforeMessages,
+        afterMessages: result.afterMessages,
+        removedMessages: result.removedMessages,
+        beforeTokens: used,
         afterTokens: this.estimateMessagesTokens(this.history),
         limit,
       });
