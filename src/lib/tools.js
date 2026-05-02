@@ -1,5 +1,6 @@
 import { exec as execCb, execFile as execFileCb } from "node:child_process";
 import { promises as fs } from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { promisify } from "node:util";
 
@@ -554,6 +555,31 @@ function isStdioMaxBufferError(error) {
   );
 }
 
+async function loadOpenClawWebSearchConfig() {
+  const cfgPath =
+    process.env.PIECODE_OPENCLAW_CONFIG_PATH ||
+    process.env.OPENCLAW_CONFIG_PATH ||
+    path.join(os.homedir(), ".openclaw", "openclaw.json");
+  try {
+    const raw = await fs.readFile(cfgPath, "utf8");
+    const parsed = JSON.parse(raw);
+    const braveApiKey = parsed?.plugins?.entries?.brave?.config?.webSearch?.apiKey;
+    const provider =
+      parsed?.tools?.web?.search?.provider ||
+      parsed?.plugins?.entries?.brave?.config?.webSearch?.provider ||
+      "";
+    if (typeof braveApiKey === "string" && braveApiKey.trim()) {
+      return {
+        provider: provider || "brave",
+        braveApiKey: braveApiKey.trim(),
+      };
+    }
+  } catch {
+    // Ignore missing or incompatible OpenClaw config.
+  }
+  return {};
+}
+
 async function hasCommand(cmd) {
   try {
     await exec(`which ${cmd}`);
@@ -570,6 +596,7 @@ export function createToolset({
   onToolStart,
   onTodoWrite,
   mcpHub = null,
+  webSearch = null,
 }) {
   let lastTodoSignature = "";
   const mcpAvailable = () => Boolean(mcpHub && typeof mcpHub.hasServers === "function" && mcpHub.hasServers());
@@ -1286,6 +1313,92 @@ export function createToolset({
       _toolName: "grep",
     });
 
+  const webSearchTool = async ({
+    query,
+    q,
+    max_results: maxResults = 5,
+    provider = "",
+    site = "",
+    recency_days: recencyDays = null,
+  } = {}) => {
+    const searchQuery = String(query || q || "").trim();
+    const openClawWebSearch = await loadOpenClawWebSearchConfig();
+    const mergedWebSearch = {
+      ...(openClawWebSearch && typeof openClawWebSearch === "object" ? openClawWebSearch : {}),
+      ...(webSearch && typeof webSearch === "object" ? webSearch : {}),
+    };
+    const selectedProvider = String(provider || mergedWebSearch?.provider || process.env.PIECODE_WEB_SEARCH_PROVIDER || "").trim().toLowerCase();
+    const limit = Math.min(Math.max(Number(maxResults) || 5, 1), 10);
+    const siteFilter = String(site || "").trim();
+    const effectiveQuery = siteFilter ? `${searchQuery} site:${siteFilter}` : searchQuery;
+    onToolStart?.("web_search", {
+      query: searchQuery,
+      max_results: limit,
+      provider: selectedProvider || "auto",
+      site: siteFilter,
+      recency_days: recencyDays,
+    });
+    if (!searchQuery) throw new Error("Missing required parameter: query");
+
+    const providers = [];
+    const configured = mergedWebSearch;
+    const braveKey = configured.braveApiKey || configured.apiKey || process.env.BRAVE_SEARCH_API_KEY;
+    const tavilyKey = configured.tavilyApiKey || configured.apiKey || process.env.TAVILY_API_KEY;
+    const serperKey = configured.serperApiKey || configured.apiKey || process.env.SERPER_API_KEY;
+
+    if (!selectedProvider || selectedProvider === "brave") {
+      if (braveKey) providers.push({ name: "brave", apiKey: braveKey });
+    }
+    if (!selectedProvider || selectedProvider === "tavily") {
+      if (tavilyKey) providers.push({ name: "tavily", apiKey: tavilyKey });
+    }
+    if (!selectedProvider || selectedProvider === "serper") {
+      if (serperKey) providers.push({ name: "serper", apiKey: serperKey });
+    }
+
+    if (providers.length === 0) {
+      const requested = selectedProvider ? `${selectedProvider.toUpperCase()} ` : "";
+      throw new Error(
+        `Web search is not configured. Set ${requested}API key via BRAVE_SEARCH_API_KEY, TAVILY_API_KEY, SERPER_API_KEY, or ~/.piecode/settings.json webSearch.`
+      );
+    }
+
+    let lastError = null;
+    for (const item of providers) {
+      try {
+        if (item.name === "brave") {
+          return await searchWithBrave({
+            query: effectiveQuery,
+            originalQuery: searchQuery,
+            apiKey: item.apiKey,
+            maxResults: limit,
+            recencyDays,
+          });
+        }
+        if (item.name === "tavily") {
+          return await searchWithTavily({
+            query: effectiveQuery,
+            originalQuery: searchQuery,
+            apiKey: item.apiKey,
+            maxResults: limit,
+            recencyDays,
+          });
+        }
+        if (item.name === "serper") {
+          return await searchWithSerper({
+            query: effectiveQuery,
+            originalQuery: searchQuery,
+            apiKey: item.apiKey,
+            maxResults: limit,
+          });
+        }
+      } catch (error) {
+        lastError = error;
+      }
+    }
+    throw new Error(`Web search failed: ${lastError?.message || "unknown error"}`);
+  };
+
   const listMcpServers = async () => {
     onToolStart?.("list_mcp_servers", {});
     if (!mcpAvailable()) return "No MCP servers configured.";
@@ -1395,6 +1508,8 @@ export function createToolset({
     rg: rgTool,
     grep: grepTool,
     search_files: searchFiles,
+    web_search: webSearchTool,
+    search_web: webSearchTool,
     list_mcp_servers: listMcpServers,
     list_mcp_tools: listMcpTools,
     mcp_call_tool: callMcpTool,
@@ -1548,6 +1663,57 @@ async function searchWithGrep({
     const results = parseSearchResults(stdout, workspaceDir);
     return formatSearchResults(results, limit, regex);
   } catch (error) {
+    if (isStdioMaxBufferError(error)) {
+      const compactArgs = [
+        "-r",
+        "-l",
+      ];
+
+      if (!caseSensitive) {
+        compactArgs.push("-i");
+      }
+      if (fixedStrings) {
+        compactArgs.push("-F");
+      }
+      if (filePattern) {
+        compactArgs.push("--include", filePattern);
+      }
+
+      compactArgs.push(
+        "--exclude-dir=node_modules",
+        "--exclude-dir=.git",
+        "--exclude-dir=dist",
+        "--exclude-dir=build",
+        "--exclude-dir=.next",
+        "--exclude-dir=coverage",
+        "--",
+        regex,
+        absPath
+      );
+
+      try {
+        const { stdout } = await execFile("grep", compactArgs, {
+          cwd: workspaceDir,
+          maxBuffer: 10 * 1024 * 1024,
+        });
+        const files = stdout
+          .split("\n")
+          .map((line) => line.trim())
+          .filter(Boolean)
+          .map((file) => file.replace(workspaceDir + "/", "").replace(workspaceDir, "."));
+        if (files.length === 0) return `No matches found for pattern: ${regex}`;
+        const shown = files.slice(0, limit);
+        const suffix = files.length > shown.length ? `\n... (${files.length - shown.length} more files)` : "";
+        return `Found matches in ${files.length} files for "${regex}" (condensed due large output):\n${shown
+          .map((file, idx) => `${idx + 1}. ${file}`)
+          .join("\n")}${suffix}`;
+      } catch (compactError) {
+        if (compactError.code === 1 && !compactError.stdout) {
+          return `No matches found for pattern: ${regex}`;
+        }
+        throw new Error(`Search failed: ${compactError.message}`);
+      }
+    }
     if (error.code === 1 && !error.stdout) {
       // grep returns 1 when no matches found
       return `No matches found for pattern: ${regex}`;
@@ -1709,4 +1875,105 @@ function formatSearchResults(results, limit, regex) {
   });
 
   return output;
+}
+
+function compactSearchResultText(value, maxChars = 600) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+function formatWebSearchResults({ provider, query, results }) {
+  const list = Array.isArray(results) ? results : [];
+  return JSON.stringify(
+    {
+      provider,
+      query,
+      results: list.map((item) => ({
+        title: compactSearchResultText(item.title, 180),
+        url: String(item.url || ""),
+        snippet: compactSearchResultText(item.snippet || item.content || item.description, 600),
+      })),
+    },
+    null,
+    2
+  );
+}
+
+async function searchWithBrave({ query, originalQuery, apiKey, maxResults, recencyDays }) {
+  const url = new URL("https://api.search.brave.com/res/v1/web/search");
+  url.searchParams.set("q", query);
+  url.searchParams.set("count", String(maxResults));
+  url.searchParams.set("text_decorations", "false");
+  url.searchParams.set("result_filter", "web");
+  if (Number.isFinite(Number(recencyDays)) && Number(recencyDays) > 0) {
+    const days = Math.min(Math.max(Math.round(Number(recencyDays)), 1), 365);
+    url.searchParams.set("freshness", days <= 1 ? "pd" : days <= 7 ? "pw" : days <= 31 ? "pm" : "py");
+  }
+  const res = await fetch(url, {
+    headers: {
+      Accept: "application/json",
+      "X-Subscription-Token": apiKey,
+    },
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`Brave Search API error (${res.status}): ${JSON.stringify(data)}`);
+  }
+  const results = (Array.isArray(data?.web?.results) ? data.web.results : []).slice(0, maxResults).map((item) => ({
+    title: item?.title,
+    url: item?.url,
+    snippet: item?.description,
+  }));
+  return formatWebSearchResults({ provider: "brave", query: originalQuery, results });
+}
+
+async function searchWithTavily({ query, originalQuery, apiKey, maxResults, recencyDays }) {
+  const body = {
+    api_key: apiKey,
+    query,
+    max_results: maxResults,
+    search_depth: "basic",
+    include_answer: false,
+    include_raw_content: false,
+  };
+  if (Number.isFinite(Number(recencyDays)) && Number(recencyDays) > 0) {
+    body.days = Math.min(Math.max(Math.round(Number(recencyDays)), 1), 365);
+  }
+  const res = await fetch("https://api.tavily.com/search", {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`Tavily API error (${res.status}): ${JSON.stringify(data)}`);
+  }
+  const results = (Array.isArray(data?.results) ? data.results : []).slice(0, maxResults).map((item) => ({
+    title: item?.title,
+    url: item?.url,
+    snippet: item?.content,
+  }));
+  return formatWebSearchResults({ provider: "tavily", query: originalQuery, results });
+}
+
+async function searchWithSerper({ query, originalQuery, apiKey, maxResults }) {
+  const res = await fetch("https://google.serper.dev/search", {
+    method: "POST",
+    headers: {
+      "content-type": "application/json",
+      "X-API-KEY": apiKey,
+    },
+    body: JSON.stringify({ q: query, num: maxResults }),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    throw new Error(`Serper API error (${res.status}): ${JSON.stringify(data)}`);
+  }
+  const results = (Array.isArray(data?.organic) ? data.organic : []).slice(0, maxResults).map((item) => ({
+    title: item?.title,
+    url: item?.link,
+    snippet: item?.snippet,
+  }));
+  return formatWebSearchResults({ provider: "serper", query: originalQuery, results });
 }

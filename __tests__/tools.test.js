@@ -111,6 +111,8 @@ describe("tools usability", () => {
     expect(typeof tools.rg).toBe("function");
     expect(typeof tools.grep).toBe("function");
     expect(typeof tools.search_files).toBe("function");
+    expect(typeof tools.web_search).toBe("function");
+    expect(typeof tools.search_web).toBe("function");
     expect(typeof tools.edit_file).toBe("function");
     expect(typeof tools.apply_patch).toBe("function");
     expect(typeof tools.replace_in_files).toBe("function");
@@ -421,6 +423,90 @@ describe("tools usability", () => {
     expect(approvalCalls).toBe(0);
     expect(result).toContain("src/alpha.js");
     expect(result).not.toContain("src/beta.txt");
+  });
+
+  test("web_search uses Brave API and returns structured results", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    const originalFetch = global.fetch;
+    global.fetch = async (url, init) => {
+      expect(String(url)).toContain("api.search.brave.com");
+      expect(String(url)).toContain("q=piecode");
+      expect(init?.headers?.["X-Subscription-Token"]).toBe("brave-test-key");
+      return new Response(
+        JSON.stringify({
+          web: {
+            results: [
+              {
+                title: "PieCode docs",
+                url: "https://example.com/piecode",
+                description: "A coding agent.",
+              },
+            ],
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } }
+      );
+    };
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: false },
+      askApproval: async () => false,
+      webSearch: { provider: "brave", braveApiKey: "brave-test-key" },
+    });
+
+    try {
+      const raw = await tools.web_search({ query: "piecode", max_results: 1 });
+      const parsed = JSON.parse(raw);
+      expect(parsed.provider).toBe("brave");
+      expect(parsed.results[0]).toMatchObject({
+        title: "PieCode docs",
+        url: "https://example.com/piecode",
+        snippet: "A coding agent.",
+      });
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  test("web_search can read Brave key from OpenClaw config fallback", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    const home = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-openclaw-home-"));
+    const originalOpenClawConfigPath = process.env.PIECODE_OPENCLAW_CONFIG_PATH;
+    const originalFetch = global.fetch;
+    await fs.mkdir(path.join(home, ".openclaw"), { recursive: true });
+    await fs.writeFile(
+      path.join(home, ".openclaw", "openclaw.json"),
+      JSON.stringify({
+        tools: { web: { search: { provider: "brave" } } },
+        plugins: { entries: { brave: { config: { webSearch: { apiKey: "openclaw-brave-key" } } } } },
+      }),
+      "utf8"
+    );
+    process.env.PIECODE_OPENCLAW_CONFIG_PATH = path.join(home, ".openclaw", "openclaw.json");
+    global.fetch = async (_url, init) => {
+      expect(init?.headers?.["X-Subscription-Token"]).toBe("openclaw-brave-key");
+      return new Response(JSON.stringify({ web: { results: [] } }), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      });
+    };
+
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: false },
+      askApproval: async () => false,
+    });
+
+    try {
+      const raw = await tools.web_search({ query: "piecode", max_results: 1 });
+      const parsed = JSON.parse(raw);
+      expect(parsed.provider).toBe("brave");
+    } finally {
+      global.fetch = originalFetch;
+      if (originalOpenClawConfigPath === undefined) delete process.env.PIECODE_OPENCLAW_CONFIG_PATH;
+      else process.env.PIECODE_OPENCLAW_CONFIG_PATH = originalOpenClawConfigPath;
+      await fs.rm(home, { recursive: true, force: true });
+    }
   });
 
   test("git_status and git_diff return graceful output outside git repo", async () => {

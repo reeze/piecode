@@ -392,6 +392,8 @@ export class TurnEngine {
       "rg",
       "grep",
       "search_files",
+      "web_search",
+      "search_web",
       "git_status",
       "git_diff",
       "list_mcp_servers",
@@ -721,6 +723,8 @@ export class TurnEngine {
           "rg",
           "grep",
           "search_files",
+          "web_search",
+          "search_web",
           "git_status",
           "git_diff",
           ...(this.mcpEnabled

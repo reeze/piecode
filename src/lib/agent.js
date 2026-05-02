@@ -15,6 +15,7 @@ export class Agent {
     onTodoWrite,
     projectInstructionsRef,
     mcpHub = null,
+    webSearch = null,
   }) {
     this.provider = provider;
     this.workspaceDir = workspaceDir;
@@ -25,6 +26,7 @@ export class Agent {
     this.activeSkillsRef = activeSkillsRef || { value: [] };
     this.projectInstructionsRef = projectInstructionsRef || { value: null };
     this.mcpHub = mcpHub && typeof mcpHub.hasServers === "function" ? mcpHub : null;
+    this.webSearch = webSearch && typeof webSearch === "object" ? webSearch : null;
     this.history = [];
     this.rebuildToolset();
     this.enablePlanner = process.env.PIECODE_ENABLE_PLANNER === "1";
@@ -46,7 +48,13 @@ export class Agent {
       onToolStart: (tool, input) => this.onEvent?.({ type: "tool_start", tool, input }),
       onTodoWrite: this.onTodoWrite,
       mcpHub: this.mcpHub,
+      webSearch: this.webSearch,
     });
+  }
+
+  setWebSearch(webSearch = null) {
+    this.webSearch = webSearch && typeof webSearch === "object" ? webSearch : null;
+    this.rebuildToolset();
   }
 
   setMcpHub(mcpHub = null) {

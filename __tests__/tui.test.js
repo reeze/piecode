@@ -303,6 +303,24 @@ describe("tui usability", () => {
     expect(frame).not.toContain("TODO(");
   });
 
+  test("frame separators use ascii for mobile terminal compatibility", () => {
+    const out = createOut(80, 18);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.event("[thought] Preparing tool: run_tests");
+    tui.renderInput("");
+    const raw = out.writes.join("");
+    expect(raw).toContain("----------");
+    expect(raw).not.toContain("─");
+  });
+
   test("status bar shows TODO progress and hides it when empty", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({

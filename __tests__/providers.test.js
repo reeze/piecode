@@ -229,13 +229,107 @@ describe('provider selection', () => {
       });
 
       expect(provider.kind).toBe('codex-auth-token');
-      expect(provider.supportsNativeTools).toBe(false);
+      expect(provider.supportsNativeTools).toBe(true);
       expect(text).toBe('{"type":"final","message":"done"}');
       expect(deltas.join('')).toBe('{"type":"final","message":"done"}');
       expect(provider.getLastUsage()).toEqual({
         input_tokens: 11,
         output_tokens: 7,
         total_tokens: 18,
+      });
+    } finally {
+      global.fetch = originalFetch;
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = originalCodexHome;
+      if (originalDisableCli === undefined)
+        delete process.env.PIECODE_DISABLE_CODEX_CLI;
+      else process.env.PIECODE_DISABLE_CODEX_CLI = originalDisableCli;
+      await fs.rm(tmp, { recursive: true, force: true });
+    }
+  });
+
+  test('codex token provider supports native Responses tool calls', async () => {
+    const originalFetch = global.fetch;
+    const originalCodexHome = process.env.CODEX_HOME;
+    const originalDisableCli = process.env.PIECODE_DISABLE_CODEX_CLI;
+    const tmp = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'piecode-provider-test-')
+    );
+
+    process.env.CODEX_HOME = tmp;
+    process.env.PIECODE_DISABLE_CODEX_CLI = '1';
+    const codexToken = createCodexTestToken();
+    await fs.writeFile(
+      path.join(tmp, 'auth.json'),
+      JSON.stringify({ tokens: { access_token: codexToken } }),
+      'utf8'
+    );
+    await fs.writeFile(
+      path.join(tmp, 'config.toml'),
+      'model = "gpt-5.3-codex"\n',
+      'utf8'
+    );
+
+    global.fetch = async (_url, init) => {
+      const body = JSON.parse(String(init?.body || '{}'));
+      expect(body.instructions).toBe('sys');
+      expect(body.input?.[0]).toMatchObject({
+        role: 'user',
+      });
+      expect(body.tools?.[0]).toMatchObject({
+        type: 'function',
+        name: 'read_file',
+      });
+      expect(body.parallel_tool_calls).toBe(true);
+
+      const chunks = [
+        'data: {"type":"response.output_item.added","item":{"type":"function_call","id":"fc_read_0","call_id":"call_read_0","name":"read_file","arguments":""}}\n\n',
+        'data: {"type":"response.function_call_arguments.delta","delta":"{\\"path\\":\\"src/"}\n\n',
+        'data: {"type":"response.function_call_arguments.done","arguments":"{\\"path\\":\\"src/cli.js\\"}"}\n\n',
+        'data: {"type":"response.output_item.done","item":{"type":"function_call","id":"fc_read_0","call_id":"call_read_0","name":"read_file","arguments":"{\\"path\\":\\"src/cli.js\\"}"}}\n\n',
+        'data: {"type":"response.completed","response":{"status":"completed","usage":{"input_tokens":9,"output_tokens":4,"total_tokens":13},"output":[{"type":"function_call","id":"fc_read_0","call_id":"call_read_0","name":"read_file","arguments":"{\\"path\\":\\"src/cli.js\\"}"}]}}\n\n',
+      ];
+      const stream = new ReadableStream({
+        start(controller) {
+          for (const chunk of chunks) {
+            controller.enqueue(new TextEncoder().encode(chunk));
+          }
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { 'content-type': 'text/event-stream' },
+      });
+    };
+
+    try {
+      const provider = getProvider({ provider: 'codex' });
+      const response = await provider.completeStream({
+        systemPrompt: 'sys',
+        messages: [{ role: 'user', content: 'read cli' }],
+        tools: [
+          {
+            type: 'function',
+            function: {
+              name: 'read_file',
+              description: 'Read file',
+              parameters: { type: 'object', properties: {} },
+            },
+          },
+        ],
+      });
+
+      expect(response?.type).toBe('native');
+      expect(response?.format).toBe('openai');
+      expect(response?.finishReason).toBe('tool_calls');
+      expect(response?.message?.tool_calls?.[0]?.id).toBe('call_read_0');
+      expect(response?.message?.tool_calls?.[0]?.function?.name).toBe('read_file');
+      expect(response?.message?.tool_calls?.[0]?.function?.arguments).toBe('{"path":"src/cli.js"}');
+      expect(provider.getLastUsage()).toEqual({
+        input_tokens: 9,
+        output_tokens: 4,
+        total_tokens: 13,
       });
     } finally {
       global.fetch = originalFetch;

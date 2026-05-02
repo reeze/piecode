@@ -215,6 +215,12 @@ function formatCompactNumber(n) {
   return String(Math.round(value));
 }
 
+function separatorLine(width) {
+  // Use ASCII here because several mobile terminals render box-drawing glyphs
+  // with unstable width/fallback characters during frequent full-frame redraws.
+  return `\x1b[90m${"-".repeat(Math.max(1, Number(width) || 1))}\x1b[0m`;
+}
+
 export class SimpleTui {
   constructor({ out, workspaceDir, providerLabel, getSkillsLabel, getApprovalLabel, layout = null }) {
     this.out = out;
@@ -941,6 +947,9 @@ export class SimpleTui {
         case "grep":
         case "search_files":
           return `${color("Search", "36")}${suffix}`;
+        case "web_search":
+        case "search_web":
+          return `${color("Web search", "36")}${suffix}`;
         case "git_status":
           return color("Git status", "36");
         case "git_diff":
@@ -1285,7 +1294,7 @@ export class SimpleTui {
     const height = Math.max(16, this.out.rows || 30);
 
     if (this.overlayVisible) {
-      const sep = `\x1b[90m${"─".repeat(width)}\x1b[0m`;
+      const sep = separatorLine(width);
       const title = truncateLine(` ${this.overlayTitle}`, width);
       const fallbackHint = " /:search  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close ";
       const hintText = this.overlaySearchActive
@@ -1321,7 +1330,7 @@ export class SimpleTui {
       return;
     }
 
-    const sep = `\x1b[90m${"─".repeat(width)}\x1b[0m`;
+    const sep = separatorLine(width);
     const errorLine = this.lastError ? truncateLine(` error: ${this.lastError}`, width) : "";
 
     const headerLines = errorLine ? 1 : 0;

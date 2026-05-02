@@ -140,6 +140,7 @@ export function buildSystemPrompt({
     "- Use case_sensitive: true only when exact case matters",
     "- Keep regex patterns simple for better performance",
     "- Use rg before read_file when you don't know the exact file location",
+    "- Use web_search only when current external information is needed; cite returned URLs in final answers",
   ];
 
   if (!nativeTools) {
@@ -156,6 +157,8 @@ export function buildSystemPrompt({
       "rg",
       "grep",
       "search_files",
+      "web_search",
+      "search_web",
       "git_status",
       "git_diff",
       "run_tests",
@@ -198,6 +201,8 @@ export function buildSystemPrompt({
       "- rg: { pattern?: string, regex?: string, query?: string, path?: string, glob?: string, file_pattern?: string, max_results?: number, case_sensitive?: boolean, fixed_strings?: boolean, context_lines?: number } - Fast code search using ripgrep semantics; prefer this for codebase search",
       "- grep: alias for rg",
       "- search_files: compatibility alias for rg",
+      "- web_search: { query: string, max_results?: number, site?: string, recency_days?: number, provider?: 'brave'|'tavily'|'serper' } - Search the web for current external information; returns title/url/snippet results",
+      "- search_web: alias for web_search",
       "- git_status: { porcelain?: boolean } - Show current git status",
       "- git_diff: { path?: string, staged?: boolean, context?: number } - Show git diff",
       "- run_tests: { command?: string, timeout_ms?: number } - Run test command and return parsed summary",
@@ -219,6 +224,7 @@ export function buildSystemPrompt({
       'Find all uses of a function: {"type":"tool_use","tool":"rg","input":{"pattern":"functionName\\(","path":"src","glob":"*.js"},"reason":"Find all calls to functionName in JS files"}',
       'Search for TODO comments: {"type":"tool_use","tool":"rg","input":{"pattern":"TODO|FIXME|XXX","max_results":20},"reason":"Find all TODO comments in the codebase"}',
       'Find class definitions: {"type":"tool_use","tool":"rg","input":{"pattern":"class\\s+\\w+","glob":"*.ts"},"reason":"Find all class definitions in TypeScript files"}',
+      'Search the web: {"type":"tool_use","tool":"web_search","input":{"query":"OpenAI latest API model docs","max_results":5},"reason":"Need current external documentation"}',
 
       "CRITICAL:",
       "- Your entire response must be valid JSON",
@@ -297,6 +303,8 @@ const KNOWN_TOOL_NAMES = new Set([
   "rg",
   "grep",
   "search_files",
+  "web_search",
+  "search_web",
   "git_status",
   "git_diff",
   "run_tests",
@@ -864,6 +872,39 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
             description: "Context lines around matches (default: 2, max: 10)",
           },
         },
+      },
+    },
+    {
+      name: "web_search",
+      description:
+        "Search the web for current external information. Returns structured title, URL, and snippet results. Use only when local code/docs are insufficient or up-to-date external facts are needed.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query" },
+          q: { type: "string", description: "Alias for query" },
+          max_results: { type: "integer", description: "Maximum results to return (default: 5, max: 10)" },
+          site: { type: "string", description: "Optional domain filter, e.g. openai.com" },
+          recency_days: { type: "integer", description: "Optional recent-days filter where provider supports it" },
+          provider: { type: "string", enum: ["brave", "tavily", "serper"], description: "Optional provider override" },
+        },
+        required: ["query"],
+      },
+    },
+    {
+      name: "search_web",
+      description: "Alias for web_search.",
+      input_schema: {
+        type: "object",
+        properties: {
+          query: { type: "string", description: "Search query" },
+          q: { type: "string", description: "Alias for query" },
+          max_results: { type: "integer", description: "Maximum results to return" },
+          site: { type: "string", description: "Optional domain filter" },
+          recency_days: { type: "integer", description: "Optional recent-days filter" },
+          provider: { type: "string", enum: ["brave", "tavily", "serper"], description: "Optional provider override" },
+        },
+        required: ["query"],
       },
     },
     {

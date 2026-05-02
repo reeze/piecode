@@ -445,7 +445,7 @@ Options:
   --skill, -S          Enable skill by name (repeatable)
   --list-skills        List discovered skills and exit
   --tui                Start simple full-screen TUI mode
-  --disable-codex      Disable Codex CLI and auth file fallback (equivalent to PIECODE_DISABLE_CODEX_CLI=1)
+  --disable-codex      Disable Codex CLI fallback (equivalent to PIECODE_DISABLE_CODEX_CLI=1)
 
 Environment:
   ANTHROPIC_API_KEY    Preferred provider
@@ -468,7 +468,8 @@ Environment:
 
   CODEX_HOME           Optional (default ~/.codex)
   CODEX_MODEL          Optional for codex token mode (default gpt-5.3-codex)
-  PIECODE_DISABLE_CODEX_CLI Optional (set 1 to disable codex CLI session backend)
+  PIECODE_DISABLE_CODEX_CLI Optional (set 1 to disable Codex CLI session fallback)
+  PIECODE_CODEX_PREFER_CLI Optional (set 1 to force Codex CLI session fallback)
   PIECODE_ENABLE_PLANNER  Optional (set 1 to enable experimental task planner)
   PIECODE_PLAN_MODE       Optional (set 1 to start in plan-only mode)
   PIECODE_PLAN_FIRST      Optional (default off; set 1 to enable lightweight pre-plan)
@@ -485,8 +486,8 @@ Auth fallback order:
   1) Command line arguments --provider/--api-key/--model
   2) ~/.piecode/settings.json
   3) Environment variables (ANTHROPIC_API_KEY, OPENAI_API_KEY, OPENROUTER_API_KEY)
-  4) Codex CLI session (codex login)
-  5) Codex auth file (~/.codex/auth.json)
+  4) Codex auth file (~/.codex/auth.json; native tools when token/key is usable)
+  5) Codex CLI session fallback (codex login; slower, no native tools)
   Note: Codex OAuth tokens can be scope-limited.
 
 Slash commands in interactive mode:
@@ -923,6 +924,9 @@ function formatToolInputSummary(tool, input, maxLen = 120) {
   if (tool === "find_files") {
     return summarizeForLog(`${safe.path || "."} ${safe.query || ""}`, maxLen);
   }
+  if (tool === "web_search" || tool === "search_web") {
+    return summarizeForLog(safe.query || safe.q || "", maxLen);
+  }
   if (tool === "git_status") {
     return Boolean(safe.porcelain) ? "porcelain" : "full";
   }
@@ -1100,6 +1104,8 @@ function maybeHandleLocalInfoTask(input, { logLine, tui, display, mcpHub = null 
     "- `rg`: Search file contents with ripgrep semantics",
     "- `grep`: Alias for `rg`",
     "- `search_files`: Compatibility alias for `rg`",
+    "- `web_search`: Search the web using Brave/Tavily/Serper",
+    "- `search_web`: Alias for `web_search`",
     "- `git_status`: Show git status",
     "- `git_diff`: Show git diff",
     "- `run_tests`: Run tests with structured summary",
@@ -1709,10 +1715,31 @@ function providerPrefix(kind) {
   return k || "model";
 }
 
+function providerTransport(provider) {
+  const kind = String(provider?.kind || "").toLowerCase();
+  if (kind === "codex-cli-session") return "cli";
+  if (kind.includes("codex-auth-token")) return "chatgpt";
+  if (kind.includes("codex-auth-key")) return "api";
+  return "api";
+}
+
+function providerToolMode(provider) {
+  return provider?.supportsNativeTools ? "native" : "text";
+}
+
+function isCodexCliProvider(provider) {
+  return String(provider?.kind || "").toLowerCase() === "codex-cli-session";
+}
+
 function formatProviderModel(provider) {
   const prefix = providerPrefix(provider?.kind);
   const model = String(provider?.model || "").trim() || "unknown";
-  return `${model}(${prefix})`;
+  return `${model}(${prefix}, tools:${providerToolMode(provider)}, ${providerTransport(provider)})`;
+}
+
+function formatProviderWarning(provider) {
+  if (!isCodexCliProvider(provider)) return "";
+  return "warning: using Codex CLI fallback; native tools are disabled and startup/turns may be slower. Use Codex auth token/key or set PIECODE_DISABLE_CODEX_CLI=1 to fail fast.";
 }
 
 function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
@@ -1733,6 +1760,8 @@ function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
   for (const line of logoLines) {
     tui.event(line);
   }
+  const warning = formatProviderWarning(provider);
+  if (warning) tui.event(warning);
 }
 
 function createCompleter(getSkillIndex, getModelCatalog = null, getMcpServerNames = null) {
@@ -2170,7 +2199,8 @@ async function handleSlashCommand(input, ctx) {
         dynamicByModel: modelContextWindowsRef?.value,
       })
     );
-    return `${prefix}: ${modelLabel} | context window: ${contextWindow}`;
+    const fallback = isCodexCliProvider(provider) ? " | fallback: codex-cli" : " | fallback: none";
+    return `${prefix}: ${modelLabel} | context window: ${contextWindow}${fallback}`;
   };
   const formatPlanModeStatus = (prefix = "plan mode", enabled = planModeRef?.value) =>
     enabled ? `${prefix}: on` : `${prefix}: off`;
@@ -2373,8 +2403,12 @@ async function handleSlashCommand(input, ctx) {
     const p = providerRef.value;
     if (tui && typeof setStatusBar === "function") {
       setStatusBar(formatModelStatus(p, "current model"));
+      const warning = formatProviderWarning(p);
+      if (warning) logLine(warning);
     } else {
       logLine(formatModelStatus(p, "current model"));
+      const warning = formatProviderWarning(p);
+      if (warning) logLine(warning);
       logLine("usage: /model list | /model <model-id>");
     }
     return { done: false, handled: true };
@@ -2461,8 +2495,12 @@ async function handleSlashCommand(input, ctx) {
       }
       if (tui && typeof setStatusBar === "function") {
         setStatusBar(formatModelStatus(nextProvider, "model switched"));
+        const warning = formatProviderWarning(nextProvider);
+        if (warning) logLine(warning);
       } else {
         logLine(formatModelStatus(nextProvider, "model switched"));
+        const warning = formatProviderWarning(nextProvider);
+        if (warning) logLine(warning);
       }
     } catch (err) {
       logLine(`unable to switch model: ${err.message}`);
@@ -4144,6 +4182,7 @@ async function main() {
     activeSkillsRef,
     projectInstructionsRef,
     mcpHub: mcpHubRef.value,
+    webSearch: settings?.webSearch || settings?.tools?.web?.search || null,
     onTodoWrite: (nextTodos) => {
       todosRef.value = normalizeTodos(nextTodos);
       todoAutoTrackRef.value = false;
@@ -4567,6 +4606,10 @@ async function main() {
     tui.render(currentInputRef.value, "Type /help for commands");
   } else {
     console.log(`Pie Code (${formatProviderModel(providerRef.value)})`);
+    const providerWarning = formatProviderWarning(providerRef.value);
+    if (providerWarning) {
+      console.error(providerWarning);
+    }
     if (projectInstructionsRef.value?.source) {
       console.log(`loaded project instructions: ${projectInstructionsRef.value.source}`);
     }

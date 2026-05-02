@@ -281,6 +281,11 @@ function normalizeUsage(raw) {
 }
 
 async function postResponsesStream(url, headers, body, onChunk, options = {}) {
+  const detailed = await postResponsesStreamDetailed(url, headers, body, onChunk, options);
+  return { text: detailed.text, usage: detailed.usage };
+}
+
+async function postResponsesStreamDetailed(url, headers, body, onChunk, options = {}) {
   const controller = new AbortController();
   const externalSignal = options?.signal;
   let abortListener = null;
@@ -336,6 +341,24 @@ async function postResponsesStream(url, headers, body, onChunk, options = {}) {
     let buffer = '';
     let text = '';
     let usage = null;
+    let finishReason = '';
+    const toolCalls = [];
+    const toolCallByKey = new Map();
+    let currentToolKey = '';
+
+    const ensureToolCall = (item = {}) => {
+      const key = String(item.call_id || item.id || currentToolKey || `tool_${toolCalls.length}`);
+      if (toolCallByKey.has(key)) return toolCallByKey.get(key);
+      const call = {
+        id: String(item.id || responsesItemIdFromToolCallId(key)),
+        call_id: String(item.call_id || key),
+        name: String(item.name || ''),
+        arguments: typeof item.arguments === 'string' ? item.arguments : '',
+      };
+      toolCallByKey.set(key, call);
+      toolCalls.push(call);
+      return call;
+    };
 
     const handleEvent = (rawData) => {
       if (!rawData || rawData === '[DONE]') return;
@@ -352,6 +375,31 @@ async function postResponsesStream(url, headers, body, onChunk, options = {}) {
       }
 
       const type = String(parsed?.type || '');
+      if (type === 'response.output_item.added' && parsed?.item?.type === 'function_call') {
+        const call = ensureToolCall(parsed.item);
+        currentToolKey = call.call_id || call.id;
+        return;
+      }
+      if (type === 'response.function_call_arguments.delta') {
+        const call = ensureToolCall({ call_id: currentToolKey });
+        call.arguments += String(parsed?.delta || '');
+        return;
+      }
+      if (type === 'response.function_call_arguments.done') {
+        const call = ensureToolCall({ call_id: currentToolKey });
+        if (typeof parsed?.arguments === 'string') call.arguments = parsed.arguments;
+        return;
+      }
+      if (type === 'response.output_item.done' && parsed?.item?.type === 'function_call') {
+        const call = ensureToolCall(parsed.item);
+        call.id = String(parsed.item.id || call.id);
+        call.call_id = String(parsed.item.call_id || call.call_id);
+        call.name = String(parsed.item.name || call.name);
+        if (typeof parsed.item.arguments === 'string') call.arguments = parsed.item.arguments;
+        currentToolKey = '';
+        return;
+      }
+
       const delta =
         typeof parsed?.delta === 'string'
           ? parsed.delta
@@ -376,6 +424,17 @@ async function postResponsesStream(url, headers, body, onChunk, options = {}) {
         if (normalized) usage = normalized;
       }
       if (type === 'response.completed' && response) {
+        finishReason = response.status === 'completed' ? 'stop' : String(response.status || '');
+        const outputItems = Array.isArray(response.output) ? response.output : [];
+        for (const item of outputItems) {
+          if (item?.type === 'function_call') {
+            const call = ensureToolCall(item);
+            call.id = String(item.id || call.id);
+            call.call_id = String(item.call_id || call.call_id);
+            call.name = String(item.name || call.name);
+            if (typeof item.arguments === 'string') call.arguments = item.arguments;
+          }
+        }
         const finalText = extractResponsesText(response);
         if (finalText && finalText.length > text.length) text = finalText;
       }
@@ -426,7 +485,7 @@ async function postResponsesStream(url, headers, body, onChunk, options = {}) {
       handleEvent(data);
     }
 
-    return { text: text.trim(), usage };
+    return { text: text.trim(), usage, toolCalls, finishReason };
   } finally {
     clearTimeout(timeout);
     if (externalSignal && abortListener) {
@@ -711,6 +770,98 @@ function extractResponsesText(data) {
     }
   }
   return textParts.join('\n').trim();
+}
+
+function responsesItemIdFromToolCallId(id) {
+  const raw = String(id || `call_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+  const cleaned = raw.replace(/[^a-zA-Z0-9_-]/g, '_');
+  return cleaned.startsWith('fc_') ? cleaned : `fc_${cleaned}`;
+}
+
+function normalizeResponsesInputContent(role, content) {
+  if (Array.isArray(content)) return content;
+  const text = String(content ?? '');
+  if (role === 'assistant') {
+    return [{ type: 'output_text', text }];
+  }
+  return [{ type: 'input_text', text }];
+}
+
+function convertOpenAIMessagesToResponsesInput(messages = []) {
+  const out = [];
+  for (const msg of Array.isArray(messages) ? messages : []) {
+    const role = String(msg?.role || '').toLowerCase();
+    if (!role || role === 'system') continue;
+    if (role === 'tool') {
+      const callId = String(msg?.tool_call_id || '').trim();
+      if (!callId) continue;
+      out.push({
+        type: 'function_call_output',
+        call_id: callId,
+        output: typeof msg?.content === 'string' ? msg.content : JSON.stringify(msg?.content ?? ''),
+      });
+      continue;
+    }
+    const toolCalls = Array.isArray(msg?.tool_calls) ? msg.tool_calls : [];
+    if (toolCalls.length > 0) {
+      for (const call of toolCalls) {
+        const callId = String(call?.id || '').trim() || `call_${out.length + 1}`;
+        out.push({
+          type: 'function_call',
+          id: responsesItemIdFromToolCallId(callId),
+          call_id: callId,
+          name: String(call?.function?.name || ''),
+          arguments: String(call?.function?.arguments || '{}'),
+        });
+      }
+      continue;
+    }
+    if (role === 'user' || role === 'assistant') {
+      out.push({
+        role,
+        content: normalizeResponsesInputContent(role, msg?.content ?? ''),
+      });
+    }
+  }
+  return out;
+}
+
+function convertOpenAIToolsToResponsesTools(tools = []) {
+  return (Array.isArray(tools) ? tools : [])
+    .map((tool) => {
+      const fn = tool?.function && typeof tool.function === 'object' ? tool.function : tool;
+      const name = String(fn?.name || '').trim();
+      if (!name) return null;
+      return {
+        type: 'function',
+        name,
+        description: String(fn?.description || ''),
+        parameters: fn?.parameters && typeof fn.parameters === 'object' ? fn.parameters : { type: 'object', properties: {} },
+        strict: null,
+      };
+    })
+    .filter(Boolean);
+}
+
+async function postResponsesStreamNative(url, headers, body, onChunk, options = {}) {
+  const streamed = await postResponsesStreamDetailed(url, headers, body, onChunk, options);
+  const toolCalls = streamed.toolCalls.map((call) => ({
+    id: call.call_id || call.id,
+    type: 'function',
+    function: {
+      name: call.name,
+      arguments: call.arguments || '{}',
+    },
+  }));
+  return {
+    message: {
+      role: 'assistant',
+      content: streamed.text || '',
+      ...(toolCalls.length > 0 ? { tool_calls: toolCalls } : {}),
+    },
+    finishReason: toolCalls.length > 0 ? 'tool_calls' : streamed.finishReason || 'stop',
+    usage: streamed.usage || null,
+  };
 }
 
 function createOpenAICompatibleProvider({
@@ -1237,7 +1388,7 @@ function createCodexTokenProvider({
   return {
     kind: 'codex-auth-token',
     model,
-    supportsNativeTools: false,
+    supportsNativeTools: true,
     _lastUsage: null,
     getLastUsage() {
       return this._lastUsage || null;
@@ -1254,8 +1405,40 @@ function createCodexTokenProvider({
         include: ['reasoning.encrypted_content'],
       };
     },
-    async complete({ systemPrompt, prompt, signal }) {
+    buildNativeResponsesBody(systemPrompt, messages, tools) {
+      const input = convertOpenAIMessagesToResponsesInput(messages);
+      const convertedTools = convertOpenAIToolsToResponsesTools(tools);
+      return {
+        model,
+        store: false,
+        instructions: systemPrompt,
+        input,
+        text: { verbosity: 'medium' },
+        include: ['reasoning.encrypted_content'],
+        tool_choice: 'auto',
+        parallel_tool_calls: true,
+        ...(convertedTools.length > 0 ? { tools: convertedTools } : {}),
+      };
+    },
+    async complete({ systemPrompt, prompt, messages, tools, signal }) {
       this._lastUsage = null;
+      if (Array.isArray(messages) && Array.isArray(tools)) {
+        const streamed = await postResponsesStreamNative(
+          responsesUrl,
+          headers,
+          this.buildNativeResponsesBody(systemPrompt, messages, tools),
+          null,
+          { signal }
+        );
+        this._lastUsage = streamed.usage || null;
+        return {
+          type: 'native',
+          format: 'openai',
+          message: streamed.message,
+          finishReason: streamed.finishReason,
+          usage: this._lastUsage || null,
+        };
+      }
       const streamed = await postResponsesStream(
         responsesUrl,
         headers,
@@ -1267,8 +1450,25 @@ function createCodexTokenProvider({
       if (streamed.text) return streamed.text;
       throw new Error('Codex auth response did not contain text output.');
     },
-    async completeStream({ systemPrompt, prompt, onDelta, signal }) {
+    async completeStream({ systemPrompt, prompt, messages, tools, onDelta, signal }) {
       this._lastUsage = null;
+      if (Array.isArray(messages) && Array.isArray(tools)) {
+        const streamed = await postResponsesStreamNative(
+          responsesUrl,
+          headers,
+          this.buildNativeResponsesBody(systemPrompt, messages, tools),
+          onDelta,
+          { signal }
+        );
+        this._lastUsage = streamed.usage || null;
+        return {
+          type: 'native',
+          format: 'openai',
+          message: streamed.message,
+          finishReason: streamed.finishReason,
+          usage: this._lastUsage || null,
+        };
+      }
       const streamed = await postResponsesStream(
         responsesUrl,
         headers,

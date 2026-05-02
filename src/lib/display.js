@@ -39,6 +39,8 @@ function summarizeToolInput(tool, input, maxLen = 80) {
   else if (tool === "find_files") text = `${safe.path || "."} ${safe.query || ""}`;
   else if (tool === "rg" || tool === "grep" || tool === "search_files") {
     text = `${safe.pattern || safe.regex || safe.query || ""}${safe.glob || safe.file_pattern ? ` in ${safe.glob || safe.file_pattern}` : ""}`;
+  } else if (tool === "web_search" || tool === "search_web") {
+    text = safe.query || safe.q || "";
   } else if (tool === "git_diff") text = `${safe.staged ? "--staged " : ""}${safe.path || ""}`.trim();
   else if (tool === "run_tests") text = safe.command || "npm test";
   else text = JSON.stringify(safe);
@@ -468,6 +470,9 @@ export class Display {
       case "grep":
       case "search_files":
         return `> Search "${input?.pattern || input?.regex || input?.query || ""}"`;
+      case "web_search":
+      case "search_web":
+        return `> Web search "${input?.query || input?.q || ""}"`;
       case "git_status":
         return "> Git status";
       case "git_diff":
@@ -506,6 +511,9 @@ export class Display {
       case "grep":
       case "search_files":
         return "Scanning files...";
+      case "web_search":
+      case "search_web":
+        return "Searching web...";
       case "git_status":
       case "git_diff":
         return "Inspecting git state...";
@@ -598,6 +606,22 @@ export class Display {
           preview.push(`    ${dim(`... (${lines.length - 16} more)`)}`);
         }
         return preview.join("\n");
+      }
+      case "web_search":
+      case "search_web": {
+        try {
+          const parsed = JSON.parse(text);
+          const results = Array.isArray(parsed?.results) ? parsed.results : [];
+          const preview = results.slice(0, 5).map((item, idx) => {
+            const title = truncateLine(String(item?.title || item?.url || "result"), 90);
+            const url = truncateLine(String(item?.url || ""), 120);
+            return `    ${dim(`${idx + 1}. ${title}${url ? ` - ${url}` : ""}`)}`;
+          });
+          if (results.length > preview.length) preview.push(`    ${dim(`... (${results.length - preview.length} more)`)}`);
+          return preview.join("\n");
+        } catch {
+          return `    ${dim(truncateLine(text, 300))}`;
+        }
       }
       default:
         return "";
