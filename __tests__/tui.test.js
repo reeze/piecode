@@ -130,7 +130,10 @@ describe("tui usability", () => {
       getApprovalLabel: () => "off",
     });
 
-    expect(stripAnsi(tui.formatTimelineLines("[task] simplify repo")[0])).toContain("Task: simplify repo");
+    const taskLineRaw = tui.formatTimelineLines("[task] simplify repo")[0];
+    expect(stripAnsi(taskLineRaw)).toContain("Task: simplify repo");
+    expect(taskLineRaw).toContain("\x1b[1;37;48;5;236m");
+    expect(stripAnsi(taskLineRaw).length).toBe(out.columns - 1);
     expect(tui.formatTimelineLines("[model] seed-openai-compatible:doubao")).toEqual([]);
     expect(tui.formatTimelineLines("[plan] budget=3 - scoped plan")).toEqual([]);
     expect(stripAnsi(tui.formatTimelineLines('[run] shell command="echo hi"')[0])).toContain("Bash(echo hi)");
@@ -357,6 +360,29 @@ describe("tui usability", () => {
     expect(raw).not.toContain("─");
   });
 
+  test("wide characters do not overflow truncated status lines", () => {
+    const out = createOut(42, 18);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.setLiveThought("界面可能错乱的问题".repeat(10));
+    const frame = String(out.writes[out.writes.length - 1] || "").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+    const width = out.columns - 1;
+    for (const line of frame.split("\n")) {
+      const printableWidth = Array.from(line).reduce((sum, ch) => {
+        const cp = ch.codePointAt(0);
+        return sum + (cp >= 0x2e80 && cp <= 0xa4cf ? 2 : 1);
+      }, 0);
+      expect(printableWidth).toBeLessThanOrEqual(width);
+    }
+  });
+
   test("context usage is capped at 100% in the status bar", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
@@ -417,11 +443,12 @@ describe("tui usability", () => {
     tui.start();
     tui.setTodos([{ id: "todo-1", content: "finish", status: "completed" }]);
     let frame = latestFrame(out);
-    expect(frame).toContain("notice: TODO completed");
+    expect(frame).toContain("✅ 所有 TODO 已完成，可以结束了");
+    expect(frame).toContain("Task completed");
 
     tui.beginTurn();
     frame = latestFrame(out);
-    expect(frame).not.toContain("notice: TODO completed");
+    expect(frame).not.toContain("✅ 所有 TODO 已完成，可以结束了");
     expect(frame).toContain("TODO(1/1)");
   });
 

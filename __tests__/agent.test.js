@@ -1443,7 +1443,8 @@ describe("agent context controls", () => {
       expect(script).toContain("case 'pow'");
       expect(readme).toContain("Scientific Calculator CLI");
       expect(readme).toContain("node bin/scicalc.js");
-      expect(llmSystemPrompts[0]).toContain("COMPLEX TASK EXECUTION:");
+      expect(llmSystemPrompts[0]).toContain("general-purpose command-line agent");
+      expect(llmSystemPrompts[0]).toContain("GUIDELINES:");
     } finally {
       await rm(workspaceDir, { recursive: true, force: true });
     }

@@ -645,6 +645,7 @@ export class TurnEngine {
       activeSkills: this.agent.getActiveSkills(),
       activePlan: this.activePlan,
       projectInstructions: this.agent.projectInstructionsRef?.value?.content || null,
+      memory: this.agent.getMemoryPrompt(),
       nativeTools: useNativeTools,
       turnPolicy: this.turnPolicy,
       mcpEnabled: this.mcpEnabled,

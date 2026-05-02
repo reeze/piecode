@@ -1,15 +1,73 @@
+const ANSI_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+
+function stripAnsi(text) {
+  return String(text || "").replace(ANSI_PATTERN, "");
+}
+
 function truncateLine(line, width) {
   const text = String(line ?? "");
-  if (width <= 0) return "";
-  if (text.length <= width) return text;
-  if (width <= 3) return text.slice(0, width);
-  return `${text.slice(0, width - 3)}...`;
+  const maxWidth = Math.max(0, Number(width) || 0);
+  if (maxWidth <= 0) return "";
+  if (stringDisplayWidth(text) <= maxWidth) return text;
+
+  const ellipsis = maxWidth > 3 ? "..." : "";
+  const targetWidth = Math.max(0, maxWidth - stringDisplayWidth(ellipsis));
+  let out = "";
+  let used = 0;
+  let sawAnsi = false;
+  for (let i = 0; i < text.length;) {
+    const ansiMatch = text.slice(i).match(/^\x1b\[[0-9;?]*[ -/]*[@-~]/);
+    if (ansiMatch) {
+      out += ansiMatch[0];
+      sawAnsi = true;
+      i += ansiMatch[0].length;
+      continue;
+    }
+    const ch = text[i];
+    const cp = text.codePointAt(i);
+    const char = cp != null && cp > 0xffff ? text.slice(i, i + 2) : ch;
+    const w = charDisplayWidth(char);
+    if (used + w > targetWidth) break;
+    out += char;
+    used += w;
+    i += char.length;
+  }
+  return `${out}${ellipsis}${sawAnsi ? "\x1b[0m" : ""}`;
 }
 
 function wrapText(text, width) {
   const source = String(text ?? "").replace(/\r/g, "");
-  if (width <= 1) return [source];
+  const maxWidth = Math.max(1, Number(width) || 1);
+  if (maxWidth <= 1) return [source];
   const out = [];
+
+  const splitLongWord = (word) => {
+    const chunks = [];
+    let chunk = "";
+    let chunkWidth = 0;
+    for (let i = 0; i < word.length;) {
+      const ansiMatch = word.slice(i).match(/^\x1b\[[0-9;?]*[ -/]*[@-~]/);
+      if (ansiMatch) {
+        chunk += ansiMatch[0];
+        i += ansiMatch[0].length;
+        continue;
+      }
+      const cp = word.codePointAt(i);
+      const char = cp != null && cp > 0xffff ? word.slice(i, i + 2) : word[i];
+      const charWidth = charDisplayWidth(char);
+      if (chunk && chunkWidth + charWidth > maxWidth) {
+        chunks.push(chunk);
+        chunk = "";
+        chunkWidth = 0;
+      }
+      chunk += char;
+      chunkWidth += charWidth;
+      i += char.length;
+    }
+    if (chunk || chunks.length === 0) chunks.push(chunk);
+    return chunks;
+  };
+
   for (const paragraph of source.split("\n")) {
     if (!paragraph) {
       out.push("");
@@ -22,33 +80,28 @@ function wrapText(text, width) {
     }
     let line = "";
     for (const word of words) {
+      const wordWidth = stringDisplayWidth(word);
       if (!line) {
-        if (word.length <= width) {
+        if (wordWidth <= maxWidth) {
           line = word;
         } else {
-          let chunk = word;
-          while (chunk.length > width) {
-            out.push(chunk.slice(0, width));
-            chunk = chunk.slice(width);
-          }
-          line = chunk;
+          const chunks = splitLongWord(word);
+          out.push(...chunks.slice(0, -1));
+          line = chunks[chunks.length - 1] || "";
         }
         continue;
       }
       const next = `${line} ${word}`;
-      if (next.length <= width) {
+      if (stringDisplayWidth(next) <= maxWidth) {
         line = next;
       } else {
         out.push(line);
-        if (word.length <= width) {
+        if (wordWidth <= maxWidth) {
           line = word;
         } else {
-          let chunk = word;
-          while (chunk.length > width) {
-            out.push(chunk.slice(0, width));
-            chunk = chunk.slice(width);
-          }
-          line = chunk;
+          const chunks = splitLongWord(word);
+          out.push(...chunks.slice(0, -1));
+          line = chunks[chunks.length - 1] || "";
         }
       }
     }
@@ -59,10 +112,6 @@ function wrapText(text, width) {
 
 function color(text, code) {
   return `\x1b[${code}m${text}\x1b[0m`;
-}
-
-function stripAnsi(text) {
-  return String(text || "").replace(/\x1b\[[0-9;]*m/g, "");
 }
 
 function renderInlineMarkdown(line) {
@@ -248,6 +297,19 @@ function separatorLine(width) {
   // Use ASCII here because several mobile terminals render box-drawing glyphs
   // with unstable width/fallback characters during frequent full-frame redraws.
   return `\x1b[90m${"-".repeat(Math.max(1, Number(width) || 1))}\x1b[0m`;
+}
+
+function padDisplayLine(line, width) {
+  const text = String(line ?? "");
+  const maxWidth = Math.max(0, Number(width) || 0);
+  if (maxWidth <= 0) return "";
+  const truncated = truncateLine(text, maxWidth);
+  const pad = Math.max(0, maxWidth - stringDisplayWidth(stripAnsi(truncated)));
+  return `${truncated}${" ".repeat(pad)}`;
+}
+
+function colorFullLine(line, code, width) {
+  return color(padDisplayLine(line, width), code);
 }
 
 export class SimpleTui {
@@ -628,7 +690,9 @@ export class SimpleTui {
       nextDone === nextTotal &&
       !(previousTotal > 0 && previousDone === previousTotal);
     if (becameAllCompleted) {
-      this.transientStatusNotice = "notice: TODO completed";
+      this.transientStatusNotice = "✅ 所有 TODO 已完成，可以结束了";
+      this.lastStatus = "Task completed";
+      this.event("[result] Task completed");
     }
     this.render();
   }
@@ -1047,7 +1111,7 @@ export class SimpleTui {
       });
     if (!line) return [];
     if (line.startsWith("[task] ")) {
-      return padAll([color(` ◆ Task: ${line.slice(7).trim()} `, "1;30;47")]);
+      return [colorFullLine(` ◆ Task: ${line.slice(7).trim()} `, "1;37;48;5;236", Math.max(20, (this.out?.columns || 100) - 1))];
     }
     if (line.startsWith("[model] ")) {
       return [];

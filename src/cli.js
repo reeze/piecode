@@ -33,6 +33,7 @@ import { AgentSessionState, SessionEventBus, createJsonlSessionSink } from "./li
 import { classifyShellCommand } from "./lib/tools.js";
 import { applyFileMentionSelection, getFileMentionSuggestions, isGitRelatedPath } from "./lib/fileMentions.js";
 import { formatAttachmentSummary, readClipboardImage } from "./lib/attachments.js";
+import { loadMemory } from "./lib/memory.js";
 import {
   listResumableSessions,
   loadResumableSession,
@@ -2277,9 +2278,16 @@ async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef,
   }
 }
 
-function formatSubagentLines(subagentsRef) {
-  const state = subagentsRef?.value || {};
-  const active = state.active instanceof Map ? [...state.active.values()] : [];
+function formatSubagentLines(subagentsRef, agent = null) {
+  const managed = agent?.agentManager && typeof agent.agentManager.snapshot === "function"
+    ? agent.agentManager.snapshot()
+    : null;
+  const state = managed || subagentsRef?.value || {};
+  const active = Array.isArray(state.active)
+    ? state.active
+    : state.active instanceof Map
+      ? [...state.active.values()]
+      : [];
   const completed = Array.isArray(state.completed) ? state.completed : [];
   const lines = [];
   lines.push(`subagents: ${active.length} active, ${completed.length} completed`);
@@ -2351,7 +2359,7 @@ async function handleNonInterruptingCommand(input, ctx = {}) {
     return true;
   }
   if (lower === "/agents" || lower === "/subagents") {
-    for (const line of formatSubagentLines(ctx.subagentsRef)) logLine(line);
+    for (const line of formatSubagentLines(ctx.subagentsRef, ctx.agent)) logLine(line);
     return true;
   }
   if (lower === "/status") {
@@ -2564,7 +2572,7 @@ async function handleSlashCommand(input, ctx) {
     return { done: false, handled: true };
   }
   if (lower === "/agents" || lower === "/subagents") {
-    for (const line of formatSubagentLines(ctx.subagentsRef)) logLine(line);
+    for (const line of formatSubagentLines(ctx.subagentsRef, agent)) logLine(line);
     return { done: false, handled: true };
   }
   if (lower === "/sessions") {
@@ -3441,6 +3449,77 @@ function mergeModelCatalog(baseCatalog, popular, latest, localSettingsModels = [
   return out;
 }
 
+async function probeAvailableModels({
+  settings,
+  modelCatalogRef,
+  modelContextWindowsRef,
+  modelContextMetadataRef,
+  logLine = null,
+  tui = null,
+} = {}) {
+  if (String(process.env.PIECODE_MODEL_PROBE || "1") === "0") {
+    return { openrouter: null, seed: null };
+  }
+
+  const loadedSources = [];
+  const extraModels = [];
+  const popular = [];
+  const latest = [];
+
+  const markLoaded = (source) => {
+    const key = String(source || "").trim().toLowerCase();
+    if (!key) return;
+    if (!(modelContextMetadataRef?.value instanceof Set)) {
+      if (modelContextMetadataRef) modelContextMetadataRef.value = new Set();
+      else return;
+    }
+    modelContextMetadataRef.value.add(key);
+    loadedSources.push(key);
+  };
+
+  const applyContext = (contextByModel, source) => {
+    if (contextByModel && typeof contextByModel === "object") {
+      applyContextWindowMetadata(modelContextWindowsRef.value, contextByModel, source);
+    }
+  };
+
+  let openrouter = null;
+  let seed = null;
+
+  try {
+    openrouter = await fetchOpenRouterModelGroups({ settings });
+    applyContext(openrouter?.contextByModel, "openrouter");
+    for (const id of openrouter?.popular || []) popular.push(id);
+    for (const id of openrouter?.latest || []) latest.push(id);
+    markLoaded("openrouter");
+  } catch {
+    // Best effort: model discovery should never block startup.
+  }
+
+  try {
+    seed = await fetchSeedModelMetadata({ settings });
+    applyContext(seed?.contextByModel, "seed");
+    for (const id of seed?.models || []) extraModels.push(`seed:${id}`);
+    markLoaded("seed");
+  } catch {
+    // Seed often requires provider-specific credentials; skip quietly.
+  }
+
+  if (loadedSources.length > 0) {
+    modelCatalogRef.value = mergeModelCatalog(
+      MODEL_SUGGESTIONS,
+      popular,
+      latest,
+      [...collectModelsFromSettings(settings), ...extraModels]
+    );
+    const message = `model probe: loaded ${loadedSources.join(", ")} metadata (${modelCatalogRef.value.length} suggestions)`;
+    if (typeof logLine === "function") logLine(message);
+    else if (tui && typeof tui.render === "function") tui.render(undefined, message);
+  }
+
+  return { openrouter, seed };
+}
+
 function collectModelsFromSettings(settings = {}) {
   const out = [];
   const seen = new Set();
@@ -3562,6 +3641,7 @@ async function main() {
   const projectInstructionsLoaded = await loadProjectInstructions(workspaceDir);
   const projectInstructionsRef = { value: projectInstructionsLoaded.instructions };
   const projectInstructionsStatusRef = { value: projectInstructionsLoaded.status };
+  const memoryRef = { value: await loadMemory({ workspaceDir }) };
   const startupAutoSkills = await autoLoadSkillsFromInstructions(
     projectInstructionsRef.value,
     activeSkillsRef,
@@ -3801,6 +3881,16 @@ async function main() {
     recordTaskLog(taskTraceRef, line),
     sessionBus
   );
+  if (!oneShotPromptMode) {
+    void probeAvailableModels({
+      settings,
+      modelCatalogRef,
+      modelContextWindowsRef,
+      modelContextMetadataRef,
+      logLine,
+      tui,
+    }).catch(() => {});
+  }
   const setStatusBar = (message) => {
     if (!tui) return;
     const text = String(message || "").trim();
@@ -4034,6 +4124,7 @@ async function main() {
                 void handleNonInterruptingCommand(commandText, {
                   logLine,
                   tui,
+                  agent,
                   providerRef,
                   subagentsRef,
                   llmHistoryRef,
@@ -4246,6 +4337,14 @@ async function main() {
             return;
           }
           if (enterPressed) {
+            const selectedModel = modelPickerRef.options[modelPickerRef.index] || "";
+            if (selectedModel) {
+              const nextLine = `/model ${selectedModel}`;
+              safeRlWrite(null, { ctrl: true, name: "u" });
+              safeRlWrite(nextLine);
+              currentInputRef.value = nextLine;
+              if (tui) tui.renderInput(currentInputRef.value);
+            }
             modelPickerRef.active = false;
             modelPickerRef.query = "";
             modelPickerRef.options = [];
@@ -4542,6 +4641,7 @@ async function main() {
     askApproval,
     activeSkillsRef,
     projectInstructionsRef,
+    memoryRef,
     mcpHub: mcpHubRef.value,
     webSearch: settings?.webSearch || settings?.tools?.web?.search || null,
     contextWindowRef,
@@ -4551,6 +4651,11 @@ async function main() {
       todoAutoTrackRef.value = false;
       sessionBus.emit("todos.update", { todos: todosRef.value });
       if (tui) tui.setTodos(todosRef.value);
+    },
+    onMemoryWrite: (result) => {
+      if (result?.scope) {
+        logLine(`[memory] saved ${result.scope}: ${result.relPath || result.path}`);
+      }
     },
     onEvent: (evt) => {
       if (evt && typeof evt === "object") {
@@ -4999,6 +5104,10 @@ async function main() {
     }
     if (projectInstructionsRef.value?.source) {
       console.log(`loaded project instructions: ${projectInstructionsRef.value.source}`);
+    }
+    const loadedMemoryScopes = ["global", "project"].filter((scope) => String(memoryRef.value?.[scope]?.content || "").trim());
+    if (loadedMemoryScopes.length > 0) {
+      console.log(`loaded memory: ${loadedMemoryScopes.join(", ")}`);
     }
     if (activeSkillsRef.value.length > 0) {
       console.log(`skills: ${activeSkillsRef.value.map((s) => s.name).join(", ")}`);

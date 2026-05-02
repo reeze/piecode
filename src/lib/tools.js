@@ -622,10 +622,13 @@ export function createToolset({
   askApproval,
   onToolStart,
   onTodoWrite,
+  onMemoryWrite,
   mcpHub = null,
   webSearch = null,
   shellPermissionRef = null,
   runSubagent = null,
+  runCollaboration = null,
+  writeMemory = null,
 }) {
   let lastTodoSignature = "";
   const mcpAvailable = () => Boolean(mcpHub && typeof mcpHub.hasServers === "function" && mcpHub.hasServers());
@@ -1267,6 +1270,16 @@ export function createToolset({
     return `Updated ${normalized.length} todos:\n${summary}`;
   };
 
+  const memoryWrite = async ({ scope = "project", content } = {}) => {
+    onToolStart?.("memory_write", { scope, content });
+    if (typeof writeMemory !== "function") {
+      throw new Error("Memory support is not configured for this session.");
+    }
+    const result = await writeMemory({ scope, content });
+    onMemoryWrite?.(result);
+    return `Saved memory to ${result.relPath || result.path} (${result.scope}).`;
+  };
+
   // Search files using ripgrep, grep, or native implementation
   const searchFiles = async ({
     path: searchPath = ".",
@@ -1482,6 +1495,16 @@ export function createToolset({
     );
   };
 
+  const collaborateTool = async ({ task, context = "" } = {}, options = {}) => {
+    const normalizedTask = String(task || "").trim();
+    onToolStart?.("collaborate", { task: normalizedTask, context });
+    if (!normalizedTask) throw new Error("Missing required parameter: task");
+    if (typeof runCollaboration !== "function") {
+      throw new Error("Collaboration support is not configured for this session.");
+    }
+    return await runCollaboration({ task: normalizedTask, context: String(context || "") }, options);
+  };
+
   const listMcpServers = async () => {
     onToolStart?.("list_mcp_servers", {});
     if (!mcpAvailable()) return "No MCP servers configured.";
@@ -1588,12 +1611,15 @@ export function createToolset({
     run_tests: runTests,
     todo_write: todoWrite,
     todowrite: todoWrite,
+    memory_write: memoryWrite,
+    remember: memoryWrite,
     rg: rgTool,
     grep: grepTool,
     search_files: searchFiles,
     web_search: webSearchTool,
     search_web: webSearchTool,
     subagent: subagentTool,
+    collaborate: collaborateTool,
     list_mcp_servers: listMcpServers,
     list_mcp_tools: listMcpTools,
     mcp_call_tool: callMcpTool,

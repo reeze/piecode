@@ -13,19 +13,20 @@ describe('Prompt functions', () => {
       expect(prompt).toContain('Shell auto approval: ON');
     });
 
-    test('should include all core principles', () => {
+    test('should include general-purpose guidelines', () => {
       const prompt = buildSystemPrompt({
         workspaceDir: '/test/workspace',
         autoApprove: false,
       });
 
-      expect(prompt).toContain('CORE PRINCIPLES');
-      expect(prompt).toContain('Assist with software engineering tasks');
-      expect(prompt).toContain('Focus on safe, secure, correct code');
-      expect(prompt).toContain('keep solutions simple and focused');
+      expect(prompt).toContain('general-purpose command-line agent');
+      expect(prompt).toContain('coding, writing, research, analysis, planning, or troubleshooting');
+      expect(prompt).toContain('GUIDELINES');
+      expect(prompt).not.toContain('CAPABILITIES');
+      expect(prompt).not.toContain('OPERATING RULES');
     });
 
-    test('should include tool schemas in text mode (nativeTools=false)', () => {
+    test('should include tool guidance in text mode (nativeTools=false)', () => {
       const prompt = buildSystemPrompt({
         workspaceDir: '/test/workspace',
         autoApprove: false,
@@ -33,7 +34,7 @@ describe('Prompt functions', () => {
       });
 
       expect(prompt).toContain('RESPONSE FORMAT');
-      expect(prompt).toContain('TOOL SCHEMAS');
+      expect(prompt).toContain('TOOLS');
       expect(prompt).toContain('"type":"thought"');
       expect(prompt).toContain('todo_write/todowrite');
       expect(prompt).toContain('edit_file');
@@ -48,7 +49,7 @@ describe('Prompt functions', () => {
       });
 
       expect(prompt).not.toContain('RESPONSE FORMAT');
-      expect(prompt).not.toContain('TOOL SCHEMAS');
+      expect(prompt).not.toContain('TOOLS:');
       expect(prompt).not.toContain('"type":"thought"');
       expect(prompt).not.toContain('todo_write/todowrite');
     });
@@ -104,8 +105,8 @@ describe('Prompt functions', () => {
         },
       });
 
-      expect(prompt).toContain('Never call the same read-only tool with identical input twice in one turn');
-      expect(prompt).toContain('treat AGENTS.md as already read');
+      expect(prompt).toContain('avoid repeated identical read-only calls');
+      expect(prompt).toContain('do not re-read them unless exact quotes are needed');
     });
 
     test('should include todo tracking conventions in text mode', () => {
@@ -116,11 +117,10 @@ describe('Prompt functions', () => {
       });
 
       expect(prompt).toContain('todo_write');
-      expect(prompt).toContain('pending, in_progress, completed');
-      expect(prompt).toContain('Read the target file before editing');
-      expect(prompt).toContain('Use edit_file for precise oldText -> newText changes');
-      expect(prompt).toContain('do not use write_file unless the user explicitly asks for full rewrite/overwrite');
-      expect(prompt).toContain('Use write_file only for creating new files or full file rewrites');
+      expect(prompt).toContain('pending, in_progress, or completed');
+      expect(prompt).toContain('Before editing existing files, read them first');
+      expect(prompt).toContain('Prefer targeted edits');
+      expect(prompt).toContain('write_file is for new files or explicit rewrites');
     });
   });
 

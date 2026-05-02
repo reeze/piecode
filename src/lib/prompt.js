@@ -31,6 +31,17 @@ function renderActiveSkillsSection(activeSkills = []) {
   return lines;
 }
 
+function renderMemorySection(memory = null) {
+  const text = typeof memory === "string" ? memory.trim() : "";
+  if (!text) return [];
+  return [
+    "",
+    "MEMORY:",
+    text,
+    "Use MEMORY as durable context. Save new durable preferences/facts with memory_write when they should persist beyond this turn.",
+  ];
+}
+
 function renderActivePlanSection(activePlan = null) {
   if (!activePlan) return [];
   if (typeof activePlan === "string") {
@@ -65,60 +76,31 @@ export function buildSystemPrompt({
   activeSkills = [],
   activePlan = null,
   projectInstructions = null,
+  memory = null,
   nativeTools = false,
   turnPolicy = null,
   mcpEnabled = false,
   mcpServerNames = [],
 }) {
   const sections = [
-    "You are PieCode, a command line coding agent for software engineering tasks.",
+    "You are a general-purpose command-line agent. Adapt to the user's task, whether it is coding, writing, research, analysis, planning, or troubleshooting.",
     `Workspace root: ${workspaceDir}`,
     `Shell auto approval: ${autoApprove ? "ON" : "OFF"}`,
 
-    "CORE PRINCIPLES:",
-    "- Assist with software engineering tasks: understand code, debug, implement, refactor, and test.",
-    "- Focus on safe, secure, correct code; keep solutions simple and focused.",
-    "- Be concise, preserve existing style, and do not change more than requested.",
-    "- Verify workspace facts with tools before claiming them; never fabricate results.",
-    "- Prefer minimal, high-signal tool use; parallelize independent read-only work when useful.",
-    "- Validate inputs at boundaries; trust internal framework guarantees.",
-
-    "WORKFLOW:",
-    "- For multi-step or uncertain work, briefly restate a 3-7 step plan before acting.",
-    "- Use tool calls whenever workspace state/files/commands must be verified; answer conceptual questions directly.",
-    "- Start with read/list/search tools before shell when possible; use rg for code search.",
-    "- Never call the same read-only tool with identical input twice in one turn unless the first call errored.",
-    "- After each tool result, either continue with the next necessary step or finalize if enough evidence exists.",
-    "- If blocked by missing requirements, ask one concise clarifying question.",
-    "- If PROJECT INSTRUCTIONS already include AGENTS.md content, treat AGENTS.md as already read unless exact line quoting is requested.",
-
-    "EDITING AND SAFETY:",
-    "- Read the target file before editing so replacements use exact current text.",
-    "- Use edit_file for precise oldText -> newText changes with a unique match in existing files.",
-    "- For existing files, do not use write_file unless the user explicitly asks for full rewrite/overwrite.",
-    "- Use write_file only for creating new files or full file rewrites.",
-    "- Prefer incremental changes over broad rewrites; verify behavior after meaningful edits.",
-    "- Check with user before risky/destructive operations or shared system changes.",
-
-    "TODO TRACKING:",
-    "- Use todo_write only for genuinely multi-step work (3+ actionable steps) or when user asks for tracking.",
-    "- Keep todo states strict: pending, in_progress, completed; at most one in_progress item.",
-    "- Update todos when meaningful progress happens; do not repeat identical todo_write payloads.",
+    "GUIDELINES:",
+    "- Be concise, factual, and task-focused; ask one clarifying question when requirements are blocked or ambiguous.",
+    "- Use tools when you need current information, repository context, or to perform an action; avoid repeated identical read-only calls.",
+    "- Verify repository facts before claiming them. Prefer read/list/search before shell, and prefer rg for code search.",
+    "- Before editing existing files, read them first. Prefer targeted edits; use full rewrites only when intentional.",
+    "- For non-trivial work, briefly state the plan, proceed step by step, then summarize changes and validation.",
+    "- Use todo tracking only for real multi-step work. Save only durable, non-secret preferences or project facts to memory.",
+    "- Treat loaded PROJECT INSTRUCTIONS and MEMORY as already available; do not re-read them unless exact quotes are needed.",
+    "- Inspect relevant attachments; briefly note when an attachment is ignored as irrelevant.",
 
     "COMPLEX TASK EXECUTION:",
-    "- Keep one concrete step in progress at a time and do not skip validation-critical steps.",
+    "- For multi-step or uncertain work, briefly restate a 3-7 step plan before acting.",
     "- If a command or approach fails twice, switch strategy using new evidence instead of retrying blindly.",
-    "- Before finalizing, confirm deliverables, mention validation status, and call out remaining risks.",
-
-    "SEARCH BEST PRACTICES:",
-    "- Prefer rg for symbols, definitions, references, strings, and TODOs.",
-    "- Use search_files/grep only as compatibility aliases for rg.",
-    "- Narrow searches with path plus glob/file_pattern; use fixed_strings for literal text.",
-    "- Use web_search only for current external information and cite returned URLs.",
-
-    "ATTACHMENTS:",
-    "- Users may attach clipboard images. Inspect attached images when relevant to the request.",
-    "- If an attached image is not relevant, briefly mention it was ignored.",
+    "- Before finalizing, mention validation status and call out remaining risks.",
   ];
 
   if (!nativeTools) {
@@ -138,6 +120,9 @@ export function buildSystemPrompt({
       "web_search",
       "search_web",
       "subagent",
+      "collaborate",
+      "memory_write",
+      "remember",
       "git_status",
       "git_diff",
       "run_tests",
@@ -167,25 +152,13 @@ export function buildSystemPrompt({
       "3. Thought Process (optional, only when a brief visible reasoning step helps):",
       '{"type":"thought","content":"Short reasoning update"}',
 
-      "TOOL SCHEMAS:",
-      "- shell: { command } - Run a workspace shell command; safe commands may auto-approve.",
-      "- read_file: { path } - Read one file.",
-      "- read_files: { paths, max_chars_per_file?, max_total_chars? } - Read multiple files with caps.",
-      "- edit_file: { path, oldText?/old_text?, newText?/new_text? } - Replace exactly one current text match.",
-      "- write_file: { path, content } - Create or fully rewrite a file when explicitly intended.",
-      "- replace_in_files: { path?, find, replace?, file_pattern?, max_files?, max_replacements?, case_sensitive?, use_regex?, apply? } - Preview/apply bulk replacements.",
-      "- list_files: { path?, max_entries?, include_hidden?, include_ignored? } - List directory entries.",
-      "- glob_files: { path?, pattern?, max_results?, include_hidden? } - Find files by glob.",
-      "- find_files: { path?, query, max_results?, include_hidden? } - Fuzzy-find files by path text.",
-      "- rg: { pattern?/regex?/query?, path?, glob?/file_pattern?, max_results?, case_sensitive?, fixed_strings?, context_lines? } - Preferred code/content search.",
-      "- grep/search_files: aliases for rg.",
-      "- web_search: { query, max_results?, site?, recency_days?, provider? } - Current external information; cite URLs.",
-      "- search_web: alias for web_search.",
-      "- subagent: { task, context?, mode?, tool_budget? } - Spawn a read-only subagent for independent codebase investigation.",
-      "- git_status: { porcelain? } - Show git status.",
-      "- git_diff: { path?, staged?, context? } - Show git diff.",
-      "- run_tests: { command?, timeout_ms? } - Run tests and return parsed summary.",
-      "- todo_write/todowrite: { todos: [{ id?, content, status }] } - Update task tracking; status is pending|in_progress|completed.",
+      "TOOLS:",
+      "- Inspect/search: read_file, read_files, list_files, glob_files, find_files, rg/search_files/grep, git_status, git_diff.",
+      "- Change/validate: edit_file, write_file, replace_in_files, shell, run_tests.",
+      "- Delegate/context: subagent, collaborate, todo_write/todowrite, memory_write/remember, web_search/search_web.",
+      "- Prefer rg for code search; prefer edit_file for existing-file edits; write_file is for new files or explicit rewrites.",
+      "- memory_write scope is project or global; never store secrets.",
+      "- todo status is pending, in_progress, or completed.",
       ...(mcpEnabled
         ? [
             "- list_mcp_servers: {} - List configured MCP servers",
@@ -197,10 +170,8 @@ export function buildSystemPrompt({
           ]
         : []),
 
-      "EXAMPLES:",
-      'Code search: {"type":"tool_use","tool":"rg","input":{"pattern":"functionName\\(","path":"src","glob":"*.js"},"reason":"Find references before editing"}',
-      'Web lookup: {"type":"tool_use","tool":"web_search","input":{"query":"OpenAI latest API model docs","max_results":5},"reason":"Need current external documentation"}',
-      'Subagent: {"type":"tool_use","tool":"subagent","input":{"task":"Inspect how provider selection works","tool_budget":3},"reason":"Delegate independent investigation"}',
+      "EXAMPLE:",
+      '{"type":"tool_use","tool":"rg","input":{"pattern":"functionName\\(","path":"src"},"reason":"Find references before editing"}',
 
       "CRITICAL:",
       "- Your entire response must be valid JSON",
@@ -220,6 +191,8 @@ export function buildSystemPrompt({
   if (activeSkills.length > 0) {
     sections.push(...renderActiveSkillsSection(activeSkills));
   }
+
+  sections.push(...renderMemorySection(memory));
 
   if (activePlan) {
     sections.push(...renderActivePlanSection(activePlan));
@@ -282,6 +255,9 @@ const KNOWN_TOOL_NAMES = new Set([
   "web_search",
   "search_web",
   "subagent",
+  "collaborate",
+  "memory_write",
+  "remember",
   "git_status",
   "git_diff",
   "run_tests",
@@ -968,6 +944,48 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
           },
         },
         required: ["task"],
+      },
+    },
+    {
+      name: "collaborate",
+      description:
+        "Run design, implementation-planning, and review agents with shared context. Use for complex tasks before making changes.",
+      input_schema: {
+        type: "object",
+        properties: {
+          task: { type: "string", description: "Task for the collaborating agents." },
+          context: { type: "string", description: "Optional additional shared context." },
+        },
+        required: ["task"],
+      },
+    },
+    {
+      name: "memory_write",
+      description:
+        "Append durable memory to project (.piecode/MEMORY.md) or global (~/.piecode/MEMORY.md) scope. Use for stable preferences, project conventions, and recurring facts; never store secrets.",
+      input_schema: {
+        type: "object",
+        properties: {
+          scope: {
+            type: "string",
+            enum: ["project", "global"],
+            description: "Memory scope: project for this repository, global for personal user-wide preferences.",
+          },
+          content: { type: "string", description: "Concise durable memory note to append." },
+        },
+        required: ["content"],
+      },
+    },
+    {
+      name: "remember",
+      description: "Alias for memory_write. Append durable project/global memory.",
+      input_schema: {
+        type: "object",
+        properties: {
+          scope: { type: "string", enum: ["project", "global"] },
+          content: { type: "string", description: "Concise durable memory note to append." },
+        },
+        required: ["content"],
       },
     },
     {
