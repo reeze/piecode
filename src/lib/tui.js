@@ -61,6 +61,10 @@ function color(text, code) {
   return `\x1b[${code}m${text}\x1b[0m`;
 }
 
+function stripAnsi(text) {
+  return String(text || "").replace(/\x1b\[[0-9;]*m/g, "");
+}
+
 function renderInlineMarkdown(line) {
   let out = String(line || "");
   out = out.replace(
@@ -83,20 +87,40 @@ function renderMarkdownLines(text) {
   const lines = source.split("\n");
   const out = [];
   let inCode = false;
+  let codeLang = "";
+
   for (const line of lines) {
-    const fence = line.match(/^\s*```/);
+    const fence = line.match(/^\s*```\s*([\w.+-]*)\s*$/);
     if (fence) {
-      inCode = !inCode;
-      out.push(color("```", "2;37"));
+      if (!inCode) {
+        inCode = true;
+        codeLang = String(fence[1] || "").trim();
+        const label = codeLang ? ` ${codeLang} ` : " code ";
+        out.push(color(`${label}${"-".repeat(Math.max(8, 56 - label.length))}`, "2;37"));
+      } else {
+        inCode = false;
+        codeLang = "";
+        out.push(color("-".repeat(56), "2;37"));
+      }
       continue;
     }
     if (inCode) {
-      out.push(color(line, "36"));
+      // Keep code monospace-friendly: no wrapping markers, no Markdown inline parsing.
+      // Cyan foreground works consistently across most terminals without relying on
+      // background colors that can become noisy in full-screen redraws.
+      out.push(color(line || " ", "36"));
       continue;
     }
+
     const header = line.match(/^(#{1,6})\s+(.+)$/);
     if (header) {
-      out.push(color(renderInlineMarkdown(header[2]), "1;36"));
+      const level = header[1].length;
+      const rendered = renderInlineMarkdown(header[2]);
+      out.push(level <= 2 ? color(rendered, "1;36") : color(rendered, "1"));
+      continue;
+    }
+    if (/^\s*([-*_])\s*\1\s*\1[\s\1]*$/.test(line)) {
+      out.push(color("-".repeat(56), "2;37"));
       continue;
     }
     const bullet = line.match(/^(\s*)[-*+]\s+(.+)$/);
@@ -107,6 +131,11 @@ function renderMarkdownLines(text) {
     const ordered = line.match(/^(\s*)(\d+)[.)]\s+(.+)$/);
     if (ordered) {
       out.push(`${ordered[1]}${color(`${ordered[2]}.`, "2;37")} ${renderInlineMarkdown(ordered[3])}`);
+      continue;
+    }
+    const quote = line.match(/^>\s?(.*)$/);
+    if (quote) {
+      out.push(`${color("│", "2;37")} ${color(renderInlineMarkdown(quote[1]), "3;37")}`);
       continue;
     }
     out.push(renderInlineMarkdown(line));
@@ -278,6 +307,8 @@ export class SimpleTui {
     this.commandSuggestionIndex = 0;
     this.commandSuggestionLabel = "commands";
     this.scrollOffset = 0;
+    this.lastScrollMax = 0;
+    this.lastScrollSourceLength = 0;
     this.thoughtStreamText = "";
     this.thoughtStreamVisible = false;
     this.planModeEnabled = false;
@@ -349,26 +380,30 @@ export class SimpleTui {
   }
 
   scrollLines(delta) {
-    const step = Math.max(1, Math.round(Math.abs(Number(delta) || 0)));
-    const direction = Number(delta) < 0 ? -1 : 1;
-    this.scrollOffset = Math.max(0, this.scrollOffset + direction * step);
+    const amount = Number(delta) || 0;
+    const step = Math.max(1, Math.round(Math.abs(amount)));
+    const direction = amount < 0 ? -1 : 1;
+    const max = Math.max(0, Number(this.lastScrollMax) || 0);
+    this.scrollOffset = Math.max(0, Math.min(max, this.scrollOffset + direction * step));
     this.render();
     return this.scrollOffset;
   }
 
   scrollPage(direction = 1) {
     const page = Math.max(3, Math.floor((this.out.rows || 30) * 0.5));
-    return this.scrollLines(direction * page);
+    return this.scrollLines((Number(direction) < 0 ? -1 : 1) * page);
   }
 
   scrollToTop() {
-    this.scrollOffset = 999999;
+    this.scrollOffset = Number.MAX_SAFE_INTEGER;
     this.render();
+    return this.scrollOffset;
   }
 
   scrollToBottom() {
     this.scrollOffset = 0;
     this.render();
+    return this.scrollOffset;
   }
 
   onModelCall(label) {
@@ -480,9 +515,9 @@ export class SimpleTui {
   }
 
   setLiveThought(content) {
-    const text = String(content || "").trim();
+    const text = String(content || "").replace(/\s+/g, " ").trim();
     this.thoughtStreamVisible = Boolean(text);
-    this.thoughtStreamText = text ? `Thought: ${text}` : "";
+    this.thoughtStreamText = text ? `Update: ${text}` : "";
     this.render();
   }
 
@@ -524,8 +559,9 @@ export class SimpleTui {
   }
 
   setContextUsage(used, limit) {
-    const safeUsed = Number.isFinite(used) ? Math.max(0, Math.round(used)) : 0;
     const safeLimit = Number.isFinite(limit) ? Math.max(0, Math.round(limit)) : 0;
+    const rawUsed = Number.isFinite(used) ? Math.max(0, Math.round(used)) : 0;
+    const safeUsed = safeLimit > 0 ? Math.min(rawUsed, safeLimit) : rawUsed;
     this.contextUsed = safeUsed;
     this.contextLimit = safeLimit;
     this.render();
@@ -741,19 +777,29 @@ export class SimpleTui {
   }
 
   buildOverlayLayout(width) {
-    const rawLines = String(this.overlayText || "").replace(/\r/g, "").split("\n");
+    const rawText = String(this.overlayText || "").replace(/\r/g, "");
+    const renderedLines = renderMarkdownLines(rawText);
     const wrapped = [];
     const rawStartOffsets = [];
-    for (const line of rawLines) {
+    let inCode = false;
+    for (const line of renderedLines) {
+      const plain = stripAnsi(line);
+      const codeBoundary = /^\s*(?:[\w.+-]+\s+)?-{8,}\s*$/.test(plain);
+      if (codeBoundary) {
+        inCode = !inCode;
+        rawStartOffsets.push(wrapped.length);
+        wrapped.push(truncateLine(line, width));
+        continue;
+      }
       rawStartOffsets.push(wrapped.length);
-      const chunks = wrapText(line, width);
+      const chunks = inCode ? [truncateLine(line, width)] : wrapText(line, width);
       if (chunks.length === 0) wrapped.push("");
       else wrapped.push(...chunks);
     }
     let requestOffset = 0;
     let responseOffset = Math.max(0, wrapped.length - 1);
-    for (let i = 0; i < rawLines.length; i += 1) {
-      const line = String(rawLines[i] || "").trimStart().toLowerCase();
+    for (let i = 0; i < renderedLines.length; i += 1) {
+      const line = stripAnsi(String(renderedLines[i] || "")).trimStart().toLowerCase();
       if (line.startsWith("request:")) requestOffset = rawStartOffsets[i] || 0;
       if (line.startsWith("response:")) responseOffset = rawStartOffsets[i] || responseOffset;
     }
@@ -920,8 +966,8 @@ export class SimpleTui {
       lines.push(truncateLine(` ${color("Details:", "1;35")} ${detailsText}`, width));
     }
     const choiceLine = this.approvalDefaultYes
-      ? `${color("[Y]", "1;32")}es  ${color("[N]", "1;31")}o  ${color("[ENTER]", "1;33")}=${color("Yes", "32")}`
-      : `${color("[Y]", "1;32")}es  ${color("[N]", "1;31")}o  ${color("[ENTER]", "1;33")}=${color("No", "31")}`;
+      ? `${color("[Y]", "1;32")}once  ${color("[R]", "1;36")}remember  ${color("[A]", "1;33")}all session  ${color("[N]", "1;31")}no  ${color("[ENTER]", "1;33")}=${color("Once", "32")}`
+      : `${color("[Y]", "1;32")}once  ${color("[R]", "1;36")}remember  ${color("[A]", "1;33")}all session  ${color("[N]", "1;31")}no  ${color("[ENTER]", "1;33")}=${color("No", "31")}`;
     lines.push(truncateLine(` ${choiceLine}`, width));
     return lines;
   }
@@ -931,7 +977,8 @@ export class SimpleTui {
       const name = String(tool || "tool");
       const body = String(details || "").trim();
       const clean = body ? body.replace(/^\((.*)\)$/, "$1").trim() : "";
-      const suffix = clean ? ` ${color(clean, "2;37")}` : "";
+      const showDetails = this.showRawLogs || /^\[trace\]|\b(?:path|command|query|regex|find|oldText|newText|content|input)=/i.test(clean);
+      const suffix = clean && showDetails ? ` ${color(clean, "2;37")}` : "";
       switch (name) {
         case "read_file":
           return `${color("Read", "36")}${suffix}`;
@@ -994,8 +1041,8 @@ export class SimpleTui {
       return [];
     }
     if (line.startsWith("[thought] ")) {
-      const details = trimWorkspaceText(line.slice(9).trim(), 1800).text;
-      return padAll([color(`Thought: ${details || "<empty>"}`, "35"), ""]);
+      const details = trimWorkspaceText(line.slice(9).replace(/\s+/g, " ").trim(), 600).text;
+      return padAll([color(`Update: ${details || "<empty>"}`, "35"), ""]);
     }
     if (line.startsWith("[run] shell")) {
       const m = line.match(/command=("[^"]*"|\\S+)/);
@@ -1045,7 +1092,8 @@ export class SimpleTui {
     }
     if (line.startsWith("[tools] ")) {
       const body = line.slice(8).trim();
-      return padAll([`${color("[tools]", "1;36")} ${body}`, ""]);
+      const clean = this.showRawLogs ? body : body.split(" - ")[0].trim();
+      return padAll([`${color("[tools]", "1;36")} ${clean}`, ""]);
     }
     if (line.startsWith("[response] ")) {
       const text = trimWorkspaceText(line.slice(11).trim(), 8000).text;
@@ -1118,6 +1166,15 @@ export class SimpleTui {
     }
     if (line.startsWith("loaded project instructions:")) {
       return padAll([color(line, "2;37")]);
+    }
+    if (/^(#{1,6})\s+/.test(line)) {
+      return padAll(renderMarkdownLines(line));
+    }
+    if (/^\s*(?:[-*+]\s+|\d+[.)]\s+|>\s?)/.test(line)) {
+      return padAll(renderMarkdownLines(line));
+    }
+    if (/(`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|\[[^\]]+\]\([^)]+\))/.test(line)) {
+      return padAll(renderMarkdownLines(line));
     }
     if (line.startsWith("error:")) {
       return padAll([color(line, "31")]);
@@ -1373,10 +1430,19 @@ export class SimpleTui {
     const viewportLogBudget = Math.max(1, height - reservedLines);
     const maxLogLines = Math.max(1, Math.min(Math.max(1, sourceLines.length || 1), viewportLogBudget));
     const maxScroll = Math.max(0, sourceLines.length - maxLogLines);
+    this.lastScrollMax = maxScroll;
+    this.lastScrollSourceLength = sourceLines.length;
     this.scrollOffset = Math.min(Math.max(0, this.scrollOffset), maxScroll);
     const start = Math.max(0, sourceLines.length - maxLogLines - this.scrollOffset);
     const visibleLogs = sourceLines.slice(start, start + maxLogLines);
-    const scrollLabel = this.scrollOffset > 0 ? ` | scroll:+${this.scrollOffset}` : "";
+    const visibleStart = sourceLines.length === 0 ? 0 : start + 1;
+    const visibleEnd = Math.min(sourceLines.length, start + visibleLogs.length);
+    const viewName = this.showRawLogs ? "raw" : "timeline";
+    const scrollLabel = this.scrollOffset > 0
+      ? ` | ${viewName}:${visibleStart}-${visibleEnd}/${sourceLines.length}`
+      : sourceLines.length > maxLogLines
+        ? ` | ${viewName}:bottom ${visibleEnd}/${sourceLines.length}`
+        : "";
     const ctxStatus =
       this.contextLimit > 0
         ? ` | ctx:${formatCompactNumber(this.contextUsed)}/${formatCompactNumber(this.contextLimit)}(${Math.min(999, Math.round((this.contextUsed / this.contextLimit) * 100))}%)`
@@ -1388,7 +1454,8 @@ export class SimpleTui {
     const todoDone = this.todos.filter((t) => String(t?.status || "").toLowerCase() === "completed").length;
     const todoStatus = this.todos.length > 0 ? ` | TODO(${todoDone}/${this.todos.length})` : "";
     const planStatus = this.planModeEnabled ? " | plan:on" : "";
-    const promptStatusRaw = `status: ${this.lastStatus || "idle"}${planStatus}${ctxStatus}${tokStatus}${todoStatus}${scrollLabel}`;
+    const scrollHint = this.scrollOffset > 0 ? " | PgDn/End:bottom" : (this.lastScrollMax > 0 ? " | PgUp/↑:history" : "");
+    const promptStatusRaw = `status: ${this.lastStatus || "idle"}${planStatus}${ctxStatus}${tokStatus}${todoStatus}${scrollLabel}${scrollHint}`;
     const bashMode = /^\s*!/.test(this.currentInput) ? " | mode:bash" : "";
     const leftStatusLabel = this.formatTransientStatusLabel() || this.formatProjectInstructionsLabel();
     let promptStatus = "";

@@ -15,10 +15,12 @@ import {
   addSkillByName,
   autoEnableSkills,
   autoLoadSkillsFromInstructions,
+  discoverSkillCommands,
   discoverSkills,
   loadActiveSkills,
   removeSkillByName,
   resolveRequestedSkills,
+  resolveSkillCommand,
   resolveSkillRoots,
 } from "./lib/skills.js";
 import { createSkillInteractive } from "./lib/skillCreator.js";
@@ -27,6 +29,7 @@ import { Display } from "./lib/display.js";
 import { consumeMouseWheelDeltas, stripMouseInputNoise } from "./lib/mouse.js";
 import { TuiLineEditor } from "./lib/tuiLineEditor.js";
 import { McpHub, mergeCommonMcpServers, resolveMcpServerConfigs } from "./lib/mcp.js";
+import { AgentSessionState, SessionEventBus, createJsonlSessionSink } from "./lib/sessionProtocol.js";
 import { classifyShellCommand } from "./lib/tools.js";
 import { applyFileMentionSelection, getFileMentionSuggestions, isGitRelatedPath } from "./lib/fileMentions.js";
 
@@ -55,6 +58,7 @@ const SLASH_COMMANDS = [
   "/mcp import",
   "/skills",
   "/skills list",
+  "/skills commands",
   "/skills use",
   "/skills off",
   "/skills clear",
@@ -208,7 +212,10 @@ async function ensureSessionStoreDir(workspaceDir, sessionId) {
   return root;
 }
 
-function startTaskTrace(taskTraceRef, { input, kind }) {
+function startTaskTrace(taskTraceRef, { input, kind, sessionBus = null }) {
+  if (sessionBus && typeof sessionBus.emit === "function") {
+    sessionBus.emit("task.start", { input: String(input || ""), kind: String(kind || "task") });
+  }
   taskTraceRef.seq += 1;
   const id = `turn-${String(taskTraceRef.seq).padStart(3, "0")}`;
   const nowIso = new Date().toISOString();
@@ -265,7 +272,11 @@ function recordTaskLlm(taskTraceRef, entry) {
   });
 }
 
-async function finishTaskTrace(taskTraceRef, workspaceDir, { status = "done", error = "" } = {}) {
+async function finishTaskTrace(taskTraceRef, workspaceDir, { status = "done", error = "", sessionBus = null } = {}) {
+  if (sessionBus && typeof sessionBus.emit === "function") {
+    const doneType = String(status || "done") === "done" ? "task.done" : "task.error";
+    sessionBus.emit(doneType, { status: String(status || "done"), error: String(error || "") });
+  }
   const current = taskTraceRef?.current;
   if (!current) return null;
   current.finishedAt = new Date().toISOString();
@@ -481,6 +492,7 @@ Environment:
   MCP via settings       Configure mcpServers in ~/.piecode/settings.json (overrides imported configs)
   PIECODE_SKILLS_DIR Optional (comma-separated skill root directories)
   PIECODE_HISTORY_FILE Optional (default ~/.piecode_history)
+  PIECODE_SESSION_EVENTS_FILE Optional JSONL event stream for GUI/remote integrations
 
 Auth fallback order:
   1) Command line arguments --provider/--api-key/--model
@@ -513,6 +525,8 @@ Slash commands in interactive mode:
   /mcp import on|off   Toggle shared MCP config import
   /skills              Show active skills
   /skills list         List discovered skills
+  /skills commands     List slash commands exposed by skills
+  /<skill-command>     Invoke a skill as a custom command
   /skills use <name>   Enable a skill
   /skills off <name>   Disable a skill
   /skills clear        Disable all skills
@@ -535,6 +549,8 @@ Slash commands in interactive mode:
 
 Skill invocation:
   Mention $skill-name in a prompt to auto-enable that skill.
+  Skills are also invokable as slash commands, e.g. /openspec <request>.
+  Skill frontmatter may define command, aliases, or commands for extra command names.
 `);
 }
 
@@ -834,9 +850,12 @@ async function createNeoBlessedKeypressSource({ input, output }) {
   };
 }
 
-function createLogger(tui, display, getInput = () => "", onLogLine = null) {
+function createLogger(tui, display, getInput = () => "", onLogLine = null, sessionBus = null) {
   return (line) => {
     if (typeof onLogLine === "function") onLogLine(line);
+    if (sessionBus && typeof sessionBus.emit === "function") {
+      sessionBus.emit("log.line", { line: String(line || "") });
+    }
     if (tui) {
       tui.event(line);
       tui.render(getInput());
@@ -1166,37 +1185,45 @@ function extractThoughtContentFromPartialJson(raw) {
   return out.trim();
 }
 
+function formatStageUpdate(text, maxLen = 220) {
+  const source = String(text || "")
+    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/`([^`]+)`/g, "$1")
+    .replace(/\*\*([^*]+)\*\*/g, "$1")
+    .replace(/__([^_]+)__/g, "$1")
+    .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
+    .replace(/^\s*[-*+]\s+/gm, "")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!source) return "";
+  return source.length > maxLen ? `${source.slice(0, maxLen - 3)}...` : source;
+}
+
 function extractReadableThinkingPreview(raw) {
   const source = String(raw || "");
   const thought = extractThoughtContentFromPartialJson(source);
-  if (thought) {
-    const cleanedThought = sanitizeThinkingChunk(thought);
-    if (cleanedThought) return cleanedThought;
-  }
+  if (thought) return formatStageUpdate(sanitizeThinkingChunk(thought));
 
   const compact = source.replace(/\s+/g, " ").trim();
   if (!compact) return "";
 
   const reasonMatch = compact.match(
-    /"(reason|analysis|summary|thought|rationale)"\s*:\s*"((?:[^"\\]|\\.)*)"/i
+    /"(reason|summary|rationale)"\s*:\s*"((?:[^"\\]|\\.)*)"/i
   );
   if (reasonMatch?.[2]) {
-    return reasonMatch[2]
-      .replace(/\\n/g, "\n")
-      .replace(/\\t/g, "\t")
-      .replace(/\\"/g, '"')
-      .trim();
+    return formatStageUpdate(
+      reasonMatch[2]
+        .replace(/\\n/g, "\n")
+        .replace(/\\t/g, "\t")
+        .replace(/\\"/g, '"')
+    );
   }
 
   const toolMatch = compact.match(/"tool"\s*:\s*"([^"\\]+)"/i);
-  if (toolMatch?.[1]) {
-    return `Preparing tool: ${toolMatch[1]}`;
-  }
+  if (toolMatch?.[1]) return `Preparing tool: ${toolMatch[1]}`;
 
-  // If output is raw JSON/tool schema and we cannot extract a readable field yet, avoid noise.
-  if (compact.startsWith("{") || compact.startsWith("[")) return "";
-
-  return sanitizeThinkingChunk(compact);
+  // Do not expose raw chain-of-thought or partial JSON/tool streams in the user UI.
+  return "";
 }
 
 function extractJsonObject(raw) {
@@ -1619,17 +1646,27 @@ async function waitForTuiApproval({ stdinStream, defaultYes }) {
       if (!key) return;
       if (key.name === "return" || key.name === "enter") {
         stdinStream.off("keypress", handler);
-        resolve(Boolean(defaultYes));
+        resolve(defaultYes ? "allow_once" : "deny");
         return;
       }
       if (key.name === "y") {
         stdinStream.off("keypress", handler);
-        resolve(true);
+        resolve("allow_once");
+        return;
+      }
+      if (key.name === "r") {
+        stdinStream.off("keypress", handler);
+        resolve("remember_command");
+        return;
+      }
+      if (key.name === "a") {
+        stdinStream.off("keypress", handler);
+        resolve("allow_all_session");
         return;
       }
       if (key.name === "n") {
         stdinStream.off("keypress", handler);
-        resolve(false);
+        resolve("deny");
       }
     };
     stdinStream.on("keypress", handler);
@@ -1700,8 +1737,27 @@ function printSkillList(skillIndex, logLine) {
     return;
   }
   logLine("## Skills");
+  const commandIndex = discoverSkillCommands(skillIndex);
   for (const skill of skills) {
-    logLine(`- **${skill.name}**${skill.description ? `: ${skill.description}` : ""}`);
+    const commands = [...commandIndex.values()]
+      .filter((command) => command.skillName === skill.name)
+      .map((command) => command.slash)
+      .sort((a, b) => a.localeCompare(b));
+    const commandText = commands.length > 0 ? ` (commands: ${commands.join(", ")})` : "";
+    logLine(`- **${skill.name}**${skill.description ? `: ${skill.description}` : ""}${commandText}`);
+  }
+}
+
+function printSkillCommandList(skillIndex, logLine) {
+  const commands = [...discoverSkillCommands(skillIndex).values()].sort((a, b) => a.name.localeCompare(b.name));
+  if (commands.length === 0) {
+    logLine("no skill commands discovered");
+    return;
+  }
+  logLine("## Skill Commands");
+  for (const command of commands) {
+    const description = command.description ? `: ${command.description}` : "";
+    logLine(`- **${command.slash}** -> ${command.skillName}${description}`);
   }
 }
 
@@ -1789,6 +1845,9 @@ function createCompleter(getSkillIndex, getModelCatalog = null, getMcpServerName
     const mcpNames = Array.isArray(mcpNamesRaw)
       ? mcpNamesRaw.map((name) => String(name || "").trim()).filter(Boolean).sort((a, b) => a.localeCompare(b))
       : [];
+    const skillCommandNames = [...discoverSkillCommands(skillIndex).values()]
+      .map((command) => command.slash)
+      .sort((a, b) => a.localeCompare(b));
     const tryComplete = (candidates, fragment) => {
       const hits = candidates.filter((item) => item.startsWith(fragment));
       callback(null, [hits.length ? hits : candidates, fragment]);
@@ -1855,7 +1914,7 @@ function createCompleter(getSkillIndex, getModelCatalog = null, getMcpServerName
       return;
     }
 
-    tryComplete(SLASH_COMMANDS, trimmed);
+    tryComplete([...SLASH_COMMANDS, ...skillCommandNames], trimmed);
   };
 }
 
@@ -1951,6 +2010,9 @@ function getSuggestionsForInput(line, getSkillIndex, getModelCatalog = null, get
   const mcpNames = Array.isArray(mcpNamesRaw)
     ? mcpNamesRaw.map((name) => String(name || "").trim()).filter(Boolean).sort((a, b) => a.localeCompare(b))
     : [];
+  const skillCommandNames = [...discoverSkillCommands(skillIndex).values()]
+    .map((command) => command.slash)
+    .sort((a, b) => a.localeCompare(b));
 
   const filterByPrefix = (candidates, fragment) => {
     const hits = candidates.filter((item) => item.startsWith(fragment));
@@ -2008,7 +2070,7 @@ function getSuggestionsForInput(line, getSkillIndex, getModelCatalog = null, get
     return filterByPrefix(candidates, fragment);
   }
 
-  return filterByPrefix(SLASH_COMMANDS, trimmed);
+  return filterByPrefix([...SLASH_COMMANDS, ...skillCommandNames], trimmed);
 }
 
 async function collectWorkspaceFilesForMentions(workspaceDir, maxEntries = FILE_MENTION_INDEX_MAX) {
@@ -2183,6 +2245,8 @@ async function handleSlashCommand(input, ctx) {
     modelContextMetadataRef,
     llmLastRef,
     llmHistoryRef,
+    sessionBus,
+    refreshTuiContextUsage,
   } = ctx;
 
   const raw = String(input || "").trim();
@@ -2305,6 +2369,7 @@ async function handleSlashCommand(input, ctx) {
         "/mcp import on|off",
         "/skills",
         "/skills list",
+        "/skills commands",
         "/skills use <name>",
         "/skills off <name>",
         "/skills clear",
@@ -2321,6 +2386,7 @@ async function handleSlashCommand(input, ctx) {
     agent.clearHistory();
     if (ctx.todosRef) {
       ctx.todosRef.value = [];
+      ctx.sessionBus?.emit?.("todos.update", { todos: [] });
       if (ctx.tui) ctx.tui.setTodos([]);
     }
     if (ctx.todoAutoTrackRef) ctx.todoAutoTrackRef.value = false;
@@ -2337,6 +2403,7 @@ async function handleSlashCommand(input, ctx) {
       logLine(`compact skipped: ${result.summary}`);
       return { done: false, handled: true };
     }
+    refreshTuiContextUsage?.();
     logLine(
       `context compacted: ${result.beforeMessages} -> ${result.afterMessages} messages (removed ${result.removedMessages})`
     );
@@ -2482,16 +2549,15 @@ async function handleSlashCommand(input, ctx) {
       } else if (nextProviderName === "openrouter") {
         await loadOpenRouterContextMetadata({ force: false, logErrors: false });
       }
+      const nextContextLimit = resolveContextWindow({
+        modelName: nextProvider?.model,
+        providerName: providerPrefix(nextProvider?.kind),
+        settings,
+        dynamicByModel: modelContextWindowsRef?.value,
+      });
+      if (ctx.agent?.contextWindowRef) ctx.agent.contextWindowRef.value = nextContextLimit;
       if (tui) {
-        tui.setContextUsage(
-          0,
-          resolveContextWindow({
-            modelName: nextProvider?.model,
-            providerName: providerPrefix(nextProvider?.kind),
-            settings,
-            dynamicByModel: modelContextWindowsRef?.value,
-          })
-        );
+        tui.setContextUsage(0, nextContextLimit);
       }
       if (tui && typeof setStatusBar === "function") {
         setStatusBar(formatModelStatus(nextProvider, "model switched"));
@@ -2704,6 +2770,10 @@ async function handleSlashCommand(input, ctx) {
     printSkillList(skillIndex, logLine);
     return { done: false, handled: true };
   }
+  if (lower === "/skills commands") {
+    printSkillCommandList(skillIndex, logLine);
+    return { done: false, handled: true };
+  }
   if (lower === "/skills clear") {
     activeSkillsRef.value = [];
     logLine("all skills disabled");
@@ -2742,6 +2812,25 @@ async function handleSlashCommand(input, ctx) {
     if (tui) tui.setRawLogsVisible(false);
     logLine("workspace timeline view");
     return { done: false, handled: true };
+  }
+
+  const skillCommand = resolveSkillCommand(raw, skillIndex);
+  if (skillCommand) {
+    const result = await addSkillByName(activeSkillsRef.value, skillIndex, skillCommand.skillName);
+    if (result.added) {
+      activeSkillsRef.value = result.active;
+      logLine(`enabled skill for command ${skillCommand.slash}: ${skillCommand.skillName}`);
+    } else if (result.reason === "not-found" || result.reason === "unreadable") {
+      logLine(`skill command unavailable: ${skillCommand.slash} (${result.reason})`);
+      return { done: false, handled: true };
+    }
+    ctx.commandRunRef = ctx.commandRunRef || { value: null };
+    ctx.commandRunRef.value = {
+      input: skillCommand.prompt,
+      displayName: skillCommand.slash,
+      skillName: skillCommand.skillName,
+    };
+    return { done: false, handled: false, commandRun: ctx.commandRunRef.value };
   }
 
   if (raw.startsWith("/")) {
@@ -3256,6 +3345,7 @@ async function main() {
 
   const providerOptionsRef = { value: resolveProviderOptions(args, settings) };
   const providerRef = { value: getProvider(providerOptionsRef.value) };
+  const contextWindowRef = { value: 0 };
   const projectInstructionsLoaded = await loadProjectInstructions(workspaceDir);
   const projectInstructionsRef = { value: projectInstructionsLoaded.instructions };
   const projectInstructionsStatusRef = { value: projectInstructionsLoaded.status };
@@ -3265,6 +3355,7 @@ async function main() {
     skillIndex
   );
   const autoApproveRef = { value: false };
+  const shellPermissionRef = { value: { allowAllSession: false, rememberedCommands: new Set() } };
   const oneShotPromptMode = args.prompt !== null;
   if (oneShotPromptMode) {
     // One-shot mode has no interactive approval channel; auto-approve tool prompts.
@@ -3291,6 +3382,11 @@ async function main() {
     value: { active: false, tools: [], filesChanged: new Set(), beforeGitSet: null },
   };
   const taskTraceRef = { seq: 0, current: null, sessionId: makeSessionId(), sessionDir: "" };
+  const sessionBus = new SessionEventBus({ sessionId: taskTraceRef.sessionId });
+  const sessionState = new AgentSessionState({ sessionId: taskTraceRef.sessionId });
+  sessionBus.subscribe((event) => sessionState.apply(event));
+  const sessionSink = createJsonlSessionSink(process.env.PIECODE_SESSION_EVENTS_FILE || "");
+  if (sessionSink) sessionBus.subscribe(sessionSink);
   const currentInputRef = { value: "" };
   const keepIdleStatusRef = { value: false };
   const todosRef = { value: [] };
@@ -3303,6 +3399,7 @@ async function main() {
   const modelPickerRef = { active: false, query: "", options: [], index: 0 };
   const commandPickerRef = { active: false, mode: "command", options: [], index: 0 };
   const mcpHubRef = { value: null };
+  const commandRunRef = { value: null };
   const getMcpServerNamesForSuggestions = () => {
     const names = new Set([...getLocalMcpServerKeySet(settings)]);
     if (mcpHubRef.value && typeof mcpHubRef.value.hasServers === "function" && mcpHubRef.value.hasServers()) {
@@ -3360,6 +3457,15 @@ async function main() {
           const enterLike = name === "return" || name === "enter" || str === "\r" || str === "\n";
           if ((modelPickerRef.active || commandPickerRef.active) && (tabLike || navLike || enterLike)) {
             return false;
+          }
+          if (!key?.ctrl && !key?.meta && !key?.shift && (name === "up" || name === "down")) {
+            const currentLine = stripMouseInputNoise(String(rl?.line || ""));
+            if (currentLine.trim().length === 0) return false;
+          }
+          if (name === "pageup" || name === "pagedown") return false;
+          if (!key?.ctrl && !key?.meta && !key?.shift && (name === "home" || name === "end")) {
+            const currentLine = stripMouseInputNoise(String(rl?.line || ""));
+            if (currentLine.trim().length === 0) return false;
           }
           return true;
         },
@@ -3440,6 +3546,7 @@ async function main() {
       settings,
       dynamicByModel: modelContextWindowsRef.value,
     });
+  contextWindowRef.value = resolveProviderContextLimit(providerRef.value);
   const getPendingRequestTokenTotal = () => {
     let total = 0;
     for (const value of llmPendingRequestTokensRef.value.values()) {
@@ -3466,15 +3573,18 @@ async function main() {
     llmPendingRequestTokensRef.value.clear();
   };
   const refreshTuiContextUsage = () => {
+    const limit = resolveProviderContextLimit();
+    contextWindowRef.value = limit;
     if (!tui) return;
-    const turnUsage = tui.getTurnTokenUsage();
     const pending = getPendingRequestTokenTotal();
-    const used = Math.max(0, Math.round((turnUsage.sent || 0) + (turnUsage.received || 0) + pending));
-    tui.setContextUsage(used, resolveProviderContextLimit());
+    const historyTokens = typeof agent?.estimateMessagesTokens === "function" ? agent.estimateMessagesTokens(agent.history) : 0;
+    const used = Math.max(0, Math.round(historyTokens + pending));
+    tui.setContextUsage(used, limit);
   };
 
   const logLine = createLogger(tui, display, () => currentInputRef.value, (line) =>
-    recordTaskLog(taskTraceRef, line)
+    recordTaskLog(taskTraceRef, line),
+    sessionBus
   );
   const setStatusBar = (message) => {
     if (!tui) return;
@@ -4094,17 +4204,16 @@ async function main() {
       [],
       collectModelsFromSettings(settings)
     );
+    const nextContextLimit = resolveContextWindow({
+      modelName: nextProvider?.model,
+      providerName: providerPrefix(nextProvider?.kind),
+      settings,
+      dynamicByModel: modelContextWindowsRef.value,
+    });
+    contextWindowRef.value = nextContextLimit;
     if (tui) {
       tui.onModelCall(formatProviderModel(nextProvider));
-      tui.setContextUsage(
-        0,
-        resolveContextWindow({
-          modelName: nextProvider?.model,
-          providerName: providerPrefix(nextProvider?.kind),
-          settings,
-          dynamicByModel: modelContextWindowsRef.value,
-        })
-      );
+      tui.setContextUsage(0, nextContextLimit);
       tui.onThinkingDone();
     }
     return nextProvider;
@@ -4114,7 +4223,7 @@ async function main() {
     let approvalMeta = null;
     if (q === "shell" && details && typeof details === "object") {
       const classificationLevel = String(details?.classification?.level || "unclassified");
-      if (classificationLevel === "safe") return true;
+      if (classificationLevel === "safe") return "allow_once";
       const reason = String(details?.classification?.reason || "");
       const cmdPreview = summarizeForLog(String(details?.command || ""), 220);
       q = `shell: ${cmdPreview}${reason ? ` (${reason})` : ""}`;
@@ -4135,7 +4244,7 @@ async function main() {
           ? `[approve] auto-approved ${q} (non-interactive mode)`
           : `[approve] denied ${q} (non-interactive mode)`
       );
-      return approved;
+      return approved ? "allow_once" : "deny";
     }
     if (tui) {
       const compactPrompt = q.replace(/\s+/g, " ").trim();
@@ -4147,11 +4256,15 @@ async function main() {
       tui.render(currentInputRef.value, "approval handled");
       return approved;
     } else {
-      ans = (await rl.question(q)).trim().toLowerCase();
+      const prompt = `${q}\nApprove? [y] once, [r] remember command for session, [a] allow all for session, [n] no: `;
+      ans = (await rl.question(prompt)).trim().toLowerCase();
       if (rl.history?.[0] === ans) rl.history.shift();
     }
-    if (!ans && defaultYes) return true;
-    return ans === "y" || ans === "yes";
+    if (!ans && defaultYes) return "allow_once";
+    if (ans === "y" || ans === "yes") return "allow_once";
+    if (ans === "r" || ans === "remember") return "remember_command";
+    if (ans === "a" || ans === "all" || ans === "always") return "allow_all_session";
+    return "deny";
   };
 
   const logMcpConfiguredServers = (hub) => {
@@ -4183,12 +4296,18 @@ async function main() {
     projectInstructionsRef,
     mcpHub: mcpHubRef.value,
     webSearch: settings?.webSearch || settings?.tools?.web?.search || null,
+    contextWindowRef,
+    shellPermissionRef,
     onTodoWrite: (nextTodos) => {
       todosRef.value = normalizeTodos(nextTodos);
       todoAutoTrackRef.value = false;
+      sessionBus.emit("todos.update", { todos: todosRef.value });
       if (tui) tui.setTodos(todosRef.value);
     },
     onEvent: (evt) => {
+      if (evt && typeof evt === "object") {
+        sessionBus.emit(`agent.${String(evt.type || "event")}`, evt);
+      }
       if (evt.type === "model_call") {
         recordTaskEvent(taskTraceRef, evt);
         const label = formatProviderModel({ kind: evt.provider, model: evt.model });
@@ -4232,6 +4351,16 @@ async function main() {
       if (evt.type === "plan_progress") {
         recordTaskEvent(taskTraceRef, evt);
         logLine(`[plan] ${evt.message}`);
+      }
+      if (evt.type === "context_compacted") {
+        recordTaskEvent(taskTraceRef, evt);
+        if (tui) refreshTuiContextUsage();
+        const before = formatCompactNumber(evt.beforeTokens || 0);
+        const after = formatCompactNumber(evt.afterTokens || 0);
+        const limit = evt.limit ? `/${formatCompactNumber(evt.limit)}` : "";
+        logLine(
+          `[context] auto compacted: ${evt.beforeMessages} -> ${evt.afterMessages} messages | tok ${before} -> ${after}${limit}`
+        );
       }
       if (evt.type === "llm_request") {
         recordTaskEvent(taskTraceRef, evt);
@@ -4301,14 +4430,9 @@ async function main() {
         if (llmStreamRef.value && Object.prototype.hasOwnProperty.call(llmStreamRef.value, evt.stage)) {
           llmStreamRef.value[evt.stage] += String(evt.delta || "");
         }
-        if (tui && evt.stage === "turn") {
-          const preview =
-            extractReadableThinkingPreview(llmStreamRef.value.turn) ||
-            extractReadableThinkingPreview(evt.delta);
-          if (preview) {
-            tui.setLiveThought(preview);
-          }
-        }
+        // Keep streamed model internals out of the user timeline. The UI shows
+        // coarse phase/tool status instead, and explicit thought/tool reasons are
+        // surfaced as short stage updates below.
       }
       if (evt.type === "llm_response") {
         recordTaskEvent(taskTraceRef, evt);
@@ -4364,12 +4488,8 @@ async function main() {
           llmStreamRef.value[evt.stage] = String(evt.payload || "");
         }
         if (tui && evt.stage === "turn") {
-          const preview =
-            extractThinkingFromFinalModelPayload(llmStreamRef.value.turn) ||
-            extractReadableThinkingPreview(llmStreamRef.value.turn);
-          if (preview) {
-            tui.setLiveThought(preview);
-          }
+          const preview = extractThinkingFromFinalModelPayload(llmStreamRef.value.turn);
+          if (preview) tui.setLiveThought(formatStageUpdate(preview));
         }
         const pendingSent = consumePendingRequestTokens(evt.stage);
         let sentTokens = normalizedUsage?.input_tokens ?? null;
@@ -4395,14 +4515,17 @@ async function main() {
       }
       if (evt.type === "thought") {
         recordTaskEvent(taskTraceRef, evt);
-        if (tui) tui.clearLiveThought();
-        if (display) display.onThought(evt.content);
-        logLine(`[thought] ${evt.content}`);
+        const update = formatStageUpdate(evt.content);
+        if (tui && update) tui.setLiveThought(update);
+        if (display && update) display.onThought(update);
+        if (update) logLine(`[thought] ${update}`);
       }
       if (evt.type === "tool_batch_start") {
         recordTaskEvent(taskTraceRef, evt);
         if (display) display.onToolBatchUse(evt.calls);
-        logLine(`[tools] ${formatToolBatchSummary(evt.calls)}`);
+        const calls = Array.isArray(evt.calls) ? evt.calls : [];
+        const label = traceRef.value || verboseToolLogs ? formatToolBatchSummary(calls) : formatToolCounts(calls.map((call) => call?.tool));
+        logLine(`[tools] ${label || "tools"}`);
       }
       if (evt.type === "tool_use") {
         recordTaskEvent(taskTraceRef, evt);
@@ -4425,7 +4548,8 @@ async function main() {
         }
         if (tui) tui.onToolUse(evt.tool);
         if (tui && evt.reason) {
-          tui.setLiveThought(String(evt.reason));
+          const update = formatStageUpdate(evt.reason);
+          if (update) tui.setLiveThought(update);
         }
         if (display && !evt.parallel) display.onToolUse(evt.tool, evt.input, evt.reason);
         const summary = formatToolInputSummary(evt.tool, evt.input, 100);
@@ -4433,7 +4557,7 @@ async function main() {
           // keep todo activity in status bar only
         } else if (evt.parallel) {
           // batch header already logged by tool_batch_start
-        } else if (verboseToolLogs) {
+        } else if (traceRef.value || verboseToolLogs) {
           const details = Object.entries(evt.input || {})
             .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
             .join(" ");
@@ -4441,9 +4565,7 @@ async function main() {
             `[tool] ${evt.tool}${evt.reason ? ` - ${summarizeForLog(evt.reason, 120)}` : ""}${details ? ` (${details})` : ""}`
           );
         } else {
-          const reason = evt.reason ? ` - ${summarizeForLog(evt.reason, 120)}` : "";
-          const inputSummary = summary ? ` (${summary})` : "";
-          logLine(`[tool] ${evt.tool}${reason}${inputSummary}`);
+          logLine(`[tool] ${evt.tool}`);
         }
       }
       if (evt.type === "tool_start") {
@@ -4453,19 +4575,19 @@ async function main() {
           logLine(`[trace] tool_start name=${evt.tool}`);
         }
         if (display) display.onToolStart(evt.tool, evt.input);
-        if (verboseToolLogs) {
+        if (traceRef.value || verboseToolLogs) {
           const details = Object.entries(evt.input || {})
             .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
             .join(" ");
           logLine(`[run] ${evt.tool}${details ? ` ${details}` : ""}`);
         } else {
-          const summary = formatToolInputSummary(evt.tool, evt.input, 120);
-          logLine(`[run] ${evt.tool}${summary ? ` ${summary}` : ""}`);
+          logLine(`[run] ${evt.tool}`);
         }
         if (todoAutoTrackRef.value && evt.tool !== "todo_write" && evt.tool !== "todowrite") {
           const advanced = advanceTodosOnToolStart(todosRef.value);
           if (advanced.length > 0) {
             todosRef.value = advanced;
+            sessionBus.emit("todos.update", { todos: todosRef.value });
             if (tui) tui.setTodos(todosRef.value);
           }
         }
@@ -4539,10 +4661,10 @@ async function main() {
 
   if (args.prompt !== null) {
     try {
-      startTaskTrace(taskTraceRef, { input: args.prompt, kind: "agent" });
+      startTaskTrace(taskTraceRef, { sessionBus, input: args.prompt, kind: "agent" });
       const localInfo = maybeHandleLocalInfoTask(args.prompt, { logLine, tui, display, mcpHub: mcpHubRef.value });
       if (localInfo.handled) {
-        const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done" });
+        const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done", sessionBus });
         if (saved) console.log(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
         return;
       }
@@ -4568,12 +4690,13 @@ async function main() {
         } else {
           console.log(`\n${output}`);
         }
-        const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done" });
+        const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done", sessionBus });
         if (saved) console.log(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
       } catch (err) {
         const saved = await finishTaskTrace(taskTraceRef, workspaceDir, {
           status: "error",
           error: String(err?.message || "error"),
+          sessionBus,
         });
         if (saved) console.error(`session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
         throw err;
@@ -4589,7 +4712,8 @@ async function main() {
 
   if (tui) {
     tui.start();
-    tui.setContextUsage(0, resolveProviderContextLimit(providerRef.value));
+    contextWindowRef.value = resolveProviderContextLimit(providerRef.value);
+    tui.setContextUsage(0, contextWindowRef.value);
     emitStartupLogo(tui, providerRef.value, workspaceDir, stdout.columns || 100);
     if (activeSkillsRef.value.length > 0) {
       tui.event(`skills: ${activeSkillsRef.value.map((s) => s.name).join(", ")}`);
@@ -4719,7 +4843,7 @@ async function main() {
           continue;
         }
       }
-      startTaskTrace(taskTraceRef, { input: finalInput, kind: "shell" });
+      startTaskTrace(taskTraceRef, { sessionBus, input: finalInput, kind: "shell" });
       currentInputRef.value = "";
       if (tui) tui.setProjectInstructionsVisible(false);
       if (tui) tui.render(currentInputRef.value, "running shell command");
@@ -4732,13 +4856,14 @@ async function main() {
       const saved = await finishTaskTrace(taskTraceRef, workspaceDir, {
         status: shellResult?.ok ? "done" : "error",
         error: shellResult?.ok ? "" : String(shellResult?.error || ""),
+        sessionBus,
       });
       if (saved) logLine(`[trace] session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
       continue;
     }
     const isSlash = finalInput.startsWith("/");
     if (!isSlash) {
-      startTaskTrace(taskTraceRef, { input: finalInput, kind: "agent" });
+      startTaskTrace(taskTraceRef, { sessionBus, input: finalInput, kind: "agent" });
       logLine(`[task] ${finalInput}`);
       if (tui) tui.setProjectInstructionsVisible(false);
     }
@@ -4788,6 +4913,9 @@ async function main() {
       todoAutoTrackRef,
       llmLastRef,
       llmHistoryRef,
+      sessionBus,
+      refreshTuiContextUsage,
+      commandRunRef,
     });
     if (slash.done) break;
     if (slash.handled) {
@@ -4796,22 +4924,31 @@ async function main() {
       continue;
     }
 
-    const localTask = maybeHandleLocalInfoTask(finalInput, { logLine, tui, display, mcpHub: mcpHubRef.value });
+    const commandRun = commandRunRef.value;
+    commandRunRef.value = null;
+    const agentInput = commandRun?.input || finalInput;
+    if (commandRun) {
+      startTaskTrace(taskTraceRef, { sessionBus, input: finalInput, kind: "agent" });
+      logLine(`[task] ${commandRun.displayName} ${commandRun.skillName ? `(${commandRun.skillName})` : ""}`.trim());
+      if (tui) tui.setProjectInstructionsVisible(false);
+    }
+
+    const localTask = maybeHandleLocalInfoTask(agentInput, { logLine, tui, display, mcpHub: mcpHubRef.value });
     if (localTask.handled) {
-      const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done" });
+      const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done", sessionBus });
       if (saved) logLine(`[trace] session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
       if (display) display.clearSuggestions();
       currentInputRef.value = "";
       continue;
     }
 
-    await maybeAutoEnableSkills(finalInput, activeSkillsRef, skillIndex, logLine);
+    await maybeAutoEnableSkills(agentInput, activeSkillsRef, skillIndex, logLine);
     taskRunningRef.value = true;
     try {
       clearPendingRequestTokens();
       const turnResult = await runAgentTurn(
         agent,
-        finalInput,
+        agentInput,
         tui,
         logLine,
         display,
@@ -4822,6 +4959,7 @@ async function main() {
       const saved = await finishTaskTrace(taskTraceRef, workspaceDir, {
         status: turnResult?.ok ? "done" : turnResult?.aborted ? "aborted" : "error",
         error: turnResult?.ok ? "" : String(turnResult?.error || ""),
+        sessionBus,
       });
       if (saved) logLine(`[trace] session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
     } finally {
@@ -4845,6 +4983,7 @@ async function main() {
       const advancedAfterTurn = advanceTodosOnTurnDone(todosRef.value);
       if (advancedAfterTurn.length > 0) {
         todosRef.value = advancedAfterTurn;
+        sessionBus.emit("todos.update", { todos: todosRef.value });
         if (tui) tui.setTodos(todosRef.value);
       }
     }

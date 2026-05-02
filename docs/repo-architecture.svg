@@ -1,0 +1,186 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="950" viewBox="0 0 1400 950">
+  <defs>
+    <style>
+      .bg { fill: #0f172a; }
+      .title { fill: #f8fafc; font: 700 34px system-ui, -apple-system, Segoe UI, sans-serif; }
+      .subtitle { fill: #cbd5e1; font: 16px system-ui, -apple-system, Segoe UI, sans-serif; }
+      .section { fill: #111827; stroke: #334155; stroke-width: 2; rx: 20; }
+      .box { fill: #1e293b; stroke: #64748b; stroke-width: 1.5; rx: 14; }
+      .box2 { fill: #172554; stroke: #60a5fa; stroke-width: 1.5; rx: 14; }
+      .box3 { fill: #14532d; stroke: #4ade80; stroke-width: 1.5; rx: 14; }
+      .box4 { fill: #581c87; stroke: #c084fc; stroke-width: 1.5; rx: 14; }
+      .box5 { fill: #7c2d12; stroke: #fb923c; stroke-width: 1.5; rx: 14; }
+      .label { fill: #f8fafc; font: 700 17px system-ui, -apple-system, Segoe UI, sans-serif; }
+      .small { fill: #dbeafe; font: 13px system-ui, -apple-system, Segoe UI, sans-serif; }
+      .muted { fill: #94a3b8; font: 12px system-ui, -apple-system, Segoe UI, sans-serif; }
+      .sectionTitle { fill: #e2e8f0; font: 700 18px system-ui, -apple-system, Segoe UI, sans-serif; }
+      .arrow { stroke: #93c5fd; stroke-width: 2.5; fill: none; marker-end: url(#arrowhead); }
+      .arrowGreen { stroke: #86efac; stroke-width: 2.5; fill: none; marker-end: url(#arrowheadGreen); }
+      .arrowOrange { stroke: #fdba74; stroke-width: 2.5; fill: none; marker-end: url(#arrowheadOrange); }
+      .dash { stroke-dasharray: 7 6; }
+    </style>
+    <marker id="arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#93c5fd" />
+    </marker>
+    <marker id="arrowheadGreen" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#86efac" />
+    </marker>
+    <marker id="arrowheadOrange" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+      <polygon points="0 0, 10 3.5, 0 7" fill="#fdba74" />
+    </marker>
+  </defs>
+
+  <rect class="bg" width="1400" height="950" />
+  <text class="title" x="60" y="60">PieCode Repository Architecture</text>
+  <text class="subtitle" x="60" y="88">Command-line coding agent with TUI, model providers, tool execution, skills, MCP integrations, and tests</text>
+
+  <!-- User / CLI -->
+  <rect class="section" x="45" y="120" width="310" height="700" rx="22" />
+  <text class="sectionTitle" x="70" y="155">Entry + User Interface</text>
+
+  <rect class="box2" x="75" y="185" width="250" height="82" rx="14" />
+  <text class="label" x="100" y="218">src/cli.js</text>
+  <text class="small" x="100" y="242">CLI entry, flags, settings,</text>
+  <text class="small" x="100" y="260">slash commands, orchestration</text>
+
+  <rect class="box" x="75" y="300" width="250" height="74" rx="14" />
+  <text class="label" x="100" y="330">tui.js</text>
+  <text class="small" x="100" y="354">Full-screen terminal UI</text>
+
+  <rect class="box" x="75" y="400" width="250" height="92" rx="14" />
+  <text class="label" x="100" y="430">Input Helpers</text>
+  <text class="small" x="100" y="454">tuiLineEditor.js</text>
+  <text class="small" x="100" y="472">mouse.js, display.js</text>
+
+  <rect class="box" x="75" y="520" width="250" height="92" rx="14" />
+  <text class="label" x="100" y="550">File Mentions</text>
+  <text class="small" x="100" y="574">fileMentions.js</text>
+  <text class="small" x="100" y="592">@path suggestions/selection</text>
+
+  <rect class="box5" x="75" y="645" width="250" height="92" rx="14" />
+  <text class="label" x="100" y="675">Configuration</text>
+  <text class="small" x="100" y="699">~/.piecode/settings.json</text>
+  <text class="small" x="100" y="717">env vars, provider/model</text>
+
+  <!-- Core -->
+  <rect class="section" x="395" y="120" width="360" height="700" rx="22" />
+  <text class="sectionTitle" x="420" y="155">Agent Core</text>
+
+  <rect class="box2" x="445" y="190" width="260" height="88" rx="14" />
+  <text class="label" x="470" y="224">agent.js</text>
+  <text class="small" x="470" y="248">Conversation loop facade</text>
+  <text class="small" x="470" y="266">History + prompt + toolset</text>
+
+  <rect class="box2" x="445" y="315" width="260" height="95" rx="14" />
+  <text class="label" x="470" y="349">turnEngine.js</text>
+  <text class="small" x="470" y="373">Runs model turns</text>
+  <text class="small" x="470" y="391">Parses tool JSON + approval</text>
+
+  <rect class="box" x="445" y="445" width="260" height="88" rx="14" />
+  <text class="label" x="470" y="479">prompt.js</text>
+  <text class="small" x="470" y="503">System prompt + history</text>
+  <text class="small" x="470" y="521">Tool and skill instructions</text>
+
+  <rect class="box4" x="445" y="570" width="260" height="100" rx="14" />
+  <text class="label" x="470" y="604">Planning</text>
+  <text class="small" x="470" y="628">taskPlanner.js</text>
+  <text class="small" x="470" y="646">plannedTaskRunner.js</text>
+
+  <rect class="box" x="445" y="705" width="260" height="70" rx="14" />
+  <text class="label" x="470" y="738">Conversation State</text>
+  <text class="small" x="470" y="760">Messages, summaries, traces</text>
+
+  <!-- Capabilities -->
+  <rect class="section" x="795" y="120" width="305" height="700" rx="22" />
+  <text class="sectionTitle" x="820" y="155">Capabilities</text>
+
+  <rect class="box3" x="825" y="185" width="245" height="96" rx="14" />
+  <text class="label" x="850" y="218">tools.js</text>
+  <text class="small" x="850" y="242">shell, file read/write,</text>
+  <text class="small" x="850" y="260">list, sandbox, safety</text>
+
+  <rect class="box3" x="825" y="315" width="245" height="98" rx="14" />
+  <text class="label" x="850" y="348">mcp.js</text>
+  <text class="small" x="850" y="372">MCP server configs</text>
+  <text class="small" x="850" y="390">tools/resources bridge</text>
+
+  <rect class="box4" x="825" y="450" width="245" height="112" rx="14" />
+  <text class="label" x="850" y="483">Skills System</text>
+  <text class="small" x="850" y="507">skills.js discovery/load</text>
+  <text class="small" x="850" y="525">skillCreator.js scaffold</text>
+  <text class="small" x="850" y="543">~/.codex/skills, ~/.agents/skills</text>
+
+  <rect class="box" x="825" y="600" width="245" height="95" rx="14" />
+  <text class="label" x="850" y="633">Workspace</text>
+  <text class="small" x="850" y="657">Repo files, tests, git</text>
+  <text class="small" x="850" y="675">Sandboxed operations</text>
+
+  <!-- External -->
+  <rect class="section" x="1140" y="120" width="215" height="700" rx="22" />
+  <text class="sectionTitle" x="1165" y="155">External Systems</text>
+
+  <rect class="box5" x="1165" y="190" width="165" height="126" rx="14" />
+  <text class="label" x="1185" y="222">providers.js</text>
+  <text class="small" x="1185" y="247">Anthropic</text>
+  <text class="small" x="1185" y="267">OpenAI-compatible</text>
+  <text class="small" x="1185" y="287">Seed/Volcengine</text>
+  <text class="small" x="1185" y="307">Codex</text>
+
+  <rect class="box5" x="1165" y="360" width="165" height="90" rx="14" />
+  <text class="label" x="1185" y="392">AI APIs</text>
+  <text class="small" x="1185" y="416">Chat/completions</text>
+  <text class="small" x="1185" y="434">Model responses</text>
+
+  <rect class="box3" x="1165" y="495" width="165" height="90" rx="14" />
+  <text class="label" x="1185" y="527">MCP Servers</text>
+  <text class="small" x="1185" y="551">Local or remote</text>
+  <text class="small" x="1185" y="569">Extra tools/data</text>
+
+  <rect class="box4" x="1165" y="630" width="165" height="90" rx="14" />
+  <text class="label" x="1185" y="662">Skill Packs</text>
+  <text class="small" x="1185" y="686">SKILL.md files</text>
+  <text class="small" x="1185" y="704">Reusable workflows</text>
+
+  <!-- Tests -->
+  <rect class="section" x="45" y="850" width="1310" height="70" rx="20" />
+  <text class="sectionTitle" x="70" y="880">Validation Layer</text>
+  <text class="small" x="245" y="880">__tests__/agent.test.js</text>
+  <text class="small" x="410" y="880">providers.test.js</text>
+  <text class="small" x="555" y="880">tools.test.js</text>
+  <text class="small" x="675" y="880">mcp.test.js</text>
+  <text class="small" x="790" y="880">skills-triggers.test.js</text>
+  <text class="small" x="980" y="880">tui.test.js</text>
+  <text class="small" x="1090" y="880">taskPlanner.test.js</text>
+  <text class="small" x="1245" y="880">performance tests</text>
+
+  <!-- Flow arrows -->
+  <path class="arrow" d="M325 225 C365 225 390 225 445 225" />
+  <path class="arrow" d="M575 278 L575 315" />
+  <path class="arrow" d="M575 410 L575 445" />
+  <path class="arrowGreen" d="M705 360 C750 360 775 235 825 235" />
+  <path class="arrowGreen" d="M705 370 C755 370 775 365 825 365" />
+  <path class="arrowOrange" d="M705 490 C770 490 775 505 825 505" />
+  <path class="arrowOrange" d="M1070 233 C1110 233 1128 253 1165 253" />
+  <path class="arrowOrange" d="M1248 316 L1248 360" />
+  <path class="arrowGreen" d="M1070 365 C1110 365 1128 540 1165 540" />
+  <path class="arrowOrange" d="M1070 506 C1115 506 1125 675 1165 675" />
+  <path class="arrow dash" d="M200 737 C240 825 455 850 620 850" />
+  <path class="arrow dash" d="M575 775 C575 825 575 840 575 850" />
+  <path class="arrow dash" d="M948 695 C948 790 948 825 948 850" />
+
+  <!-- Flow labels -->
+  <text class="muted" x="345" y="210">user prompt / commands</text>
+  <text class="muted" x="590" y="300">delegates turn</text>
+  <text class="muted" x="720" y="215">tool calls</text>
+  <text class="muted" x="720" y="348">MCP calls</text>
+  <text class="muted" x="720" y="485">skill context</text>
+  <text class="muted" x="1085" y="222">model request</text>
+  <text class="muted" x="1258" y="344">API traffic</text>
+
+  <!-- Legend -->
+  <rect class="box" x="1015" y="35" width="320" height="62" rx="14" />
+  <circle cx="1040" cy="57" r="6" fill="#60a5fa" /><text class="muted" x="1055" y="62">Core flow</text>
+  <circle cx="1140" cy="57" r="6" fill="#4ade80" /><text class="muted" x="1155" y="62">Tools/MCP</text>
+  <circle cx="1240" cy="57" r="6" fill="#c084fc" /><text class="muted" x="1255" y="62">Skills/planning</text>
+  <circle cx="1040" cy="82" r="6" fill="#fb923c" /><text class="muted" x="1055" y="87">External/config</text>
+</svg>

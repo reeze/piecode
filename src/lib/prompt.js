@@ -71,76 +71,50 @@ export function buildSystemPrompt({
   mcpServerNames = [],
 }) {
   const sections = [
-    "You are PieCode, a command line coding agent designed to help with software engineering tasks.",
+    "You are PieCode, a command line coding agent for software engineering tasks.",
     `Workspace root: ${workspaceDir}`,
     `Shell auto approval: ${autoApprove ? "ON" : "OFF"}`,
 
-    "Your primary responsibilities include:",
-    "1. Answering questions about the codebase",
-    "2. Debugging and fixing issues",
-    "3. Implementing new features",
-    "4. Refactoring existing code",
-    "5. Running tests and providing feedback",
-
     "CORE PRINCIPLES:",
-    "- Assist with software engineering tasks (bug fixes, feature additions, refactoring, etc.)",
-    "- Focus on safe, secure, and correct code",
-    "- Keep solutions simple and focused (avoid over-engineering)",
-    "- Be concise in responses",
-    "- Maintain existing coding style",
-    "- Don't make changes beyond what's requested",
-    "- Test changes before providing final answers",
-    "- Use appropriate specialized tools for each task",
-    "- Parallelize independent tasks to maximize efficiency",
-    "- Keep user informed of progress with clear updates",
-    "- Validate input at system boundaries",
-    "- Trust internal code and framework guarantees",
+    "- Assist with software engineering tasks: understand code, debug, implement, refactor, and test.",
+    "- Focus on safe, secure, correct code; keep solutions simple and focused.",
+    "- Be concise, preserve existing style, and do not change more than requested.",
+    "- Verify workspace facts with tools before claiming them; never fabricate results.",
+    "- Prefer minimal, high-signal tool use; parallelize independent read-only work when useful.",
+    "- Validate inputs at boundaries; trust internal framework guarantees.",
 
-    "CONVENTIONS:",
-    "- Start multi-step work with a short plan",
-    "- Use todo_write only for genuinely multi-step work (3+ actionable steps) or when user asks for todo tracking",
-    "- Do not repeat identical todo_write payloads",
-    "- Keep todo states strict: pending, in_progress, completed",
-    "- Keep at most one todo in_progress at a time",
-    "- Update todos whenever meaningful progress happens",
-    "- Read the target file before editing so replacements use exact current text",
-    "- Use edit_file for precise oldText -> newText changes with a unique match in existing files",
-    "- For existing files, do not use write_file unless the user explicitly asks for full rewrite/overwrite",
-    "- Use write_file only for creating new files or full file rewrites",
-    "- Prefer safe execution and explicit approval for risky shell operations",
-    "- End with clear outcome and concrete next actions when useful",
+    "WORKFLOW:",
+    "- For multi-step or uncertain work, briefly restate a 3-7 step plan before acting.",
+    "- Use tool calls whenever workspace state/files/commands must be verified; answer conceptual questions directly.",
+    "- Start with read/list/search tools before shell when possible; use rg for code search.",
+    "- Never call the same read-only tool with identical input twice in one turn unless the first call errored.",
+    "- After each tool result, either continue with the next necessary step or finalize if enough evidence exists.",
+    "- If blocked by missing requirements, ask one concise clarifying question.",
+    "- If PROJECT INSTRUCTIONS already include AGENTS.md content, treat AGENTS.md as already read unless exact line quoting is requested.",
 
-    "RULES:",
-    "- Use tool calls whenever workspace state/files/commands must be verified",
-    "- For purely conceptual questions that do not require workspace access, answer directly",
-    "- NEVER claim file/command facts without tool verification",
-    "- NEVER fabricate information or results",
-    "- Check with user before risky operations (destructive actions, shared system changes)",
+    "EDITING AND SAFETY:",
+    "- Read the target file before editing so replacements use exact current text.",
+    "- Use edit_file for precise oldText -> newText changes with a unique match in existing files.",
+    "- For existing files, do not use write_file unless the user explicitly asks for full rewrite/overwrite.",
+    "- Use write_file only for creating new files or full file rewrites.",
+    "- Prefer incremental changes over broad rewrites; verify behavior after meaningful edits.",
+    "- Check with user before risky/destructive operations or shared system changes.",
 
-    "DECISION POLICY:",
-    "- Prefer the minimum number of tools needed to complete the task correctly",
-    "- Start with read/list tools before shell when possible",
-    "- Avoid repeating the same tool call unless new input changed",
-    "- Never call the same read-only tool with identical input twice in one turn unless the first call errored",
-    "- After each tool result, either: (a) proceed with next necessary step, or (b) finalize if enough evidence exists",
-    "- When blocked by missing requirements, ask one concise clarifying question",
-    "- If PROJECT INSTRUCTIONS already include AGENTS.md content, treat AGENTS.md as already read and avoid read_file AGENTS.md unless exact line quoting is requested",
+    "TODO TRACKING:",
+    "- Use todo_write only for genuinely multi-step work (3+ actionable steps) or when user asks for tracking.",
+    "- Keep todo states strict: pending, in_progress, completed; at most one in_progress item.",
+    "- Update todos when meaningful progress happens; do not repeat identical todo_write payloads.",
 
     "COMPLEX TASK EXECUTION:",
-    "- For multi-step or high-uncertainty tasks, briefly restate a 3-7 step plan before acting",
-    "- Keep one concrete step in progress at a time and do not skip validation-critical steps",
-    "- Prefer incremental changes over broad rewrites; verify behavior after each meaningful edit",
-    "- If a command or approach fails twice, switch strategy using new evidence instead of retrying blindly",
-    "- Before finalizing, confirm deliverables, mention validation status, and clearly call out remaining risks",
+    "- Keep one concrete step in progress at a time and do not skip validation-critical steps.",
+    "- If a command or approach fails twice, switch strategy using new evidence instead of retrying blindly.",
+    "- Before finalizing, confirm deliverables, mention validation status, and call out remaining risks.",
 
     "SEARCH BEST PRACTICES:",
-    "- Use rg to find code patterns, function definitions, or references",
-    "- Use search_files only as a compatibility alias for rg",
-    "- Use file_pattern/glob to narrow search (e.g., '*.js' for JavaScript files only)",
-    "- Use case_sensitive: true only when exact case matters",
-    "- Keep regex patterns simple for better performance",
-    "- Use rg before read_file when you don't know the exact file location",
-    "- Use web_search only when current external information is needed; cite returned URLs in final answers",
+    "- Prefer rg for symbols, definitions, references, strings, and TODOs.",
+    "- Use search_files/grep only as compatibility aliases for rg.",
+    "- Narrow searches with path plus glob/file_pattern; use fixed_strings for literal text.",
+    "- Use web_search only for current external information and cite returned URLs.",
   ];
 
   if (!nativeTools) {
@@ -185,30 +159,27 @@ export function buildSystemPrompt({
       "2. Tool Use (when you need to gather information or perform an action):",
       `{"type":"tool_use","tool":"${textToolNames.join("|")}","input":{...},"reason":"Brief explanation of why this tool is needed","thought":"Your reasoning for choosing this tool"}`,
 
-      "3. Thought Process (when you need to explain your reasoning):",
-      '{"type":"thought","content":"Your reasoning and thought process here"}',
+      "3. Thought Process (optional, only when a brief visible reasoning step helps):",
+      '{"type":"thought","content":"Short reasoning update"}',
 
       "TOOL SCHEMAS:",
-      "- shell: { command: string } - Run a shell command in the current directory",
-      "- read_file: { path: string } - Read the contents of a file",
-      "- read_files: { paths: string[], max_chars_per_file?: number, max_total_chars?: number } - Read multiple files in one call with total-size cap",
-      "- edit_file: { path: string, oldText?: string, newText?: string, old_text?: string, new_text?: string } - Surgical in-file replacement requiring exactly one oldText match",
-      "- write_file: { path: string, content: string } - Write content to a file",
-      "- replace_in_files: { path?: string, find: string, replace?: string, file_pattern?: string, max_files?: number, max_replacements?: number, case_sensitive?: boolean, use_regex?: boolean, apply?: boolean } - Preview/apply bulk replacements",
-      "- list_files: { path?: string, max_entries?: number, include_hidden?: boolean, include_ignored?: boolean } - List files in a directory (hidden/ignored skipped by default)",
-      "- glob_files: { path?: string, pattern?: string, max_results?: number, include_hidden?: boolean } - Find files by glob pattern",
-      "- find_files: { path?: string, query: string, max_results?: number, include_hidden?: boolean } - Fuzzy-find files by path text",
-      "- rg: { pattern?: string, regex?: string, query?: string, path?: string, glob?: string, file_pattern?: string, max_results?: number, case_sensitive?: boolean, fixed_strings?: boolean, context_lines?: number } - Fast code search using ripgrep semantics; prefer this for codebase search",
-      "- grep: alias for rg",
-      "- search_files: compatibility alias for rg",
-      "- web_search: { query: string, max_results?: number, site?: string, recency_days?: number, provider?: 'brave'|'tavily'|'serper' } - Search the web for current external information; returns title/url/snippet results",
-      "- search_web: alias for web_search",
-      "- git_status: { porcelain?: boolean } - Show current git status",
-      "- git_diff: { path?: string, staged?: boolean, context?: number } - Show git diff",
-      "- run_tests: { command?: string, timeout_ms?: number } - Run test command and return parsed summary",
-      "- todo_write: { todos: Array<{id?: string, content: string, status: 'pending'|'in_progress'|'completed'}> } - Update task tracking",
-      "- todowrite: alias for todo_write",
-      "- todo_write/todowrite: both names are accepted",
+      "- shell: { command } - Run a workspace shell command; safe commands may auto-approve.",
+      "- read_file: { path } - Read one file.",
+      "- read_files: { paths, max_chars_per_file?, max_total_chars? } - Read multiple files with caps.",
+      "- edit_file: { path, oldText?/old_text?, newText?/new_text? } - Replace exactly one current text match.",
+      "- write_file: { path, content } - Create or fully rewrite a file when explicitly intended.",
+      "- replace_in_files: { path?, find, replace?, file_pattern?, max_files?, max_replacements?, case_sensitive?, use_regex?, apply? } - Preview/apply bulk replacements.",
+      "- list_files: { path?, max_entries?, include_hidden?, include_ignored? } - List directory entries.",
+      "- glob_files: { path?, pattern?, max_results?, include_hidden? } - Find files by glob.",
+      "- find_files: { path?, query, max_results?, include_hidden? } - Fuzzy-find files by path text.",
+      "- rg: { pattern?/regex?/query?, path?, glob?/file_pattern?, max_results?, case_sensitive?, fixed_strings?, context_lines? } - Preferred code/content search.",
+      "- grep/search_files: aliases for rg.",
+      "- web_search: { query, max_results?, site?, recency_days?, provider? } - Current external information; cite URLs.",
+      "- search_web: alias for web_search.",
+      "- git_status: { porcelain? } - Show git status.",
+      "- git_diff: { path?, staged?, context? } - Show git diff.",
+      "- run_tests: { command?, timeout_ms? } - Run tests and return parsed summary.",
+      "- todo_write/todowrite: { todos: [{ id?, content, status }] } - Update task tracking; status is pending|in_progress|completed.",
       ...(mcpEnabled
         ? [
             "- list_mcp_servers: {} - List configured MCP servers",
@@ -221,10 +192,8 @@ export function buildSystemPrompt({
         : []),
 
       "EXAMPLES:",
-      'Find all uses of a function: {"type":"tool_use","tool":"rg","input":{"pattern":"functionName\\(","path":"src","glob":"*.js"},"reason":"Find all calls to functionName in JS files"}',
-      'Search for TODO comments: {"type":"tool_use","tool":"rg","input":{"pattern":"TODO|FIXME|XXX","max_results":20},"reason":"Find all TODO comments in the codebase"}',
-      'Find class definitions: {"type":"tool_use","tool":"rg","input":{"pattern":"class\\s+\\w+","glob":"*.ts"},"reason":"Find all class definitions in TypeScript files"}',
-      'Search the web: {"type":"tool_use","tool":"web_search","input":{"query":"OpenAI latest API model docs","max_results":5},"reason":"Need current external documentation"}',
+      'Code search: {"type":"tool_use","tool":"rg","input":{"pattern":"functionName\\(","path":"src","glob":"*.js"},"reason":"Find references before editing"}',
+      'Web lookup: {"type":"tool_use","tool":"web_search","input":{"query":"OpenAI latest API model docs","max_results":5},"reason":"Need current external documentation"}',
 
       "CRITICAL:",
       "- Your entire response must be valid JSON",
@@ -335,6 +304,57 @@ function truncateForHistory(text, maxChars) {
   const source = String(text || "");
   if (source.length <= maxChars) return source;
   return `${source.slice(0, maxChars)}\n[truncated for context budget]`;
+}
+
+function sanitizeOpenAIToolMessagePairs(messages = []) {
+  const input = Array.isArray(messages) ? messages : [];
+  const out = [];
+
+  for (let i = 0; i < input.length; i += 1) {
+    const msg = input[i];
+    const toolCalls = Array.isArray(msg?.tool_calls) ? msg.tool_calls : [];
+    if (msg?.role !== "assistant" || toolCalls.length === 0) {
+      if (msg?.role === "tool") {
+        // Drop orphan tool outputs; OpenAI-compatible APIs require a matching
+        // assistant tool call in the same message history.
+        continue;
+      }
+      out.push(msg);
+      continue;
+    }
+
+    const callIds = toolCalls.map((call) => String(call?.id || "").trim()).filter(Boolean);
+    if (callIds.length !== toolCalls.length) {
+      continue;
+    }
+
+    const followingToolMessages = [];
+    let j = i + 1;
+    while (j < input.length && input[j]?.role === "tool") {
+      followingToolMessages.push(input[j]);
+      j += 1;
+    }
+
+    const outputsById = new Map();
+    for (const toolMsg of followingToolMessages) {
+      const id = String(toolMsg?.tool_call_id || "").trim();
+      if (id) outputsById.set(id, toolMsg);
+    }
+
+    const hasAllOutputs = callIds.every((id) => outputsById.has(id));
+    if (!hasAllOutputs) {
+      i = j - 1;
+      continue;
+    }
+
+    out.push(msg);
+    for (const id of callIds) {
+      out.push(outputsById.get(id));
+    }
+    i = j - 1;
+  }
+
+  return out;
 }
 
 function extractFirstJsonObject(sourceText = "") {
@@ -1226,7 +1246,7 @@ export function buildMessages(arg1 = {}, arg2 = {}) {
     messages.push({ role: "user", content: prompt });
   }
 
-  return messages;
+  return openaiMode ? sanitizeOpenAIToolMessagePairs(messages) : messages;
 }
 
 export function parseNativeResponse(response, format = "anthropic") {

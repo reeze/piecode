@@ -480,6 +480,114 @@ export function extractSkillNamesFromInstructions(content, skillIndex = null) {
   return names;
 }
 
+function normalizeCommandName(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^\/+/, "")
+    .toLowerCase();
+}
+
+function commandDescriptionFromValue(value, fallback = "") {
+  if (typeof value === "string") return value.trim();
+  if (value && typeof value === "object") {
+    return String(value.description || value.desc || value.summary || fallback || "").trim();
+  }
+  return String(fallback || "").trim();
+}
+
+function extractSkillCommandSpecs(skill) {
+  const specs = [];
+  const frontmatter = skill?.frontmatter && typeof skill.frontmatter === "object" ? skill.frontmatter : {};
+  const fallbackDescription = String(skill?.description || "").trim();
+  const addSpec = (name, value = null) => {
+    const command = normalizeCommandName(name);
+    if (!command) return;
+    specs.push({
+      command,
+      description: commandDescriptionFromValue(value, fallbackDescription),
+    });
+  };
+
+  // Every skill is invokable as /<skill-name> by default.
+  addSpec(skill?.name, { description: fallbackDescription });
+
+  if (typeof frontmatter.command === "string") {
+    addSpec(frontmatter.command, { description: frontmatter.commandDescription || fallbackDescription });
+  }
+
+  if (Array.isArray(frontmatter.aliases)) {
+    for (const alias of frontmatter.aliases) addSpec(alias, { description: fallbackDescription });
+  }
+
+  const commands = frontmatter.commands;
+  if (typeof commands === "string") {
+    for (const item of commands.split(",").map((part) => part.trim()).filter(Boolean)) {
+      addSpec(item, { description: fallbackDescription });
+    }
+  } else if (Array.isArray(commands)) {
+    for (const item of commands) {
+      if (typeof item === "string") addSpec(item, { description: fallbackDescription });
+      else if (item && typeof item === "object") addSpec(item.name || item.command, item);
+    }
+  } else if (commands && typeof commands === "object") {
+    for (const [name, value] of Object.entries(commands)) addSpec(name, value);
+  }
+
+  const seen = new Set();
+  return specs.filter((spec) => {
+    if (!spec.command || seen.has(spec.command)) return false;
+    seen.add(spec.command);
+    return true;
+  });
+}
+
+export function discoverSkillCommands(skillIndex) {
+  const index = new Map();
+  if (!(skillIndex instanceof Map)) return index;
+
+  for (const skill of skillIndex.values()) {
+    for (const spec of extractSkillCommandSpecs(skill)) {
+      if (index.has(spec.command)) continue;
+      index.set(spec.command, {
+        name: spec.command,
+        slash: `/${spec.command}`,
+        skillName: skill.name,
+        skillPath: skill.path,
+        description: spec.description || skill.description || "",
+      });
+    }
+  }
+
+  return index;
+}
+
+export function resolveSkillCommand(input, skillIndex) {
+  const raw = String(input || "").trim();
+  if (!raw.startsWith("/")) return null;
+  const match = raw.match(/^\/([^\s]+)(?:\s+([\s\S]*))?$/);
+  if (!match?.[1]) return null;
+
+  const commandName = normalizeCommandName(match[1]);
+  const commandIndex = discoverSkillCommands(skillIndex);
+  const command = commandIndex.get(commandName);
+  if (!command) return null;
+
+  const args = String(match[2] || "").trim();
+  const skill = skillIndex instanceof Map ? skillIndex.get(command.skillName) : null;
+  return {
+    ...command,
+    args,
+    skill,
+    prompt: [
+      `Custom command ${command.slash} invoked.`,
+      `Skill: ${command.skillName}`,
+      command.description ? `Command description: ${command.description}` : "",
+      args ? `User request / arguments:\n${args}` : "User request / arguments: (none provided)",
+      "Follow the active skill instructions for this command. If the skill defines a spec-driven workflow such as OpenSpec, use that workflow and keep outputs/actions aligned with it.",
+    ].filter(Boolean).join("\n\n"),
+  };
+}
+
 export async function autoLoadSkillsFromInstructions(
   projectInstructions,
   activeSkillsRef,

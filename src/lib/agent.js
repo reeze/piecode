@@ -16,6 +16,8 @@ export class Agent {
     projectInstructionsRef,
     mcpHub = null,
     webSearch = null,
+    contextWindowRef = null,
+    shellPermissionRef = null,
   }) {
     this.provider = provider;
     this.workspaceDir = workspaceDir;
@@ -27,6 +29,8 @@ export class Agent {
     this.projectInstructionsRef = projectInstructionsRef || { value: null };
     this.mcpHub = mcpHub && typeof mcpHub.hasServers === "function" ? mcpHub : null;
     this.webSearch = webSearch && typeof webSearch === "object" ? webSearch : null;
+    this.contextWindowRef = contextWindowRef && typeof contextWindowRef === "object" ? contextWindowRef : { value: 0 };
+    this.shellPermissionRef = shellPermissionRef && typeof shellPermissionRef === "object" ? shellPermissionRef : { value: {} };
     this.history = [];
     this.rebuildToolset();
     this.enablePlanner = process.env.PIECODE_ENABLE_PLANNER === "1";
@@ -35,6 +39,14 @@ export class Agent {
     this.defaultToolBudget = Math.max(
       1,
       Math.min(12, Number.parseInt(process.env.PIECODE_TOOL_BUDGET || "6", 10) || 6)
+    );
+    this.autoCompactThreshold = Math.max(
+      0,
+      Math.min(0.98, Number.parseFloat(process.env.PIECODE_AUTO_COMPACT_THRESHOLD || "0.8") || 0.8)
+    );
+    this.autoCompactPreserveRecent = Math.max(
+      2,
+      Math.min(30, Number.parseInt(process.env.PIECODE_AUTO_COMPACT_KEEP || "12", 10) || 12)
     );
     this.activeAbortController = null;
     this.systemPromptCache = new Map();
@@ -49,6 +61,7 @@ export class Agent {
       onTodoWrite: this.onTodoWrite,
       mcpHub: this.mcpHub,
       webSearch: this.webSearch,
+      shellPermissionRef: this.shellPermissionRef,
     });
   }
 
@@ -119,7 +132,61 @@ export class Agent {
     });
   }
 
-  async compactHistory({ preserveRecent = 12 } = {}) {
+  estimateTokenCount(text) {
+    const source = String(text || "");
+    if (!source) return 0;
+    return Math.max(1, Math.round(source.length / 4));
+  }
+
+  estimateMessagesTokens(messages = []) {
+    return (Array.isArray(messages) ? messages : []).reduce((total, msg) => {
+      let content = "";
+      if (typeof msg?.content === "string") content = msg.content;
+      else {
+        try {
+          content = JSON.stringify(msg?.content ?? "");
+        } catch {
+          content = String(msg?.content ?? "");
+        }
+      }
+      return total + this.estimateTokenCount(`${msg?.role || "user"}: ${content}`);
+    }, 0);
+  }
+
+  getContextWindow() {
+    const value = Number(this.contextWindowRef?.value);
+    return Number.isFinite(value) ? Math.max(0, Math.round(value)) : 0;
+  }
+
+  shouldAutoCompact() {
+    const limit = this.getContextWindow();
+    if (!limit || this.autoCompactThreshold <= 0) return false;
+    if (this.history.length <= this.autoCompactPreserveRecent) return false;
+    const used = this.estimateMessagesTokens(this.history);
+    return used >= limit * this.autoCompactThreshold;
+  }
+
+  async maybeAutoCompact({ preserveRecent = this.autoCompactPreserveRecent } = {}) {
+    if (!this.shouldAutoCompact()) return null;
+    const beforeTokens = this.estimateMessagesTokens(this.history);
+    const limit = this.getContextWindow();
+    const result = await this.compactHistory({ preserveRecent, reason: "auto" });
+    if (result?.compacted) {
+      this.onEvent?.({
+        type: "context_compacted",
+        reason: "auto",
+        beforeMessages: result.beforeMessages,
+        afterMessages: result.afterMessages,
+        removedMessages: result.removedMessages,
+        beforeTokens,
+        afterTokens: this.estimateMessagesTokens(this.history),
+        limit,
+      });
+    }
+    return result;
+  }
+
+  async compactHistory({ preserveRecent = 12, reason = "manual" } = {}) {
     const keep = Math.max(2, Number.parseInt(String(preserveRecent), 10) || 12);
     if (this.history.length <= keep) {
       return {
@@ -138,7 +205,9 @@ export class Agent {
     const fallbackSummary = this.buildFallbackCompactionSummary(older);
 
     const compactPrompt = [
-      "Summarize this conversation history for future coding turns.",
+      reason === "auto"
+        ? "The conversation is near the model context limit. Summarize older history for future coding turns."
+        : "Summarize this conversation history for future coding turns.",
       "Keep only concrete facts, decisions, constraints, and unresolved items.",
       "Output concise plain text bullets (max 8 lines).",
       "",

@@ -104,6 +104,22 @@ describe("tui usability", () => {
     expect(tui.showRawLogs).toBe(true);
   });
 
+  test("raw log mode keeps full tool parameter details visible", () => {
+    const out = createOut();
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - a.txt; b.txt")[0])).not.toContain("a.txt; b.txt");
+    tui.setRawLogsVisible(true);
+    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("README.md");
+    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - a.txt; b.txt")[0])).toContain("a.txt; b.txt");
+  });
+
   test("formatTimelineLines maps key event types and hides thinking noise", () => {
     const out = createOut();
     const tui = new SimpleTui({
@@ -121,9 +137,13 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines("[run] shell echo hi")[0])).toContain("[~]");
     expect(tui.formatTimelineLines("[tool] shell (echo hi)")).toEqual([]);
     expect(tui.formatTimelineLines("[tool] todo_write (3 todos)")).toEqual([]);
-    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("[tool] Read README.md");
-    expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).toContain("[tool] Search targetSymbol in *.js");
-    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - a.txt; b.txt")[0])).toContain("[tools] read_file x2 - a.txt; b.txt");
+    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("[tool] Read");
+    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).not.toContain("README.md");
+    expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).toContain("[tool] Search");
+    expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).not.toContain("targetSymbol");
+    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (path=README.md)")[0])).toContain("[tool] Read path=README.md");
+    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - a.txt; b.txt")[0])).toContain("[tools] read_file x2");
+    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - a.txt; b.txt")[0])).not.toContain("a.txt; b.txt");
     expect(stripAnsi(tui.formatTimelineLines("[result] done")[0])).toContain("[ok] done");
     expect(stripAnsi(tui.formatTimelineLines("[result] shell failed | time: 2s")[0])).toContain(
       "[x] shell failed | time: 2s"
@@ -136,13 +156,25 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines("[banner-hint] keys: CTRL+L")[0])).toContain("keys: CTRL+L");
     expect(tui.formatTimelineLines("[thinking] internal details")).toEqual([]);
     expect(tui.formatTimelineLines("[thinking] request:turn payload-here")).toEqual([]);
-    expect(stripAnsi(tui.formatTimelineLines("[thought] I should inspect files first")[0])).toContain("Thought: I should inspect files first");
+    expect(stripAnsi(tui.formatTimelineLines("[thought] I should inspect files first")[0])).toContain("Update: I should inspect files first");
     const markdownResponse = stripAnsi(
       tui.formatTimelineLines("[response] ## Title\n- **bold** and `code`")[1]
     );
     expect(markdownResponse).toContain("•");
     expect(markdownResponse).toContain("bold");
     expect(markdownResponse).toContain("code");
+    const commandMarkdown = stripAnsi(tui.formatTimelineLines("- **skill-name**: use `npm test`")[0]);
+    expect(commandMarkdown).toContain("• skill-name: use npm test");
+    expect(commandMarkdown).not.toContain("**skill-name**");
+    const commandHeader = stripAnsi(tui.formatTimelineLines("## Skills")[0]);
+    expect(commandHeader).toContain("Skills");
+    expect(commandHeader).not.toContain("##");
+    const codeResponse = stripAnsi(
+      tui.formatTimelineLines("[response] ```js\nconst x = 1;\n```").join("\n")
+    );
+    expect(codeResponse).toContain("js ----");
+    expect(codeResponse).toContain("const x = 1;");
+    expect(codeResponse).not.toContain("```");
     const plainResponse = stripAnsi(tui.formatTimelineLines("[response] hello world")[0]);
     expect(plainResponse.trim()).toBe("hello world");
     expect(plainResponse).not.toContain("Assistant:");
@@ -173,6 +205,8 @@ describe("tui usability", () => {
     expect(lines.join("\n")).toContain("Question: Approve shell command?");
     expect(lines.join("\n")).toContain('Command: curl -sL "https://agentskills.io/specification"');
     expect(lines.join("\n")).toContain("Details: command is neither known safe nor explicitly dangerous");
+    expect(lines.join("\n")).toContain("remember");
+    expect(lines.join("\n")).toContain("all session");
     expect(lines.join("\n")).not.toContain(
       'Details: shell: curl -sL "https://agentskills.io/specification" (command is neither known safe nor explicitly dangerous)'
     );
@@ -319,6 +353,23 @@ describe("tui usability", () => {
     const raw = out.writes.join("");
     expect(raw).toContain("----------");
     expect(raw).not.toContain("─");
+  });
+
+  test("context usage is capped at 100% in the status bar", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.setContextUsage(150, 100);
+    const frame = latestFrame(out);
+    expect(frame).toContain("ctx:100/100(100%)");
+    expect(frame).not.toContain("150/100");
   });
 
   test("status bar shows TODO progress and hides it when empty", () => {
@@ -614,7 +665,7 @@ describe("tui usability", () => {
     tui.start();
     tui.setLiveThought("inspect files first");
     let frame = latestFrame(out);
-    expect(frame).toContain("Thought:");
+    expect(frame).toContain("Update:");
     expect(frame).toContain("inspect files first");
     tui.clearLiveThought();
     frame = latestFrame(out);
@@ -702,9 +753,23 @@ describe("tui usability", () => {
     tui.render("");
     const latest = latestFrame(out);
     expect(latest).toContain("line-30");
+    expect(latest).toContain("PgUp/↑:his");
+    expect(tui.lastScrollMax).toBeGreaterThan(0);
 
     tui.scrollPage(1);
     const scrolled = latestFrame(out);
-    expect(scrolled).toContain("scroll:+");
+    expect(scrolled).toContain("timeline:");
+    expect(scrolled).toContain("PgDn/End:bottom");
+    expect(tui.scrollOffset).toBeGreaterThan(0);
+
+    tui.scrollToTop();
+    expect(tui.scrollOffset).toBe(tui.lastScrollMax);
+    const top = latestFrame(out);
+    expect(top).toContain("line-1");
+
+    tui.scrollToBottom();
+    expect(tui.scrollOffset).toBe(0);
+    const bottom = latestFrame(out);
+    expect(bottom).toContain("line-30");
   });
 });

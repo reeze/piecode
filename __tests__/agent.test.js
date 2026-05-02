@@ -82,6 +82,45 @@ describe("agent context controls", () => {
     expect(agent.history).toHaveLength(2);
   });
 
+  test("maybeAutoCompact compacts before a turn when estimated history exceeds threshold", async () => {
+    const contextWindowRef = { value: 120 };
+    const events = [];
+    let completeCalls = 0;
+    const agent = new Agent({
+      provider: {
+        kind: "test-provider",
+        model: "test-model",
+        async complete(args = {}) {
+          completeCalls += 1;
+          if (String(args?.systemPrompt || "").includes("compress")) return "- durable summary";
+          return JSON.stringify({ type: "final", message: "done" });
+        },
+      },
+      workspaceDir: process.cwd(),
+      autoApproveRef: { value: false },
+      askApproval: async () => true,
+      activeSkillsRef: { value: [] },
+      projectInstructionsRef: { value: null },
+      contextWindowRef,
+      onEvent: (evt) => events.push(evt),
+    });
+    agent.autoCompactThreshold = 0.5;
+    agent.autoCompactPreserveRecent = 2;
+    agent.history = [
+      { role: "user", content: "old ".repeat(80) },
+      { role: "assistant", content: "answer ".repeat(80) },
+      { role: "user", content: "recent question" },
+      { role: "assistant", content: "recent answer" },
+    ];
+
+    const result = await agent.runTurn("new request");
+
+    expect(result).toBe("done");
+    expect(completeCalls).toBe(2);
+    expect(agent.history[0].content).toContain("[CONTEXT SUMMARY]");
+    expect(events.some((evt) => evt?.type === "context_compacted" && evt.reason === "auto")).toBe(true);
+  });
+
   test("requestAbort interrupts an active runTurn", async () => {
     const agent = createAgentWithProvider({
       async complete({ signal }) {

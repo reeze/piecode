@@ -648,6 +648,52 @@ describe("tools usability", () => {
     expect(result).toBe("Command was not approved by the user.");
   });
 
+  test("shell approval can remember an exact command for the current session", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    let asked = 0;
+    const shellPermissionRef = { value: {} };
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: false },
+      shellPermissionRef,
+      askApproval: async () => {
+        asked += 1;
+        return "remember_command";
+      },
+    });
+
+    const first = await tools.shell({ command: "python3 -V" });
+    const second = await tools.shell({ command: "python3   -V" });
+
+    expect(first).toContain("exit_code:");
+    expect(second).toContain("exit_code:");
+    expect(asked).toBe(1);
+    expect(shellPermissionRef.value.rememberedCommands.has("python3 -V")).toBe(true);
+  });
+
+  test("shell approval can allow all commands for the current session", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    let asked = 0;
+    const shellPermissionRef = { value: {} };
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: false },
+      shellPermissionRef,
+      askApproval: async () => {
+        asked += 1;
+        return "allow_all_session";
+      },
+    });
+
+    const first = await tools.shell({ command: "python3 -V" });
+    const second = await tools.shell({ command: "node -v" });
+
+    expect(first).toContain("exit_code:");
+    expect(second).toContain("exit_code:");
+    expect(asked).toBe(1);
+    expect(shellPermissionRef.value.allowAllSession).toBe(true);
+  });
+
   test("git commit requires explicit approval even when auto-approve is on", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
     let asked = 0;

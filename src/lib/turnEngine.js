@@ -543,24 +543,6 @@ export class TurnEngine {
     this.agent.throwIfAborted(signal);
 
     for (const item of results) {
-      const resultDigest = String(item.result || "").slice(0, 1000);
-      const sameAsLastTurnStep = item.signature === this.lastToolSignature && resultDigest === this.lastToolResultDigest;
-      if (sameAsLastTurnStep) this.repeatedNoProgressCount += 1;
-      else this.repeatedNoProgressCount = 0;
-      this.lastToolSignature = item.signature;
-      this.lastToolResultDigest = resultDigest;
-
-      const outcomeKey = `${item.signature}::${resultDigest}`;
-      const seenCount = (this.seenOutcomeCounts.get(outcomeKey) || 0) + 1;
-      this.seenOutcomeCounts.set(outcomeKey, seenCount);
-      if (seenCount >= 2) {
-        return {
-          done: true,
-          message:
-            "I’m repeating the same verified step result in this turn. Stopping to avoid a tool loop. Please refine the request or confirm next action.",
-        };
-      }
-
       this.agent.onEvent?.({
         type: "tool_end",
         tool: item.action.tool,
@@ -591,6 +573,26 @@ export class TurnEngine {
           }
         : {}),
     });
+
+    for (const item of results) {
+      const resultDigest = String(item.result || "").slice(0, 1000);
+      const sameAsLastTurnStep = item.signature === this.lastToolSignature && resultDigest === this.lastToolResultDigest;
+      if (sameAsLastTurnStep) this.repeatedNoProgressCount += 1;
+      else this.repeatedNoProgressCount = 0;
+      this.lastToolSignature = item.signature;
+      this.lastToolResultDigest = resultDigest;
+
+      const outcomeKey = `${item.signature}::${resultDigest}`;
+      const seenCount = (this.seenOutcomeCounts.get(outcomeKey) || 0) + 1;
+      this.seenOutcomeCounts.set(outcomeKey, seenCount);
+      if (seenCount >= 2) {
+        return {
+          done: true,
+          message:
+            "I’m repeating the same verified step result in this turn. Stopping to avoid a tool loop. Please refine the request or confirm next action.",
+        };
+      }
+    }
 
     const effectiveTurnMaxToolCalls = this.getCurrentTurnMaxToolCalls();
     if (Number.isFinite(effectiveTurnMaxToolCalls) && this.toolCalls >= effectiveTurnMaxToolCalls && !this.turnPolicy?.forceFinalizeAfterTool) {
@@ -702,6 +704,7 @@ export class TurnEngine {
   async run() {
     const signal = this.agent.activeAbortController.signal;
     this.agent.history.push({ role: "user", content: this.userMessage });
+    await this.agent.maybeAutoCompact({ preserveRecent: this.agent.autoCompactPreserveRecent });
 
     this.agent.throwIfAborted(signal);
     if (this.planOnly) {
@@ -964,6 +967,24 @@ export class TurnEngine {
       this.agent.throwIfAborted(signal);
 
       const resultDigest = String(result || "").slice(0, 1000);
+      this.agent.onEvent?.({
+        type: "tool_end",
+        tool: action.tool,
+        result: String(result || ""),
+        error: toolError,
+      });
+
+      this.agent.history.push({
+        role: "user",
+        content: JSON.stringify({
+          type: "tool_result",
+          tool: action.tool,
+          result,
+          _callId: callId,
+        }),
+        ...(useNativeTools ? { toolResult: { toolCallId: callId, name: action.tool, result } } : {}),
+      });
+
       const sameAsLastTurnStep = toolSignature === this.lastToolSignature && resultDigest === this.lastToolResultDigest;
       if (sameAsLastTurnStep) this.repeatedNoProgressCount += 1;
       else this.repeatedNoProgressCount = 0;
@@ -989,24 +1010,6 @@ export class TurnEngine {
           return msg;
         }
       }
-
-      this.agent.onEvent?.({
-        type: "tool_end",
-        tool: action.tool,
-        result: String(result || ""),
-        error: toolError,
-      });
-
-      this.agent.history.push({
-        role: "user",
-        content: JSON.stringify({
-          type: "tool_result",
-          tool: action.tool,
-          result,
-          _callId: callId,
-        }),
-        ...(useNativeTools ? { toolResult: { toolCallId: callId, name: action.tool, result } } : {}),
-      });
 
       if (action.tool === "shell") {
         if (!Number.isFinite(this.turnPolicy?.maxToolCalls) && shellIsCommitFlowCommand) {

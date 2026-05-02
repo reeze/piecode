@@ -21,8 +21,8 @@ describe('Prompt functions', () => {
 
       expect(prompt).toContain('CORE PRINCIPLES');
       expect(prompt).toContain('Assist with software engineering tasks');
-      expect(prompt).toContain('Focus on safe, secure, and correct code');
-      expect(prompt).toContain('Keep solutions simple and focused');
+      expect(prompt).toContain('Focus on safe, secure, correct code');
+      expect(prompt).toContain('keep solutions simple and focused');
     });
 
     test('should include tool schemas in text mode (nativeTools=false)', () => {
@@ -439,6 +439,36 @@ describe('Prompt functions', () => {
       expect(messages[1].tool_calls).toHaveLength(2);
       expect(messages[2]).toMatchObject({ role: 'tool', tool_call_id: 'call_1', content: 'a' });
       expect(messages[3]).toMatchObject({ role: 'tool', tool_call_id: 'call_2', content: 'b' });
+    });
+
+    test('drops orphan OpenAI tool calls without matching outputs', () => {
+      const history = [
+        { role: 'user', content: 'Read the file' },
+        {
+          role: 'assistant',
+          toolCall: { id: 'call_orphan', name: 'read_file', input: { path: 'a.txt' } },
+        },
+        { role: 'assistant', content: 'Stopped before tool result was recorded.' },
+      ];
+
+      const messages = buildMessages(history, { format: 'openai' });
+      expect(messages).toEqual([
+        { role: 'user', content: 'Read the file' },
+        { role: 'assistant', content: 'Stopped before tool result was recorded.' },
+      ]);
+    });
+
+    test('drops orphan OpenAI tool outputs without matching calls', () => {
+      const history = [
+        { role: 'user', content: 'Continue' },
+        {
+          role: 'user',
+          toolResult: { toolCallId: 'call_missing', name: 'read_file', result: 'contents' },
+        },
+      ];
+
+      const messages = buildMessages(history, { format: 'openai' });
+      expect(messages).toEqual([{ role: 'user', content: 'Continue' }]);
     });
 
     test('falls back to parsing content JSON for legacy history entries', () => {

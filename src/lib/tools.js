@@ -258,6 +258,33 @@ function truncatePreview(text, maxChars) {
   return `${source.slice(0, Math.max(0, maxChars - 3))}...`;
 }
 
+function normalizeShellPermissionCommand(command) {
+  return String(command || "").trim().replace(/\s+/g, " ");
+}
+
+function normalizeApprovalDecision(value) {
+  if (value === true) return "allow_once";
+  if (value === false || value == null) return "deny";
+  const text = String(value || "").trim().toLowerCase();
+  if (["y", "yes", "allow", "allow_once", "once", "approve"].includes(text)) return "allow_once";
+  if (["r", "remember", "remember_command", "session_command"].includes(text)) return "remember_command";
+  if (["a", "all", "allow_all", "allow_all_session", "session", "always"].includes(text)) {
+    return "allow_all_session";
+  }
+  return "deny";
+}
+
+function getShellPermissionState(ref) {
+  if (!ref || typeof ref !== "object") return null;
+  if (!ref.value || typeof ref.value !== "object") ref.value = {};
+  if (!(ref.value.rememberedCommands instanceof Set)) {
+    const existing = Array.isArray(ref.value.rememberedCommands) ? ref.value.rememberedCommands : [];
+    ref.value.rememberedCommands = new Set(existing.map(normalizeShellPermissionCommand).filter(Boolean));
+  }
+  ref.value.allowAllSession = Boolean(ref.value.allowAllSession);
+  return ref.value;
+}
+
 async function formatShellResult({
   workspaceDir,
   command,
@@ -597,6 +624,7 @@ export function createToolset({
   onTodoWrite,
   mcpHub = null,
   webSearch = null,
+  shellPermissionRef = null,
 }) {
   let lastTodoSignature = "";
   const mcpAvailable = () => Boolean(mcpHub && typeof mcpHub.hasServers === "function" && mcpHub.hasServers());
@@ -635,19 +663,43 @@ export function createToolset({
 
   const approveShellCommand = async (cmd) => {
     const classification = classifyShellCommand(cmd);
+    const normalizedCommand = normalizeShellPermissionCommand(cmd);
+    const shellPermission = getShellPermissionState(shellPermissionRef);
+    if (shellPermission?.allowAllSession) {
+      return { approved: true, classification, decision: "allow_all_session" };
+    }
+    if (normalizedCommand && shellPermission?.rememberedCommands?.has(normalizedCommand)) {
+      return { approved: true, classification, decision: "remembered_command" };
+    }
+
     const alwaysNeedsPrompt = classification.level === "dangerous";
     let approved = classification.level === "safe";
+    let decision = approved ? "auto_safe" : "deny";
     if (!approved) {
       if (alwaysNeedsPrompt) {
-        approved = askApproval ? await askApproval("shell", { command: cmd, classification }) : false;
+        decision = normalizeApprovalDecision(
+          askApproval ? await askApproval("shell", { command: cmd, classification, normalizedCommand }) : false
+        );
+        approved = decision !== "deny";
       } else {
         approved = Boolean(autoApproveRef?.value);
+        decision = approved ? "auto_approve" : "deny";
         if (!approved && askApproval) {
-          approved = await askApproval("shell", { command: cmd, classification });
+          decision = normalizeApprovalDecision(await askApproval("shell", { command: cmd, classification, normalizedCommand }));
+          approved = decision !== "deny";
         }
       }
     }
-    return { approved, classification };
+
+    if (approved && shellPermission) {
+      if (decision === "remember_command" && normalizedCommand) {
+        shellPermission.rememberedCommands.add(normalizedCommand);
+      } else if (decision === "allow_all_session") {
+        shellPermission.allowAllSession = true;
+      }
+    }
+
+    return { approved, classification, decision };
   };
 
   const executeShellCommand = async ({ cmd, timeoutMs = null }) => {

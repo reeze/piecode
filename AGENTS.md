@@ -121,7 +121,8 @@ Create `~/.piecode/settings.json`:
     "enabled": ["vercel-react-best-practices"],
     "paths": [
       "/Users/your-username/.agents/skills",
-      "/Users/your-username/.codex/skills"
+      "/Users/your-username/.codex/skills",
+      ".piecode/skills"
     ]
   },
   "providers": {
@@ -173,10 +174,26 @@ node src/cli.js --prompt "use $vercel-react-best-practices to optimize this Reac
 | `/model` | Show active provider/model |
 | `/skills` | Show active skills |
 | `/skills list` | List discovered skills |
+| `/skills commands` | List slash commands exposed by skills |
+| `/<skill-command>` | Invoke a skill-backed custom command, e.g. `/openspec <request>` |
 | `/skills use <name>` | Enable skill |
 | `/skills off <name>` | Disable skill |
 | `/skills clear` | Disable all skills |
 | `/use <name>` | Alias for `/skills use` |
+
+### OpenSpec
+
+This repo includes a project-local OpenSpec skill at `.piecode/skills/openspec/SKILL.md` and a minimal OpenSpec workspace under `openspec/`.
+
+Use these custom commands for spec-driven changes:
+
+```bash
+/openspec <request>
+/spec <request>
+/propose <request>
+/validate-spec <request>
+/implement-spec <request>
+```
 
 ## Development
 
