@@ -9,4 +9,7 @@ dist/*.tgz
 .piecode/shell
 .piecode/tasks
 .piecode/sessions
+.piecode/plugins/superpowers/
+.playwright-mcp/
+claude-code/
 .crush/

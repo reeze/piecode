@@ -7,17 +7,19 @@
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
+    <button id="sidebarBackdrop" class="sidebar-backdrop mobile-only" type="button" aria-label="Close workspace panel"></button>
     <div id="app">
       <aside class="sidebar">
         <div class="brand">
           <div class="logo">π</div>
           <div>
             <h1>PieCode</h1>
-            <p>Web coding workspace</p>
+            <p>Workspace agent</p>
           </div>
+          <button id="mobileCloseMenuBtn" class="icon-btn mobile-only sidebar-close" type="button" aria-label="Close workspace panel">×</button>
         </div>
 
-        <section class="card status-card">
+        <section class="panel status-card">
           <div class="status-row">
             <span id="statusDot" class="dot idle"></span>
             <div>
@@ -32,8 +34,8 @@
           </div>
         </section>
 
-        <section class="card">
-          <div class="card-title">Session parameters</div>
+        <section class="panel controls-panel">
+          <div class="card-title">Mode</div>
           <label class="switch-line">
             <input id="planOnly" type="checkbox" />
             <span>Plan mode</span>
@@ -42,38 +44,53 @@
             <input id="autoApprove" type="checkbox" />
             <span>Auto approve non-danger shell</span>
           </label>
-          <button id="abortBtn" class="secondary" disabled>Abort current task</button>
-          <div class="session-help">
-            <button id="slashHelpBtn" class="ghost" type="button">Slash commands</button>
-            <small>Type <code>/</code> in the composer for suggestions.</small>
+          <label class="switch-line">
+            <input id="detailMode" type="checkbox" />
+            <span>Detail mode</span>
+          </label>
+          <div class="sidebar-actions">
+            <button id="slashHelpBtn" class="ghost" type="button">/ Commands</button>
+            <button id="abortBtn" class="danger" disabled>Abort</button>
           </div>
         </section>
 
-        <section class="card sessions">
-          <div class="card-title">Sessions</div>
+        <section class="panel sessions">
+          <div class="card-title">Recent</div>
           <div class="session-current">Current: <code id="sessionIdLabel">-</code></div>
           <div id="recentSessions" class="muted">No previous sessions</div>
         </section>
 
-        <section class="card approvals" id="approvalPanel">
+        <section class="panel approvals" id="approvalPanel">
           <div class="card-title">Approvals</div>
           <div id="approvalList" class="muted">No pending approvals</div>
         </section>
 
-        <section class="card todos">
-          <div class="card-title">Todos</div>
+        <section class="panel todos">
+          <div class="card-title">Tasks</div>
           <div id="todoList" class="muted">No todos yet</div>
         </section>
       </aside>
 
       <main class="main">
         <header class="topbar">
-          <div>
-            <h2>Agent timeline</h2>
-            <p>Same PieCode backend, with a calmer web workflow.</p>
+          <button id="mobileMenuBtn" class="icon-btn mobile-only" type="button" aria-label="Open workspace panel">☰</button>
+          <div class="topbar-title">
+            <h2><span class="branch-icon">⌘</span> main</h2>
+            <p>piecode</p>
           </div>
-          <div id="connection" class="pill">offline</div>
+          <div class="topbar-actions">
+            <button id="sessionDiffBtn" class="ghost compact" type="button">Diff</button>
+            <div id="connection" class="pill">offline</div>
+            <button id="mobileAbortBtn" class="mobile-stop mobile-only" type="button" hidden>Stop</button>
+            <button id="mobileMoreBtn" class="icon-btn mobile-only" type="button" aria-label="More actions">⋮</button>
+            <button id="mobileNewBtn" class="icon-btn mobile-only" type="button" aria-label="Clear conversation">⊞</button>
+          </div>
         </header>
+
+        <section id="mobileApprovalPanel" class="mobile-approval-panel mobile-only" hidden>
+          <div class="mobile-panel-title">Confirm action</div>
+          <div id="mobileApprovalList"></div>
+        </section>
 
         <section id="messages" class="messages"></section>
 
@@ -81,15 +98,33 @@
           <div id="eventStrip" class="event-strip"></div>
           <form id="composer" class="composer">
             <div class="input-shell">
-              <textarea id="messageInput" rows="3" placeholder="Ask PieCode to inspect, edit, test, or explain this workspace..."></textarea>
-              <button id="sendBtn" type="submit" aria-label="Send message">Send</button>
+              <textarea id="messageInput" rows="3" placeholder="Ask PieCode to inspect, edit, test, or explain..."></textarea>
+              <button id="sendBtn" type="submit" aria-label="Send message">↑</button>
               <div id="slashSuggestions" class="slash-suggestions" hidden></div>
             </div>
           </form>
-          <div class="hint">Shift+Enter for newline · tool approvals will appear on the left</div>
+          <div id="contextUsage" class="context-usage">ctx: -</div>
+          <div class="hint">Shift+Enter for newline · type / for commands</div>
         </section>
       </main>
     </div>
+
+    <div id="diffOverlay" class="diff-overlay" hidden>
+      <div class="diff-dialog" role="dialog" aria-modal="true" aria-labelledby="diffTitle">
+        <div class="diff-header">
+          <div>
+            <h3 id="diffTitle">Current session diff</h3>
+            <p id="diffMeta">Working tree changes for this workspace.</p>
+          </div>
+          <div class="diff-actions">
+            <button id="refreshDiffBtn" class="secondary compact" type="button">Refresh</button>
+            <button id="closeDiffBtn" class="ghost compact" type="button">Close</button>
+          </div>
+        </div>
+        <div id="diffBody" class="diff-body">Loading diff...</div>
+      </div>
+    </div>
+
     <script src="/app.js"></script>
   </body>
 </html>

@@ -3,6 +3,7 @@ import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
+import { fileURLToPath } from "node:url";
 import { spawnSync, exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
 import * as readlineCore from "node:readline";
@@ -10,6 +11,7 @@ import { createInterface } from "node:readline/promises";
 import { Writable, Transform } from "node:stream";
 import { stdin, stdout } from "node:process";
 import { Agent } from "./lib/agent.js";
+import { createAgentEventHandler } from "./lib/agentEventHandler.js";
 import { getProvider } from "./lib/providers.js";
 import {
   addSkillByName,
@@ -23,13 +25,32 @@ import {
   resolveSkillCommand,
   resolveSkillRoots,
 } from "./lib/skills.js";
+import {
+  addPluginByName,
+  autoEnablePlugins,
+  discoverPluginCommands,
+  discoverPlugins,
+  getDefaultPluginNames,
+  loadActivePlugins,
+  removePluginByName,
+  resolvePluginCommand,
+  resolvePluginRoots,
+  resolveRequestedPlugins,
+} from "./lib/plugins.js";
+import { installPlugin, updatePlugin } from "./lib/pluginInstaller.js";
 import { createSkillInteractive } from "./lib/skillCreator.js";
 import { SimpleTui } from "./lib/tui.js";
+import { buildInputHints } from "./lib/inputHints.js";
 import { Display } from "./lib/display.js";
 import { consumeMouseWheelDeltas, stripMouseInputNoise } from "./lib/mouse.js";
 import { TuiLineEditor } from "./lib/tuiLineEditor.js";
 import { McpHub, mergeCommonMcpServers, resolveMcpServerConfigs } from "./lib/mcp.js";
 import { AgentSessionState, SessionEventBus, createJsonlSessionSink } from "./lib/sessionProtocol.js";
+import {
+  createTmuxSubagentWatcher,
+  resolveTmuxSubagentOptions,
+  watchSubagentEventsFile,
+} from "./lib/tmuxSubagentWindows.js";
 import { classifyShellCommand } from "./lib/tools.js";
 import { applyFileMentionSelection, getFileMentionSuggestions, isGitRelatedPath } from "./lib/fileMentions.js";
 import { formatAttachmentSummary, readClipboardImage } from "./lib/attachments.js";
@@ -62,7 +83,11 @@ const SLASH_COMMANDS = [
   "/plan",
   "/approve",
   "/trace",
+  "/debug",
+  "/debug status",
   "/debug llm",
+  "/debug last",
+  "/debug save",
   "/model",
   "/mcp",
   "/mcp list",
@@ -77,6 +102,15 @@ const SLASH_COMMANDS = [
   "/skills use",
   "/skills off",
   "/skills clear",
+  "/plugins",
+  "/plugins list",
+  "/plugins commands",
+  "/plugins install",
+  "/plugins update",
+  "/plugins use",
+  "/plugins off",
+  "/plugins clear",
+  "/plugin",
   "/use",
   "/skill-creator",
   "/workspace",
@@ -332,18 +366,86 @@ async function finishTaskTrace(taskTraceRef, workspaceDir, { status = "done", er
       const llmSection = llmText ? `\n\n[llm-transcript]\n${llmText}\n` : "";
       await fs.appendFile(logsPath, `\n[${current.id}] ${current.input}\n${logsText}${llmSection}\n`, "utf8");
     }
-    taskTraceRef.current = null;
-    return {
+    const saved = {
       id: current.id,
       sessionId: taskTraceRef.sessionId,
       dir: sessionDir,
       trajectoryPath,
       logsPath,
+      status: current.status,
+      error: current.error,
+      durationMs: current.durationMs,
+      input: current.input,
+      finishedAt: current.finishedAt,
     };
+    taskTraceRef.current = null;
+    taskTraceRef.lastSaved = saved;
+    return saved;
   } catch {
     taskTraceRef.current = null;
     return null;
   }
+}
+
+function formatDebugSavedTrace(saved, workspaceDir) {
+  if (!saved || typeof saved !== "object") return "trace: no saved task trace yet";
+  const rel = (value) => {
+    const text = String(value || "");
+    if (!text) return "-";
+    try {
+      return path.relative(workspaceDir, text) || text;
+    } catch {
+      return text;
+    }
+  };
+  const lines = [
+    `trace: ${saved.id || "-"} status=${saved.status || "-"} duration=${formatReadableDuration(saved.durationMs || 0)}`,
+    `session: ${saved.sessionId || "-"}`,
+    `trajectory: ${rel(saved.trajectoryPath)}`,
+    `logs: ${rel(saved.logsPath)}`,
+  ];
+  if (saved.error) lines.push(`error: ${saved.error}`);
+  if (saved.input) lines.push(`input: ${summarizeForLog(saved.input, 220)}`);
+  return lines.join("\n");
+}
+
+function formatDebugStatus({
+  traceRef,
+  taskTraceRef,
+  providerRef,
+  workspaceDir,
+  llmHistoryRef,
+  subagentsRef,
+  todosRef,
+  planModeRef,
+  contextWindowRef,
+  agent,
+} = {}) {
+  const active = taskTraceRef?.current || null;
+  const saved = taskTraceRef?.lastSaved || null;
+  const llmEntries = Array.isArray(llmHistoryRef?.value?.entries) ? llmHistoryRef.value.entries.length : 0;
+  const activeSubagents = subagentsRef?.value?.active instanceof Map ? subagentsRef.value.active.size : 0;
+  const completedSubagents = Array.isArray(subagentsRef?.value?.completed) ? subagentsRef.value.completed.length : 0;
+  const todos = Array.isArray(todosRef?.value) ? todosRef.value : [];
+  const doneTodos = todos.filter((todo) => String(todo?.status || "").toLowerCase() === "completed").length;
+  const historyMessages = Array.isArray(agent?.history) ? agent.history.length : 0;
+  const historyTokens = typeof agent?.estimateMessagesTokens === "function" ? agent.estimateMessagesTokens(agent.history) : 0;
+  const lines = [
+    "## Debug Status",
+    `trace: ${traceRef?.value ? "on" : "off"}`,
+    `plan mode: ${planModeRef?.value ? "on" : "off"}`,
+    `model: ${providerRef?.value ? formatProviderModel(providerRef.value) : "unknown"}`,
+    `context: ${formatCompactNumber(historyTokens)}/${formatCompactNumber(contextWindowRef?.value || 0)} estimated tokens (${historyMessages} messages)`,
+    `task: ${active ? `${active.id} running ${formatReadableDuration(Date.now() - Date.parse(active.startedAt || Date.now()))}` : "idle"}`,
+    `last trace: ${saved ? `${saved.id} ${saved.status || "-"}` : "none"}`,
+    `llm debug entries: ${llmEntries}`,
+    `subagents: ${activeSubagents} active, ${completedSubagents} recent completed`,
+    `todos: ${doneTodos}/${todos.length}`,
+    `session dir: ${path.relative(workspaceDir, taskTraceRef?.sessionDir || path.join(workspaceDir, ".piecode", "sessions", taskTraceRef?.sessionId || ""))}`,
+  ];
+  if (active?.error) lines.push(`current error: ${active.error}`);
+  if (saved?.error) lines.push(`last error: ${saved.error}`);
+  return lines.join("\n");
 }
 
 async function persistLlmSessionEvent(taskTraceRef, workspaceDir, entry) {
@@ -454,19 +556,29 @@ function printHelp() {
 Usage:
   piecode
   piecode --prompt "fix failing test"
+  piecode --resume <session-id|short-id>
+  piecode --web
   piecode --provider anthropic --api-key "sk-ant-..." --model "claude-3-5-sonnet-latest"
   piecode --help
 
 Options:
   --prompt, -p         One-shot prompt to run
+  --resume, -r         Resume a saved session by full or short id
   --help, -h           Show this help
   --provider, -P       Model provider: anthropic, openai, openrouter, codex, seed
   --api-key, -K        API key for the provider
   --model, -M          Model name to use
   --base-url, -B       Base URL for OpenAI-compatible endpoints (default: https://api.openai.com/v1)
   --skill, -S          Enable skill by name (repeatable)
+  --plugin, -G         Enable plugin by name (repeatable)
+  --plugin-install     Install plugin from local directory or git URL and exit
+  --plugin-update      Update git-backed plugin by name or "all" and exit
+  --plugin-install-project Install plugin into .piecode/plugins instead of ~/.piecode/plugins
   --list-skills        List discovered skills and exit
+  --list-plugins       List discovered plugins and exit
   --tui                Start simple full-screen TUI mode
+  --web                Start browser-based Web UI
+  --tmux-subagents     Open a tmux window for each subagent event stream
   --disable-codex      Disable Codex CLI fallback (equivalent to PIECODE_DISABLE_CODEX_CLI=1)
 
 Environment:
@@ -497,13 +609,16 @@ Environment:
   PIECODE_PLAN_FIRST      Optional (default off; set 1 to enable lightweight pre-plan)
   PIECODE_TOOL_BUDGET     Optional (default 6, range 1-12)
   PIECODE_VERBOSE_TOOL_LOGS Optional (set 1 for full tool input details in logs)
+  PIECODE_LLM_DEBUG_HISTORY Optional (number of LLM debug entries kept in memory; default 20)
   PIECODE_SETTINGS_FILE Optional (default ~/.piecode/settings.json)
   PIECODE_MCP_IMPORT Optional (default 1; set 0 to disable shared MCP config import)
   PIECODE_MCP_CONFIG_PATHS Optional (comma-separated JSON config paths with mcpServers)
   MCP via settings       Configure mcpServers in ~/.piecode/settings.json (overrides imported configs)
   PIECODE_SKILLS_DIR Optional (comma-separated skill root directories)
+  PIECODE_PLUGINS_DIR Optional (comma-separated plugin root directories)
   PIECODE_HISTORY_FILE Optional (default ~/.piecode_history)
   PIECODE_SESSION_EVENTS_FILE Optional JSONL event stream for GUI/remote integrations
+  PIECODE_TMUX_SUBAGENTS Optional (set 1 inside tmux to open windows for subagents; writes/tails local JSONL events that may include prompts/tool output)
 
 Auth fallback order:
   1) Command line arguments --provider/--api-key/--model
@@ -522,12 +637,17 @@ Slash commands in interactive mode:
   /sessions            List recent saved sessions
   /resume <id>         Resume a saved session by full or short id
   /status              Show current task/model/subagent status
+  /btw <question>      Run a background strict-read-only side question while the main task continues
   /agents              Show active and recent subagents
   /plan on|off         Toggle plan mode (safe read-only tools allowed; no file changes)
   /plan                Show current plan mode
   /approve on|off      Toggle shell auto-approval
   /trace on|off        Toggle runtime trace logs (timings/stages)
+  /debug               Show debug status, trace/session paths, and recent error/LLM info
+  /debug status        Show current debug/session state
   /debug llm           Dump latest LLM request/response payloads
+  /debug last          Show the last task summary with error and trace file paths
+  /debug save          Force-save the current session trace/log files
   /model               Show active provider/model
                        Tip: use /model codex:gpt-5.3-codex to force Codex provider
   /mcp                 Show MCP status and usage
@@ -545,6 +665,16 @@ Slash commands in interactive mode:
   /skills use <name>   Enable a skill
   /skills off <name>   Disable a skill
   /skills clear        Disable all skills
+  /plugins             Show active plugins
+  /plugins list        List discovered plugins
+  /plugins commands    List slash commands exposed by plugins
+  /plugins install <source> [--name <name>] [--project]
+                       Install plugin from local directory or git URL
+  /plugins update <name|all>
+                       Update git-backed plugin(s) with git pull --ff-only
+  /plugins use <name>  Enable a plugin
+  /plugins off <name>  Disable plugin
+  /plugins clear       Disable all plugins
   /use <name>          Alias for /skills use <name>
   /skill-creator       Interactive skill creation tool
   /workspace           Return to workspace timeline view
@@ -573,6 +703,7 @@ Skill invocation:
 function parseArgs(argv) {
   const args = {
     prompt: null,
+    resume: null,
     help: false,
     provider: null,
     apiKey: null,
@@ -580,14 +711,27 @@ function parseArgs(argv) {
     baseUrl: null,
     disableCodex: false,
     skills: [],
+    plugins: [],
+    pluginInstall: "",
+    pluginInstallName: "",
+    pluginInstallProject: false,
+    pluginUpdate: "",
     listSkills: false,
+    listPlugins: false,
     tui: false,
+    web: false,
+    tmuxSubagents: false,
+    watchSubagentEvents: "",
+    watchSubagentId: "",
   };
   for (let i = 0; i < argv.length; i += 1) {
     const a = argv[i];
     if (a === "--help" || a === "-h") args.help = true;
     else if (a === "--prompt" || a === "-p") {
       args.prompt = argv[i + 1] || "";
+      i += 1;
+    } else if (a === "--resume" || a === "-r") {
+      args.resume = argv[i + 1] || "";
       i += 1;
     } else if (a === "--provider" || a === "-P") {
       args.provider = argv[i + 1] || "";
@@ -606,10 +750,36 @@ function parseArgs(argv) {
     } else if (a === "--skill" || a === "-S") {
       args.skills.push(argv[i + 1] || "");
       i += 1;
+    } else if (a === "--plugin" || a === "-G") {
+      args.plugins.push(argv[i + 1] || "");
+      i += 1;
+    } else if (a === "--plugin-install") {
+      args.pluginInstall = argv[i + 1] || "";
+      i += 1;
+    } else if (a === "--plugin-install-name" || a === "--plugin-name") {
+      args.pluginInstallName = argv[i + 1] || "";
+      i += 1;
+    } else if (a === "--plugin-install-project") {
+      args.pluginInstallProject = true;
+    } else if (a === "--plugin-update") {
+      args.pluginUpdate = argv[i + 1] || "";
+      i += 1;
     } else if (a === "--list-skills") {
       args.listSkills = true;
+    } else if (a === "--list-plugins") {
+      args.listPlugins = true;
     } else if (a === "--tui") {
       args.tui = true;
+    } else if (a === "--web") {
+      args.web = true;
+    } else if (a === "--tmux-subagents") {
+      args.tmuxSubagents = true;
+    } else if (a === "--watch-subagent-events") {
+      args.watchSubagentEvents = argv[i + 1] || "";
+      i += 1;
+    } else if (a === "--subagent-id") {
+      args.watchSubagentId = argv[i + 1] || "";
+      i += 1;
     }
   }
   return args;
@@ -680,6 +850,7 @@ function trackLlmDebugEvent(llmHistoryRef, direction, payload) {
   if (!llmHistoryRef || !llmHistoryRef.value) return null;
   const state = llmHistoryRef.value;
   if (!Array.isArray(state.entries)) state.entries = [];
+  const maxEntries = Math.max(1, Number.parseInt(process.env.PIECODE_LLM_DEBUG_HISTORY || "20", 10) || 20);
   if (!Number.isFinite(state.seq)) state.seq = 0;
   if (!Number.isFinite(state.index)) state.index = -1;
   const nextId = () => {
@@ -691,6 +862,7 @@ function trackLlmDebugEvent(llmHistoryRef, direction, payload) {
   if (direction === "request") {
     const item = { id: nextId(), request: data, response: null, stage: String(data.stage || "") };
     state.entries.push(item);
+    if (state.entries.length > maxEntries) state.entries = state.entries.slice(-maxEntries);
     state.index = state.entries.length - 1;
     return item;
   }
@@ -708,6 +880,8 @@ function trackLlmDebugEvent(llmHistoryRef, direction, payload) {
     if (!target) {
       target = { id: nextId(), request: null, response: data, stage: String(data.stage || "") };
       state.entries.push(target);
+      if (state.entries.length > maxEntries) state.entries = state.entries.slice(-maxEntries);
+      target = state.entries[state.entries.length - 1];
     } else {
       target.response = data;
     }
@@ -981,6 +1155,51 @@ function formatToolInputSummary(tool, input, maxLen = 120) {
   return summarizeForLog(JSON.stringify(safe), maxLen);
 }
 
+function formatReadableToolRunLine(tool, input = {}) {
+  const name = String(tool || "tool");
+  const summary = formatToolInputSummary(name, input, 180);
+  const suffix = summary && summary !== "<empty>" ? ` ${summary}` : "";
+  switch (name) {
+    case "shell":
+      return `[run] ${summary || "shell command"}`;
+    case "read_file":
+      return `[run] read ${summary || "file"}`;
+    case "read_files":
+      return `[run] read ${summary || "files"}`;
+    case "list_files":
+      return `[run] list ${summary || "."}`;
+    case "glob_files":
+      return `[run] glob ${summary || "**/*"}`;
+    case "find_files":
+      return `[run] find ${summary || "files"}`;
+    case "rg":
+    case "grep":
+    case "search_files":
+      return `[run] search ${summary || "workspace"}`;
+    case "git_status":
+      return "[run] git status";
+    case "git_diff":
+      return `[run] git diff${suffix}`;
+    case "run_tests":
+      return `[run] test ${summary || "npm test"}`;
+    case "edit_file":
+      return `[run] edit ${summary || "file"}`;
+    case "write_file":
+      return `[run] write ${summary || "file"}`;
+    case "apply_patch":
+      return `[run] apply patch${suffix}`;
+    case "replace_in_files":
+      return `[run] replace ${summary || "in files"}`;
+    case "web_search":
+    case "search_web":
+      return `[run] web search ${summary || ""}`.trimEnd();
+    case "subagent":
+      return `[run] subagent ${summary || ""}`.trimEnd();
+    default:
+      return `[run] ${name}${suffix}`;
+  }
+}
+
 function formatToolBatchSummary(calls = [], maxLen = 180) {
   const list = Array.isArray(calls) ? calls : [];
   if (list.length === 0) return "0 tools";
@@ -1004,9 +1223,46 @@ function formatToolBatchSummary(calls = [], maxLen = 180) {
 
 function formatToolResultLinesForTimeline(tool, result, error) {
   if (error) return [];
-  if (tool !== "edit_file") return [];
-
+  const name = String(tool || "");
   const raw = String(result || "").trim();
+  if (!raw) return [];
+
+  if (name === "shell" || name === "run_tests") {
+    const lines = raw.split("\n");
+    const exit = lines.find((line) => /^exit_code:\s*/i.test(line))?.replace(/^exit_code:\s*/i, "").trim();
+    const tooLong = raw.match(/^Result too long[^\n]*/i)?.[0] || "";
+    const previewIdx = lines.findIndex((line) => /^Preview:\s*$/i.test(line));
+    const stdoutIdx = lines.findIndex((line) => /^stdout:\s*$/i.test(line));
+    const stderrIdx = lines.findIndex((line) => /^stderr:\s*$/i.test(line));
+    let bodyLines = [];
+    if (previewIdx >= 0) {
+      bodyLines = lines.slice(previewIdx + 1);
+    } else if (stdoutIdx >= 0) {
+      const stdoutEnd = stderrIdx > stdoutIdx ? stderrIdx : lines.length;
+      bodyLines = lines.slice(stdoutIdx + 1, stdoutEnd);
+      if (bodyLines.join("").trim().length === 0 && stderrIdx >= 0) bodyLines = lines.slice(stderrIdx + 1);
+    } else {
+      bodyLines = lines;
+    }
+    const preview = bodyLines.map((line) => line.trimEnd()).filter(Boolean).slice(0, 4);
+    const out = [];
+    const status = exit ? `exit ${exit}` : name === "run_tests" ? "test result" : "command result";
+    out.push(`[tool-result] ${tooLong || status}`);
+    for (const line of preview) out.push(`[tool-result]   ${summarizeForLog(line, 220)}`);
+    if (bodyLines.filter(Boolean).length > preview.length) {
+      out.push(`[tool-result]   ... (${bodyLines.filter(Boolean).length - preview.length} more lines)`);
+    }
+    return out;
+  }
+
+  if (name === "git_status" || name === "git_diff" || name === "rg" || name === "grep" || name === "search_files") {
+    const lines = raw.split("\n").map((line) => line.trimEnd()).filter(Boolean).slice(0, 8);
+    if (lines.length === 0) return [];
+    return [`[tool-result] ${name === "git_status" ? "status:" : "result:"}`, ...lines.map((line) => `[tool-result]   ${summarizeForLog(line, 220)}`)];
+  }
+
+  if (name !== "edit_file") return [];
+
   if (!raw) return [];
 
   try {
@@ -1521,85 +1777,6 @@ function isTaskAbortError(err) {
   );
 }
 
-function getGitChangedFileSet(workspaceDir) {
-  try {
-    const out = spawnSync("git", ["status", "--porcelain"], {
-      cwd: workspaceDir,
-      encoding: "utf8",
-      timeout: 5000,
-    });
-    if (out.status !== 0) return null;
-    const files = new Set();
-    for (const raw of String(out.stdout || "").split("\n")) {
-      const line = raw.trimEnd();
-      if (!line) continue;
-      const body = line.slice(3).trim();
-      if (!body) continue;
-      const renamed = body.split(" -> ");
-      files.add((renamed[renamed.length - 1] || body).trim());
-    }
-    return files;
-  } catch {
-    return null;
-  }
-}
-
-function parseNumstatOutput(raw, targetMap) {
-  const map = targetMap || new Map();
-  for (const lineRaw of String(raw || "").split("\n")) {
-    const line = lineRaw.trim();
-    if (!line) continue;
-    const parts = line.split("\t");
-    if (parts.length < 3) continue;
-    const addRaw = parts[0];
-    const delRaw = parts[1];
-    const fileRaw = parts.slice(2).join("\t").trim();
-    const file = fileRaw.split(" -> ").pop().trim();
-    const add = Number.isFinite(Number(addRaw)) ? Number(addRaw) : 0;
-    const del = Number.isFinite(Number(delRaw)) ? Number(delRaw) : 0;
-    const prev = map.get(file) || { add: 0, del: 0 };
-    map.set(file, { add: prev.add + add, del: prev.del + del });
-  }
-  return map;
-}
-
-function getGitNumstatMap(workspaceDir) {
-  try {
-    const map = new Map();
-    const unstaged = spawnSync("git", ["diff", "--numstat"], {
-      cwd: workspaceDir,
-      encoding: "utf8",
-      timeout: 5000,
-    });
-    if (unstaged.status === 0) parseNumstatOutput(unstaged.stdout, map);
-
-    const staged = spawnSync("git", ["diff", "--cached", "--numstat"], {
-      cwd: workspaceDir,
-      encoding: "utf8",
-      timeout: 5000,
-    });
-    if (staged.status === 0) parseNumstatOutput(staged.stdout, map);
-    return map;
-  } catch {
-    return null;
-  }
-}
-
-function diffGitNumstat(beforeMap, afterMap) {
-  const out = [];
-  if (!(beforeMap instanceof Map) || !(afterMap instanceof Map)) return out;
-  const files = new Set([...beforeMap.keys(), ...afterMap.keys()]);
-  for (const file of files) {
-    const before = beforeMap.get(file) || { add: 0, del: 0 };
-    const after = afterMap.get(file) || { add: 0, del: 0 };
-    const add = Math.max(0, after.add - before.add);
-    const del = Math.max(0, after.del - before.del);
-    if (add > 0 || del > 0) out.push({ file, add, del });
-  }
-  out.sort((a, b) => a.file.localeCompare(b.file));
-  return out;
-}
-
 function formatToolCounts(tools) {
   const counts = new Map();
   for (const t of Array.isArray(tools) ? tools : []) {
@@ -1610,57 +1787,6 @@ function formatToolCounts(tools) {
   return [...counts.entries()]
     .map(([k, n]) => `${k} x${n}`)
     .join(", ");
-}
-
-function buildTurnSummary({ tools = [], filesChanged = [], fileStats = [], useColor = false } = {}) {
-  const toolText = formatToolCounts(tools) || "none";
-  const files = Array.isArray(filesChanged)
-    ? filesChanged.map((f) => String(f || "").trim()).filter(Boolean)
-    : [];
-  const filesText = files.length > 0 ? files.join(", ") : "none";
-  const green = (s) => (useColor ? `\x1b[32m${s}\x1b[0m` : s);
-  const red = (s) => (useColor ? `\x1b[31m${s}\x1b[0m` : s);
-  const statsLines = Array.isArray(fileStats)
-    ? fileStats.map((s) => {
-        const file = String(s?.file || "").trim();
-        if (!file) return null;
-        const add = Number(s?.add || 0);
-        const del = Number(s?.del || 0);
-        return `  - ${file} ${green(`+${add}`)} ${red(`-${del}`)}`;
-      }).filter(Boolean)
-    : [];
-  return [
-    "Summary:",
-    `- Actions: ${toolText}`,
-    `- Files changed: ${filesText}`,
-    ...(statsLines.length > 0 ? ["- Diff stat:", ...statsLines] : []),
-  ].join("\n");
-}
-
-function shouldShowTurnSummary({ tools = [], filesChanged = [] } = {}) {
-  const files = Array.isArray(filesChanged)
-    ? filesChanged.map((f) => String(f || "").trim()).filter(Boolean)
-    : [];
-  if (files.length > 0) return true;
-
-  const list = Array.isArray(tools) ? tools.map((t) => String(t || "").trim()).filter(Boolean) : [];
-  if (list.length === 0) return false;
-
-  // Show summary only for materially active turns.
-  const significantTools = new Set([
-    "write_file",
-    "edit_file",
-    "apply_patch",
-    "replace_in_files",
-    "shell",
-    "run_tests",
-    "todo_write",
-    "todowrite",
-  ]);
-  if (list.some((t) => significantTools.has(t))) return true;
-  if (list.length >= 3) return true;
-
-  return false;
 }
 
 async function waitForTuiApproval({ stdinStream, defaultYes }) {
@@ -1748,21 +1874,49 @@ function advanceTodosOnTurnDone(todos) {
   return next;
 }
 
+function applyTodoState(todosRef, todos, { sessionBus = null, tui = null, autoTrackRef = null, autoTrack = null } = {}) {
+  if (!todosRef) return [];
+  const normalized = normalizeTodos(todos);
+  todosRef.value = normalized;
+  if (autoTrackRef && typeof autoTrack === "boolean") autoTrackRef.value = autoTrack;
+  sessionBus?.emit?.("todos.update", { todos: normalized });
+  if (tui && typeof tui.setTodos === "function") tui.setTodos(normalized);
+  return normalized;
+}
+
+function formatResumeCommand(sessionId, { binary = "piecode" } = {}) {
+  const id = String(sessionId || "").trim();
+  const command = `${String(binary || "piecode").trim() || "piecode"} --resume ${id}`;
+  return { id, shortId: shortSessionId(id), command };
+}
+
+function formatSessionExitSummary(session) {
+  const sessionId = String(session?.sessionId || "").trim();
+  if (!sessionId) return [];
+  const resume = formatResumeCommand(sessionId);
+  return [
+    `[session] id: ${sessionId}`,
+    `[session] quick resume: ${resume.command}`,
+  ];
+}
+
 function formatSessionListForDisplay(sessions) {
   const list = Array.isArray(sessions) ? sessions : [];
   if (list.length === 0) return "No resumable sessions yet.";
   return [
     "## Recent Sessions",
     ...list.map((item, index) => {
-      const shortId = item.shortId || shortSessionId(item.sessionId);
+      const resume = formatResumeCommand(item.sessionId);
+      const shortId = item.shortId || resume.shortId;
       const updated = item.updatedAt ? new Date(item.updatedAt).toLocaleString() : "unknown time";
-      return `${index + 1}. \`${shortId}\` — ${item.summary || "PieCode session"}\n   ${updated} · ${item.messageCount || 0} messages · ${item.toolCount || 0} tools\n   Resume: \`/resume ${shortId}\` or \`/resume ${item.sessionId}\``;
+      return `${index + 1}. \`${shortId}\` — ${item.summary || "PieCode session"}\n   ${updated} · ${item.messageCount || 0} messages · ${item.toolCount || 0} tools\n   Resume: \`/resume ${shortId}\`, \`/resume ${item.sessionId}\`, or \`${resume.command}\``;
     }),
   ].join("\n");
 }
 
-async function saveCliResumableSession({ workspaceDir, taskTraceRef, agent, todosRef, providerRef, logLine = null }) {
-  if (!agent || !Array.isArray(agent.history) || agent.history.length === 0) return null;
+async function saveCliResumableSession({ workspaceDir, taskTraceRef, agent, todosRef, providerRef, logLine = null, force = false }) {
+  if (!agent || !Array.isArray(agent.history)) return null;
+  if (agent.history.length === 0 && !force) return null;
   const messages = agent.history
     .filter((msg) => msg?.role === "user" || msg?.role === "assistant")
     .map((msg, index) => ({
@@ -1772,8 +1926,10 @@ async function saveCliResumableSession({ workspaceDir, taskTraceRef, agent, todo
       content: String(msg.content || ""),
       at: new Date().toISOString(),
     }));
+  const sessionId = taskTraceRef?.sessionId || makeSessionId();
+  if (taskTraceRef && !taskTraceRef.sessionId) taskTraceRef.sessionId = sessionId;
   const saved = await saveResumableSession(workspaceDir, {
-    sessionId: taskTraceRef?.sessionId || makeSessionId(),
+    sessionId,
     providerLabel: providerRef?.value ? formatProviderModel(providerRef.value) : "",
     messages,
     timeline: messages,
@@ -1782,8 +1938,9 @@ async function saveCliResumableSession({ workspaceDir, taskTraceRef, agent, todo
   });
   const shortId = shortSessionId(saved.sessionId);
   if (typeof logLine === "function") {
+    const resume = formatResumeCommand(saved.sessionId);
     logLine(`[session] saved ${saved.sessionId}`);
-    logLine(`[session] resume with /resume ${shortId} or /resume ${saved.sessionId}`);
+    logLine(`[session] resume with /resume ${shortId}, /resume ${saved.sessionId}, or ${resume.command}`);
   }
   return { ...saved, shortId };
 }
@@ -1791,6 +1948,65 @@ async function saveCliResumableSession({ workspaceDir, taskTraceRef, agent, todo
 function formatSkillLabel(activeSkillsRef) {
   const skills = activeSkillsRef.value.map((s) => s.name);
   return skills.length > 0 ? skills.join(",") : "none";
+}
+
+function formatPluginLabel(activePluginsRef) {
+  const plugins = activePluginsRef.value.map((p) => p.name);
+  return plugins.length > 0 ? plugins.join(",") : "none";
+}
+
+function printPluginList(pluginIndex, logLine) {
+  const plugins = [...pluginIndex.values()].sort((a, b) => a.name.localeCompare(b.name));
+  if (plugins.length === 0) {
+    logLine("no plugins discovered");
+    return;
+  }
+  logLine("## Plugins");
+  const commandIndex = discoverPluginCommands(pluginIndex);
+  for (const plugin of plugins) {
+    const commands = [...commandIndex.values()]
+      .filter((command) => command.pluginName === plugin.name)
+      .map((command) => command.slash)
+      .sort((a, b) => a.localeCompare(b));
+    const commandText = commands.length > 0 ? ` (commands: ${commands.join(", ")})` : "";
+    const versionText = plugin.version ? ` v${plugin.version}` : "";
+    logLine(`- **${plugin.name}**${versionText}${plugin.description ? `: ${plugin.description}` : ""}${commandText}`);
+  }
+}
+
+function printPluginCommandList(pluginIndex, logLine) {
+  const commands = [...discoverPluginCommands(pluginIndex).values()].sort((a, b) => a.name.localeCompare(b.name));
+  if (commands.length === 0) {
+    logLine("no plugin commands discovered");
+    return;
+  }
+  logLine("## Plugin Commands");
+  for (const command of commands) {
+    const description = command.description ? `: ${command.description}` : "";
+    logLine(`- **${command.slash}** -> ${command.pluginName}${description}`);
+  }
+}
+
+function parsePluginInstallArgs(input) {
+  const parsed = splitCommandArgs(input);
+  if (parsed.error) return { error: parsed.error };
+  const args = parsed.args;
+  const out = { source: "", name: "", project: false, error: "" };
+  for (let i = 0; i < args.length; i += 1) {
+    const item = args[i];
+    if (item === "--project") {
+      out.project = true;
+      continue;
+    }
+    if (item === "--name") {
+      out.name = args[i + 1] || "";
+      i += 1;
+      continue;
+    }
+    if (!out.source) out.source = item;
+  }
+  if (!out.source) out.error = "missing plugin source";
+  return out;
 }
 
 function printSkillList(skillIndex, logLine) {
@@ -1883,7 +2099,7 @@ function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
   if (warning) tui.event(warning);
 }
 
-function createCompleter(getSkillIndex, getModelCatalog = null, getMcpServerNames = null) {
+function createCompleter(getSkillIndex, getModelCatalog = null, getMcpServerNames = null, getPluginIndex = null) {
   return (line, callback) => {
     const input = String(line || "");
     const trimmed = input.trimStart();
@@ -1894,7 +2110,9 @@ function createCompleter(getSkillIndex, getModelCatalog = null, getMcpServerName
     }
 
     const skillIndex = typeof getSkillIndex === "function" ? getSkillIndex() : getSkillIndex;
+    const pluginIndex = typeof getPluginIndex === "function" ? getPluginIndex() : getPluginIndex;
     const skillNames = [...skillIndex.keys()].sort((a, b) => a.localeCompare(b));
+    const pluginNames = pluginIndex instanceof Map ? [...pluginIndex.keys()].sort((a, b) => a.localeCompare(b)) : [];
     const modelCatalog =
       typeof getModelCatalog === "function"
         ? getModelCatalog()
@@ -1911,6 +2129,9 @@ function createCompleter(getSkillIndex, getModelCatalog = null, getMcpServerName
     const skillCommandNames = [...discoverSkillCommands(skillIndex).values()]
       .map((command) => command.slash)
       .sort((a, b) => a.localeCompare(b));
+    const pluginCommandNames = pluginIndex instanceof Map
+      ? [...discoverPluginCommands(pluginIndex).values()].map((command) => command.slash).sort((a, b) => a.localeCompare(b))
+      : [];
     const tryComplete = (candidates, fragment) => {
       const hits = candidates.filter((item) => item.startsWith(fragment));
       callback(null, [hits.length ? hits : candidates, fragment]);
@@ -1932,6 +2153,25 @@ function createCompleter(getSkillIndex, getModelCatalog = null, getMcpServerName
       const match = trimmed.match(/^\/use(?:\s+(.*))?$/i);
       const fragment = (match?.[1] || "").trim();
       tryComplete(skillNames, fragment);
+      return;
+    }
+    if (/^\/plugins\s+use(?:\s+.*)?$/i.test(trimmed)) {
+      const match = trimmed.match(/^\/plugins\s+use(?:\s+(.*))?$/i);
+      const fragment = (match?.[1] || "").trim();
+      tryComplete(pluginNames, fragment);
+      return;
+    }
+    if (/^\/plugins\s+off(?:\s+.*)?$/i.test(trimmed)) {
+      const match = trimmed.match(/^\/plugins\s+off(?:\s+(.*))?$/i);
+      const fragment = (match?.[1] || "").trim();
+      tryComplete(pluginNames, fragment);
+      return;
+    }
+    if (/^\/plugins(?:\s+.*)?$/i.test(trimmed)) {
+      const fragment = trimmed.replace(/^\/plugins\s*/i, "");
+      const candidates = ["/plugins", "/plugins list", "/plugins commands", "/plugins install", "/plugins update", "/plugins use", "/plugins off", "/plugins clear"];
+      if (!fragment) callback(null, [candidates, fragment]);
+      else tryComplete(candidates, fragment);
       return;
     }
     if (/^\/model(?:\s+.*)?$/i.test(trimmed)) {
@@ -1977,7 +2217,7 @@ function createCompleter(getSkillIndex, getModelCatalog = null, getMcpServerName
       return;
     }
 
-    tryComplete([...SLASH_COMMANDS, ...skillCommandNames], trimmed);
+    tryComplete([...SLASH_COMMANDS, ...pluginCommandNames, ...skillCommandNames], trimmed);
   };
 }
 
@@ -2059,13 +2299,15 @@ function isMultilineShortcut(str, key = {}) {
   return false;
 }
 
-function getSuggestionsForInput(line, getSkillIndex, getModelCatalog = null, getMcpServerNames = null) {
+function getSuggestionsForInput(line, getSkillIndex, getModelCatalog = null, getMcpServerNames = null, getPluginIndex = null) {
   const input = String(line || "");
   const trimmed = input.trimStart();
   if (!trimmed.startsWith("/")) return [];
 
   const skillIndex = typeof getSkillIndex === "function" ? getSkillIndex() : getSkillIndex;
+  const pluginIndex = typeof getPluginIndex === "function" ? getPluginIndex() : getPluginIndex;
   const skillNames = [...skillIndex.keys()].sort((a, b) => a.localeCompare(b));
+  const pluginNames = pluginIndex instanceof Map ? [...pluginIndex.keys()].sort((a, b) => a.localeCompare(b)) : [];
   const mcpNamesRaw =
     typeof getMcpServerNames === "function"
       ? getMcpServerNames()
@@ -2076,6 +2318,9 @@ function getSuggestionsForInput(line, getSkillIndex, getModelCatalog = null, get
   const skillCommandNames = [...discoverSkillCommands(skillIndex).values()]
     .map((command) => command.slash)
     .sort((a, b) => a.localeCompare(b));
+  const pluginCommandNames = pluginIndex instanceof Map
+    ? [...discoverPluginCommands(pluginIndex).values()].map((command) => command.slash).sort((a, b) => a.localeCompare(b))
+    : [];
 
   const filterByPrefix = (candidates, fragment) => {
     const hits = candidates.filter((item) => item.startsWith(fragment));
@@ -2096,6 +2341,22 @@ function getSuggestionsForInput(line, getSkillIndex, getModelCatalog = null, get
     const match = trimmed.match(/^\/use(?:\s+(.*))?$/i);
     const fragment = (match?.[1] || "").trim();
     return filterByPrefix(skillNames, fragment);
+  }
+  if (/^\/plugins\s+use(?:\s+.*)?$/i.test(trimmed)) {
+    const match = trimmed.match(/^\/plugins\s+use(?:\s+(.*))?$/i);
+    const fragment = (match?.[1] || "").trim();
+    return filterByPrefix(pluginNames, fragment);
+  }
+  if (/^\/plugins\s+off(?:\s+.*)?$/i.test(trimmed)) {
+    const match = trimmed.match(/^\/plugins\s+off(?:\s+(.*))?$/i);
+    const fragment = (match?.[1] || "").trim();
+    return filterByPrefix(pluginNames, fragment);
+  }
+  if (/^\/plugins(?:\s+.*)?$/i.test(trimmed)) {
+    const fragment = trimmed.replace(/^\/plugins\s*/i, "");
+    const candidates = ["/plugins", "/plugins list", "/plugins commands", "/plugins install", "/plugins update", "/plugins use", "/plugins off", "/plugins clear"];
+    if (!fragment) return candidates;
+    return filterByPrefix(candidates, fragment);
   }
 
   if (/^\/model(?:\s+.*)?$/i.test(trimmed)) {
@@ -2133,7 +2394,7 @@ function getSuggestionsForInput(line, getSkillIndex, getModelCatalog = null, get
     return filterByPrefix(candidates, fragment);
   }
 
-  return filterByPrefix([...SLASH_COMMANDS, ...skillCommandNames], trimmed);
+  return filterByPrefix([...SLASH_COMMANDS, ...pluginCommandNames, ...skillCommandNames], trimmed);
 }
 
 async function collectWorkspaceFilesForMentions(workspaceDir, maxEntries = FILE_MENTION_INDEX_MAX) {
@@ -2200,47 +2461,27 @@ async function maybeAutoEnableSkills(input, activeSkillsRef, skillIndex, logLine
   }
 }
 
-async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef, workspaceDir, options = {}) {
+async function maybeAutoEnablePlugins(input, activePluginsRef, pluginIndex, logLine) {
+  const result = await autoEnablePlugins(input, activePluginsRef, pluginIndex);
+  if (result.enabled.length > 0) {
+    const sections = [];
+    if (result.byTrigger.length > 0) sections.push(`trigger: ${result.byTrigger.join(", ")}`);
+    if (result.byMention.length > 0) sections.push(`mention: ${result.byMention.join(", ")}`);
+    const details = sections.length > 0 ? ` (${sections.join(" | ")})` : "";
+    logLine(`auto-enabled plugins: ${result.enabled.join(", ")}${details}`);
+  }
+}
+
+async function runAgentTurn(agent, input, tui, logLine, display, workspaceDir, options = {}) {
   const startedAt = Date.now();
   const planOnly = Boolean(options?.planOnly);
   const attachments = Array.isArray(options?.attachments) ? options.attachments : [];
   if (tui) tui.beginTurn();
-  const beforeGitSet = getGitChangedFileSet(workspaceDir);
-  const beforeGitNumstat = getGitNumstatMap(workspaceDir);
-  if (turnSummaryRef?.value) {
-    turnSummaryRef.value.active = true;
-    turnSummaryRef.value.tools = [];
-    turnSummaryRef.value.filesChanged = new Set();
-    turnSummaryRef.value.beforeGitSet = beforeGitSet;
-    turnSummaryRef.value.beforeGitNumstat = beforeGitNumstat;
-  }
   try {
     const result = await agent.runTurn(input, { planOnly, attachments });
     const durationMs = Date.now() - startedAt;
     if (tui) tui.onTurnSuccess(durationMs);
-    const afterGitSet = getGitChangedFileSet(workspaceDir);
-    const afterGitNumstat = getGitNumstatMap(workspaceDir);
-    const filesChangedSet = new Set([...(turnSummaryRef?.value?.filesChanged || [])]);
-    if (beforeGitSet && afterGitSet) {
-      for (const file of afterGitSet) {
-        if (!beforeGitSet.has(file)) filesChangedSet.add(file);
-      }
-    }
-    const fileStats = diffGitNumstat(beforeGitNumstat, afterGitNumstat);
-    for (const stat of fileStats) filesChangedSet.add(stat.file);
-    const turnSummary = buildTurnSummary({
-      tools: turnSummaryRef?.value?.tools || [],
-      filesChanged: [...filesChangedSet],
-      fileStats,
-      useColor: Boolean(tui),
-    });
-    const baseOutput = typeof result === "string" ? result : JSON.stringify(result, null, 2);
-    const output = shouldShowTurnSummary({
-      tools: turnSummaryRef?.value?.tools || [],
-      filesChanged: [...filesChangedSet],
-    })
-      ? `${baseOutput}\n\n${turnSummary}`
-      : baseOutput;
+    const output = typeof result === "string" ? result : JSON.stringify(result, null, 2);
     if (tui) {
       const usage = tui.getTurnTokenUsage();
       logLine(`[response] ${output}`);
@@ -2248,6 +2489,7 @@ async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef,
         `[result] done | time: ${formatReadableDuration(durationMs)} | tok ↑${formatCompactNumber(usage.sent)} ↓${formatCompactNumber(usage.received)}`
       );
       tui.clearLiveThought();
+      tui.setInputHints(buildInputHints({ lastUserMessage: input, assistantText: output }));
       tui.render("", "done");
     } else if (display) {
       display.onResponse(output);
@@ -2268,6 +2510,7 @@ async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef,
         tui.render("", "aborted");
       } else {
         tui.event(`error: ${err.message}`);
+        tui.setInputHints(buildInputHints({ lastUserMessage: input, assistantText: err.message, hadError: true }));
         tui.render("", "error");
       }
     } else if (display) {
@@ -2276,10 +2519,6 @@ async function runAgentTurn(agent, input, tui, logLine, display, turnSummaryRef,
       console.error(`error: ${aborted ? "Task aborted by user." : err.message}`);
     }
     return { ok: false, aborted, error: aborted ? "aborted" : String(err?.message || "error") };
-  } finally {
-    if (turnSummaryRef?.value) {
-      turnSummaryRef.value.active = false;
-    }
   }
 }
 
@@ -2384,9 +2623,34 @@ async function handleNonInterruptingCommand(input, ctx = {}) {
     logLine(`status: task running | model=${model} | subagents=${active} active`);
     return true;
   }
+  if (lower === "/btw" || lower.startsWith("/btw ")) {
+    startBtwTask(raw, ctx);
+    return true;
+  }
   if (lower === "/help") {
-    logLine("running commands: /status, /agents, /debug llm, /help");
+    logLine("running commands: /btw <question>, /status, /agents, /debug, /debug status, /debug llm, /help");
     logLine("other commands are deferred until the current task finishes");
+    return true;
+  }
+  if (lower === "/debug" || lower === "/debug status") {
+    logLine(
+      formatDebugStatus({
+        traceRef: ctx.traceRef,
+        taskTraceRef: ctx.taskTraceRef,
+        providerRef: ctx.providerRef,
+        workspaceDir: ctx.workspaceDir,
+        llmHistoryRef: ctx.llmHistoryRef,
+        subagentsRef: ctx.subagentsRef,
+        todosRef: ctx.todosRef,
+        planModeRef: ctx.planModeRef,
+        contextWindowRef: ctx.contextWindowRef,
+        agent: ctx.agent,
+      })
+    );
+    return true;
+  }
+  if (lower === "/debug last") {
+    logLine(formatDebugSavedTrace(ctx.taskTraceRef?.lastSaved, ctx.workspaceDir));
     return true;
   }
   if (lower === "/debug llm") {
@@ -2394,7 +2658,52 @@ async function handleNonInterruptingCommand(input, ctx = {}) {
     return true;
   }
   logLine(`command not available while task is running: ${raw}`);
-  logLine("available now: /status, /agents, /debug llm, /help");
+  logLine("available now: /btw <question>, /status, /agents, /debug, /debug llm, /help");
+  return true;
+}
+
+function startBtwTask(input, ctx = {}) {
+  const raw = String(input || "").trim();
+  const task = raw.replace(/^\/btw(?:\s+|$)/i, "").trim();
+  const logLine = ctx.logLine || (() => {});
+  const agent = ctx.agent;
+  if (!task) {
+    logLine("usage: /btw <read-only question>");
+    return false;
+  }
+  if (!agent || typeof agent.runSubagent !== "function") {
+    logLine("/btw unavailable: subagent support is not configured");
+    return false;
+  }
+  const active = ctx.subagentsRef?.value?.active instanceof Map ? ctx.subagentsRef.value.active.size : 0;
+  logLine(`[btw] started read-only task${active > 0 ? ` (${active + 1} active)` : ""}: ${summarizeForLog(task, 140)}`);
+  void agent
+    .runSubagent(
+      {
+        task,
+        context: [
+          "This is a user-invoked /btw background task.",
+          "It must be strict read-only and must not modify files, todos, memory, settings, shell state, services, or external systems.",
+          "Answer concisely so the main task can continue uninterrupted.",
+          ctx.currentTask ? `Main task currently running: ${ctx.currentTask}` : "",
+        ]
+          .filter(Boolean)
+          .join("\n"),
+        mode: "analysis",
+        toolBudget: 3,
+      },
+      { strictReadOnly: true }
+    )
+    .then((result) => {
+      const text = String(result || "").trim();
+      logLine(`[btw] done: ${summarizeForLog(task, 100)}`);
+      for (const line of text.split("\n").filter(Boolean).slice(0, 18)) {
+        logLine(`[btw] ${line}`);
+      }
+    })
+    .catch((err) => {
+      logLine(`[btw] failed: ${String(err?.message || err)}`);
+    });
   return true;
 }
 
@@ -2406,6 +2715,9 @@ async function handleSlashCommand(input, ctx) {
     providerRef,
     skillIndex,
     activeSkillsRef,
+    pluginIndex,
+    activePluginsRef,
+    refreshPluginIndex,
     logLine,
     rl,
     skillRoots,
@@ -2536,13 +2848,18 @@ async function handleSlashCommand(input, ctx) {
         "/clear",
         "/compact",
         "/sessions",
-        "/resume <id>",
+        "/resume <id>  (or piecode --resume <id>)",
         "/status",
+        "/btw <question>",
         "/agents",
         "/plan",
         "/approve on|off",
         "/trace on|off",
+        "/debug",
+        "/debug status",
         "/debug llm",
+        "/debug last",
+        "/debug save",
         "/model",
         "/mcp",
         "/mcp list",
@@ -2557,6 +2874,12 @@ async function handleSlashCommand(input, ctx) {
         "/skills use <name>",
         "/skills off <name>",
         "/skills clear",
+        "/plugins",
+        "/plugins list",
+        "/plugins commands",
+        "/plugins use <name>",
+        "/plugins off <name>",
+        "/plugins clear",
         "/use <name>",
         "/skill-creator",
         "/attach image",
@@ -2570,11 +2893,13 @@ async function handleSlashCommand(input, ctx) {
   if (lower === "/clear") {
     agent.clearHistory();
     if (ctx.todosRef) {
-      ctx.todosRef.value = [];
-      ctx.sessionBus?.emit?.("todos.update", { todos: [] });
-      if (ctx.tui) ctx.tui.setTodos([]);
+      applyTodoState(ctx.todosRef, [], {
+        sessionBus: ctx.sessionBus,
+        tui: ctx.tui,
+        autoTrackRef: ctx.todoAutoTrackRef,
+        autoTrack: false,
+      });
     }
-    if (ctx.todoAutoTrackRef) ctx.todoAutoTrackRef.value = false;
     if (ctx.tui) {
       ctx.tui.resetContextUsage();
       ctx.tui.render("", "context cleared");
@@ -2585,6 +2910,15 @@ async function handleSlashCommand(input, ctx) {
   if (lower === "/status") {
     const active = ctx.subagentsRef?.value?.active instanceof Map ? ctx.subagentsRef.value.active.size : 0;
     logLine(`status: idle | model=${formatProviderModel(providerRef.value)} | subagents=${active} active`);
+    return { done: false, handled: true };
+  }
+  if (lower === "/btw" || lower.startsWith("/btw ")) {
+    startBtwTask(raw, {
+      agent,
+      logLine,
+      subagentsRef: ctx.subagentsRef,
+      currentTask: "",
+    });
     return { done: false, handled: true };
   }
   if (lower === "/agents" || lower === "/subagents") {
@@ -2606,9 +2940,15 @@ async function handleSlashCommand(input, ctx) {
       const sessionId = await resolveResumableSessionId(workspaceDir, query);
       const session = await loadResumableSession(workspaceDir, sessionId);
       agent.history = Array.isArray(session.agentHistory) ? session.agentHistory : [];
-      if (ctx.todosRef) ctx.todosRef.value = Array.isArray(session.todos) ? session.todos : [];
+      if (ctx.todosRef) {
+        applyTodoState(ctx.todosRef, Array.isArray(session.todos) ? session.todos : [], {
+          sessionBus,
+          tui,
+          autoTrackRef: ctx.todoAutoTrackRef,
+          autoTrack: false,
+        });
+      }
       if (tui) {
-        tui.setTodos(ctx.todosRef?.value || []);
         refreshTuiContextUsage?.();
       }
       logLine(`resumed session ${session.sessionId} (${session.messages?.length || agent.history.length} messages)`);
@@ -2673,6 +3013,37 @@ async function handleSlashCommand(input, ctx) {
       logLine(`trace ${mode}`);
     } else {
       logLine("usage: /trace on|off");
+    }
+    return { done: false, handled: true };
+  }
+  if (lower === "/debug" || lower === "/debug status") {
+    logLine(
+      formatDebugStatus({
+        traceRef,
+        taskTraceRef: ctx.taskTraceRef,
+        providerRef,
+        workspaceDir,
+        llmHistoryRef,
+        subagentsRef: ctx.subagentsRef,
+        todosRef: ctx.todosRef,
+        planModeRef,
+        contextWindowRef: ctx.contextWindowRef,
+        agent,
+      })
+    );
+    logLine("debug commands: /debug llm | /debug last | /debug save | /trace on|off");
+    return { done: false, handled: true };
+  }
+  if (lower === "/debug last") {
+    logLine(formatDebugSavedTrace(ctx.taskTraceRef?.lastSaved, workspaceDir));
+    return { done: false, handled: true };
+  }
+  if (lower === "/debug save") {
+    if (ctx.taskTraceRef?.current) {
+      const saved = await finishTaskTrace(ctx.taskTraceRef, workspaceDir, { status: "debug-save", sessionBus });
+      logLine(saved ? formatDebugSavedTrace(saved, workspaceDir) : "debug save failed: no trace written");
+    } else {
+      logLine(formatDebugSavedTrace(ctx.taskTraceRef?.lastSaved, workspaceDir));
     }
     return { done: false, handled: true };
   }
@@ -2999,6 +3370,87 @@ async function handleSlashCommand(input, ctx) {
     logLine("all skills disabled");
     return { done: false, handled: true };
   }
+  if (lower === "/plugins" || lower === "/plugin") {
+    const names = activePluginsRef.value.map((plugin) => plugin.name);
+    if (names.length === 0) {
+      logLine("active plugins: none");
+    } else {
+      logLine("## Active Plugins");
+      for (const name of names) logLine(`- **${name}**`);
+    }
+    return { done: false, handled: true };
+  }
+  if (lower === "/plugins list" || lower === "/plugin list") {
+    printPluginList(pluginIndex, logLine);
+    return { done: false, handled: true };
+  }
+  if (lower === "/plugins commands" || lower === "/plugin commands") {
+    printPluginCommandList(pluginIndex, logLine);
+    return { done: false, handled: true };
+  }
+  if (lower.startsWith("/plugins install ") || lower.startsWith("/plugin install ")) {
+    const payload = raw.replace(/^\/plugins?\s+install\s+/i, "").trim();
+    const parsed = parsePluginInstallArgs(payload);
+    if (parsed.error) {
+      logLine(`usage: /plugins install <source> [--name <name>] [--project] (${parsed.error})`);
+      return { done: false, handled: true };
+    }
+    try {
+      const result = await installPlugin({
+        source: parsed.source,
+        name: parsed.name,
+        project: parsed.project,
+        workspaceDir,
+      });
+      if (typeof refreshPluginIndex === "function") await refreshPluginIndex();
+      logLine(`installed plugin: ${result.name} -> ${path.relative(workspaceDir, result.dir) || result.dir}`);
+      logLine(`enable with: /plugins use ${result.name}`);
+    } catch (err) {
+      logLine(`plugin install failed: ${String(err?.message || err)}`);
+    }
+    return { done: false, handled: true };
+  }
+  if (lower.startsWith("/plugins update") || lower.startsWith("/plugin update")) {
+    const target = raw.replace(/^\/plugins?\s+update\s*/i, "").trim() || "all";
+    const targets = target.toLowerCase() === "all" ? [...pluginIndex.values()] : [pluginIndex.get(target)].filter(Boolean);
+    if (targets.length === 0) {
+      logLine(`plugin not found: ${target}`);
+      return { done: false, handled: true };
+    }
+    for (const plugin of targets) {
+      try {
+        const result = await updatePlugin({ plugin });
+        logLine(result.ok ? `updated plugin: ${plugin.name}` : `plugin update skipped: ${plugin.name} (${result.reason})`);
+      } catch (err) {
+        logLine(`plugin update failed: ${plugin.name}: ${String(err?.message || err)}`);
+      }
+    }
+    if (typeof refreshPluginIndex === "function") await refreshPluginIndex();
+    return { done: false, handled: true };
+  }
+  if (lower === "/plugins clear" || lower === "/plugin clear") {
+    activePluginsRef.value = [];
+    logLine("all plugins disabled");
+    return { done: false, handled: true };
+  }
+  if (lower.startsWith("/plugins use ") || lower.startsWith("/plugin use ")) {
+    const target = raw.replace(/^\/plugins?\s+use\s+/i, "").trim();
+    const result = await addPluginByName(activePluginsRef.value, pluginIndex, target);
+    activePluginsRef.value = result.active;
+    if (result.added) logLine(`enabled plugin: ${target}`);
+    else if (result.reason === "already-enabled") logLine(`plugin already enabled: ${target}`);
+    else if (result.reason === "not-found") logLine(`plugin not found: ${target}`);
+    else if (result.reason === "unreadable") logLine(`plugin unreadable: ${target}`);
+    else logLine("unable to enable plugin");
+    return { done: false, handled: true };
+  }
+  if (lower.startsWith("/plugins off ") || lower.startsWith("/plugin off ")) {
+    const target = raw.replace(/^\/plugins?\s+off\s+/i, "").trim();
+    const result = removePluginByName(activePluginsRef.value, target);
+    activePluginsRef.value = result.active;
+    logLine(result.removed ? `disabled plugin: ${target}` : `plugin not active: ${target}`);
+    return { done: false, handled: true };
+  }
   if (lower.startsWith("/use ")) {
     await enableSkillByName(normalized.slice("/use ".length).trim(), activeSkillsRef, skillIndex, logLine);
     return { done: false, handled: true };
@@ -3049,6 +3501,25 @@ async function handleSlashCommand(input, ctx) {
       }
     }
     return { done: false, handled: true };
+  }
+
+  const pluginCommand = resolvePluginCommand(raw, pluginIndex);
+  if (pluginCommand) {
+    const result = await addPluginByName(activePluginsRef.value, pluginIndex, pluginCommand.pluginName);
+    if (result.added) {
+      activePluginsRef.value = result.active;
+      logLine(`enabled plugin for command ${pluginCommand.slash}: ${pluginCommand.pluginName}`);
+    } else if (result.reason === "not-found" || result.reason === "unreadable") {
+      logLine(`plugin command unavailable: ${pluginCommand.slash} (${result.reason})`);
+      return { done: false, handled: true };
+    }
+    ctx.commandRunRef = ctx.commandRunRef || { value: null };
+    ctx.commandRunRef.value = {
+      input: pluginCommand.prompt,
+      displayName: pluginCommand.slash,
+      pluginName: pluginCommand.pluginName,
+    };
+    return { done: false, handled: false, commandRun: ctx.commandRunRef.value };
   }
 
   const skillCommand = resolveSkillCommand(raw, skillIndex);
@@ -3614,6 +4085,19 @@ async function main() {
     printHelp();
     return;
   }
+  if (args.web) {
+    const web = await import("./web/server.js");
+    await web.main();
+    return;
+  }
+  if (args.watchSubagentEvents) {
+    await watchSubagentEventsFile({
+      filePath: args.watchSubagentEvents,
+      subagentId: args.watchSubagentId,
+      out: stdout,
+    });
+    return;
+  }
 
   // Handle --disable-codex option
   if (args.disableCodex) {
@@ -3635,19 +4119,64 @@ async function main() {
   const refreshSkillIndex = async () => {
     skillIndex = await discoverSkills(skillRoots);
   };
+  const pluginRoots = resolvePluginRoots(settings, workspaceDir);
+  let pluginIndex = await discoverPlugins(pluginRoots);
+  const refreshPluginIndex = async () => {
+    pluginIndex = await discoverPlugins(pluginRoots);
+    return pluginIndex;
+  };
   const requestedSkills = resolveRequestedSkills(args.skills, settings);
   const { active: activeSkillsInitial, missing: missingSkills } = await loadActiveSkills(
     skillIndex,
     requestedSkills
   );
   const activeSkillsRef = { value: activeSkillsInitial };
+  const requestedPlugins = [
+    ...resolveRequestedPlugins(args.plugins, settings),
+    ...getDefaultPluginNames(pluginIndex, settings),
+  ];
+  const { active: activePluginsInitial, missing: missingPlugins } = await loadActivePlugins(
+    pluginIndex,
+    requestedPlugins
+  );
+  const activePluginsRef = { value: activePluginsInitial };
 
   if (missingSkills.length > 0) {
     console.error(`warning: missing skills: ${missingSkills.join(", ")}`);
   }
+  if (missingPlugins.length > 0) {
+    console.error(`warning: missing plugins: ${missingPlugins.join(", ")}`);
+  }
+
+  if (args.pluginInstall) {
+    const result = await installPlugin({
+      source: args.pluginInstall,
+      name: args.pluginInstallName,
+      project: args.pluginInstallProject,
+      workspaceDir,
+    });
+    console.log(`installed plugin: ${result.name}`);
+    console.log(`path: ${result.dir}`);
+    console.log(`enable with: piecode --plugin ${result.name}`);
+    return;
+  }
+  if (args.pluginUpdate) {
+    const target = String(args.pluginUpdate || "all").trim() || "all";
+    const targets = target.toLowerCase() === "all" ? [...pluginIndex.values()] : [pluginIndex.get(target)].filter(Boolean);
+    if (targets.length === 0) throw new Error(`Plugin not found: ${target}`);
+    for (const plugin of targets) {
+      const result = await updatePlugin({ plugin });
+      console.log(result.ok ? `updated plugin: ${plugin.name}` : `plugin update skipped: ${plugin.name} (${result.reason})`);
+    }
+    return;
+  }
 
   if (args.listSkills) {
     printSkillList(skillIndex, console.log);
+    return;
+  }
+  if (args.listPlugins) {
+    printPluginList(pluginIndex, console.log);
     return;
   }
 
@@ -3688,15 +4217,34 @@ async function main() {
   const llmStreamRef = { value: { turn: "", planning: "", replanning: "" } };
   const llmPendingRequestTokensRef = { value: new Map() };
   const traceStateRef = { value: { turnId: 0, turnStartedAt: 0, llmStageStart: {}, toolStartByName: {} } };
-  const turnSummaryRef = {
-    value: { active: false, tools: [], filesChanged: new Set(), beforeGitSet: null },
+  if (args.resume !== null && !String(args.resume || "").trim()) {
+    throw new Error("--resume requires a session id or short id");
+  }
+  const requestedResumeId = String(args.resume || "").trim();
+  const startupResumeSession = requestedResumeId
+    ? await loadResumableSession(workspaceDir, await resolveResumableSessionId(workspaceDir, requestedResumeId))
+    : null;
+  const taskTraceRef = {
+    seq: 0,
+    current: null,
+    lastSaved: null,
+    sessionId: startupResumeSession?.sessionId || makeSessionId(),
+    sessionDir: "",
   };
-  const taskTraceRef = { seq: 0, current: null, sessionId: makeSessionId(), sessionDir: "" };
+  const tmuxSubagentOptions = resolveTmuxSubagentOptions({
+    args,
+    env: process.env,
+    workspaceDir,
+    sessionId: taskTraceRef.sessionId,
+  });
+  const sessionEventsFile =
+    process.env.PIECODE_SESSION_EVENTS_FILE ||
+    (tmuxSubagentOptions.enabled && tmuxSubagentOptions.available ? tmuxSubagentOptions.eventsFile : "");
   const subagentsRef = { value: { active: new Map(), completed: [] } };
   const sessionBus = new SessionEventBus({ sessionId: taskTraceRef.sessionId });
   const sessionState = new AgentSessionState({ sessionId: taskTraceRef.sessionId });
   sessionBus.subscribe((event) => sessionState.apply(event));
-  const sessionSink = createJsonlSessionSink(process.env.PIECODE_SESSION_EVENTS_FILE || "");
+  const sessionSink = createJsonlSessionSink(sessionEventsFile);
   if (sessionSink) sessionBus.subscribe(sessionSink);
   const currentInputRef = { value: "" };
   const keepIdleStatusRef = { value: false };
@@ -3704,6 +4252,7 @@ async function main() {
   const todoAutoTrackRef = { value: false };
   const fileMentionIndexRef = { files: [], loading: false, lastLoadedAt: 0 };
   const exitArmedRef = { value: false };
+  const userExitRequestedRef = { value: false };
   const approvalActiveRef = { value: false };
   const suppressNextSubmitRef = { value: false };
   const pendingCommandSubmitRef = { value: "" };
@@ -3764,6 +4313,7 @@ async function main() {
         shouldHandleKeypress: (str, key = {}) => {
           if (tui && tui.isOverlayOpen && tui.isOverlayOpen()) return false;
           const name = String(key?.name || "").toLowerCase();
+          if (key?.ctrl && name === "c") return false;
           const tabLike = name === "tab" || str === "\t";
           const navLike = name === "up" || name === "down";
           const enterLike = name === "return" || name === "enter" || str === "\r" || str === "\n";
@@ -3792,7 +4342,8 @@ async function main() {
       completer: createCompleter(
         () => skillIndex,
         () => modelCatalogRef.value,
-        () => getMcpServerNamesForSuggestions()
+        () => getMcpServerNamesForSuggestions(),
+        () => pluginIndex
       ),
     });
     next.history = Array.isArray(history) ? [...history] : [];
@@ -3839,6 +4390,7 @@ async function main() {
       workspaceDir,
       providerLabel: () => formatProviderModel(providerRef.value),
       getSkillsLabel: () => formatSkillLabel(activeSkillsRef),
+      getPluginsLabel: () => formatPluginLabel(activePluginsRef),
       getApprovalLabel: () => (autoApproveRef.value ? "on" : "off"),
     });
     tui.setProjectInstructionsStatus(projectInstructionsStatusRef.value);
@@ -3898,6 +4450,19 @@ async function main() {
     recordTaskLog(taskTraceRef, line),
     sessionBus
   );
+  let tmuxSubagentWatcher = null;
+  if (tmuxSubagentOptions.enabled && !tmuxSubagentOptions.available) {
+    logLine("tmux subagent windows requested but not running inside tmux; continuing without tmux windows");
+  } else if (tmuxSubagentOptions.enabled && sessionEventsFile) {
+    tmuxSubagentWatcher = createTmuxSubagentWatcher({
+      sessionBus,
+      eventsFile: sessionEventsFile,
+      workspaceDir,
+      cliPath: fileURLToPath(import.meta.url),
+      log: (line) => logLine(line),
+    });
+    logLine(`tmux subagent windows enabled; event log: ${path.relative(workspaceDir, sessionEventsFile) || sessionEventsFile}`);
+  }
   if (!oneShotPromptMode) {
     void probeAvailableModels({
       settings,
@@ -4143,7 +4708,13 @@ async function main() {
                   tui,
                   agent,
                   providerRef,
+                  traceRef,
+                  taskTraceRef,
+                  workspaceDir,
                   subagentsRef,
+                  todosRef,
+                  planModeRef,
+                  contextWindowRef,
                   llmHistoryRef,
                   llmLastRef,
                 }).catch((err) => logLine(`command failed: ${String(err?.message || err)}`));
@@ -4167,6 +4738,24 @@ async function main() {
           return;
         }
         if (key.ctrl && key.name === "c") {
+          if (taskRunningRef.value) {
+            const requested = agent.requestAbort();
+            tui.clearInputHint();
+            tui.render(currentInputRef.value, requested ? "aborting task..." : "no active task to abort");
+            return;
+          }
+          if (emptyInput) {
+            userExitRequestedRef.value = true;
+            currentInputRef.value = "";
+            tui.clearInputHint();
+            tui.render("", "exiting");
+            try {
+              rl.close();
+            } catch {
+              // no-op
+            }
+            return;
+          }
           exitArmedRef.value = false;
           suppressNextSubmitRef.value = false;
           pendingCommandSubmitRef.value = "";
@@ -4281,7 +4870,8 @@ async function main() {
                 currentLine,
                 () => skillIndex,
                 () => modelCatalogRef.value,
-                () => getMcpServerNamesForSuggestions()
+                () => getMcpServerNamesForSuggestions(),
+                () => pluginIndex
               ).slice(0, 8);
               if (commandOptions.length > 0) {
                 commandPickerRef.active = true;
@@ -4445,7 +5035,8 @@ async function main() {
         currentLine,
         () => skillIndex,
         () => modelCatalogRef.value,
-        () => getMcpServerNamesForSuggestions()
+        () => getMcpServerNamesForSuggestions(),
+        () => pluginIndex
       ).slice(0, 8);
       if (suggestions.length === 0) {
         if (display) display.clearSuggestions();
@@ -4657,6 +5248,7 @@ async function main() {
     autoApproveRef,
     askApproval,
     activeSkillsRef,
+    activePluginsRef,
     projectInstructionsRef,
     memoryRef,
     agentDefinitionsRef,
@@ -4665,335 +5257,76 @@ async function main() {
     contextWindowRef,
     shellPermissionRef,
     onTodoWrite: (nextTodos) => {
-      todosRef.value = normalizeTodos(nextTodos);
-      todoAutoTrackRef.value = false;
-      sessionBus.emit("todos.update", { todos: todosRef.value });
-      if (tui) tui.setTodos(todosRef.value);
+      applyTodoState(todosRef, nextTodos, {
+        sessionBus,
+        tui,
+        autoTrackRef: todoAutoTrackRef,
+        autoTrack: false,
+      });
     },
     onMemoryWrite: (result) => {
       if (result?.scope) {
         logLine(`[memory] saved ${result.scope}: ${result.relPath || result.path}`);
       }
     },
-    onEvent: (evt) => {
-      if (evt && typeof evt === "object") {
-        sessionBus.emit(`agent.${String(evt.type || "event")}`, evt);
-      }
-      if (evt.type === "subagent_start") {
-        recordTaskEvent(taskTraceRef, evt);
-        updateSubagentState(subagentsRef, evt);
-        logLine(`[agent] start ${evt.id}: ${summarizeForLog(evt.task, 120)}`);
-      }
-      if (evt.type === "subagent_event") {
-        recordTaskEvent(taskTraceRef, evt);
-        updateSubagentState(subagentsRef, evt);
-      }
-      if (evt.type === "subagent_end") {
-        recordTaskEvent(taskTraceRef, evt);
-        updateSubagentState(subagentsRef, evt);
-        const suffix = evt.error ? ` error=${summarizeForLog(evt.error, 120)}` : "";
-        logLine(`[agent] ${evt.status || "done"} ${evt.id}: ${summarizeForLog(evt.task, 120)}${suffix}`);
-      }
-      if (evt.type === "model_call") {
-        recordTaskEvent(taskTraceRef, evt);
-        const label = formatProviderModel({ kind: evt.provider, model: evt.model });
-        if (tui) tui.onModelCall(label);
-        logLine(`[model] ${label}`);
-      }
-      if (evt.type === "planning_call") {
-        recordTaskEvent(taskTraceRef, evt);
-        if (tui) tui.onModelCall(formatProviderModel({ kind: evt.provider, model: evt.model }));
-        logLine(`[plan] creating plan`);
-      }
-      if (evt.type === "replanning_call") {
-        recordTaskEvent(taskTraceRef, evt);
-        if (tui) tui.onModelCall(formatProviderModel({ kind: evt.provider, model: evt.model }));
-        logLine(`[plan] revising plan`);
-      }
-      if (evt.type === "plan") {
-        recordTaskEvent(taskTraceRef, evt);
-        if (display) display.onPlan(evt.plan);
-        const budget = evt.plan?.toolBudget ?? "-";
-        const summary = evt.plan?.summary ? ` - ${evt.plan.summary}` : "";
-        logLine(`[plan] budget=${budget}${summary}`);
-        if (todosRef.value.length === 0 && shouldAutoTrackTodosFromPlan(evt.plan)) {
-          const seeded = seedTodosFromPlan(evt.plan);
-          if (seeded.length > 0) {
-            todosRef.value = seeded;
-            todoAutoTrackRef.value = true;
-            if (tui) tui.setTodos(todosRef.value);
-          }
-        } else {
-          todoAutoTrackRef.value = false;
-        }
-      }
-      if (evt.type === "replan") {
-        recordTaskEvent(taskTraceRef, evt);
-        if (display) display.onPlan(evt.plan);
-        const budget = evt.plan?.toolBudget ?? "-";
-        const summary = evt.plan?.summary ? ` - ${evt.plan.summary}` : "";
-        logLine(`[plan] updated budget=${budget}${summary}`);
-      }
-      if (evt.type === "plan_progress") {
-        recordTaskEvent(taskTraceRef, evt);
-        logLine(`[plan] ${evt.message}`);
-      }
-      if (evt.type === "context_compacted") {
-        recordTaskEvent(taskTraceRef, evt);
-        if (tui) refreshTuiContextUsage();
-        const before = formatCompactNumber(evt.beforeTokens || 0);
-        const after = formatCompactNumber(evt.afterTokens || 0);
-        const limit = evt.limit ? `/${formatCompactNumber(evt.limit)}` : "";
-        logLine(
-          `[context] auto compacted: ${evt.beforeMessages} -> ${evt.afterMessages} messages | tok ${before} -> ${after}${limit}`
-        );
-      }
-      if (evt.type === "llm_request") {
-        recordTaskEvent(taskTraceRef, evt);
-        const endpoint = inferEndpointForProvider(providerOptionsRef.value, providerRef.value);
-        const sentChars = String(evt.payload || "").length;
-        const requestProvider = providerPrefix(providerRef.value?.kind);
-        const requestModel = String(providerRef.value?.model || "");
-        llmLastRef.value.request = {
-          at: new Date().toISOString(),
-          stage: String(evt.stage || ""),
-          provider: requestProvider,
-          model: requestModel,
-          endpoint,
-          payload: String(evt.payload || ""),
-        };
-        const trackedRequest = trackLlmDebugEvent(llmHistoryRef, "request", llmLastRef.value.request);
-        void persistLlmSessionEvent(taskTraceRef, workspaceDir, {
-          at: llmLastRef.value.request.at,
-          type: "llm_request",
-          pairId: trackedRequest?.id || null,
-          turnId: traceStateRef.value.turnId,
-          taskId: taskTraceRef.current?.id || "",
-          stage: llmLastRef.value.request.stage,
-          provider: requestProvider,
-          model: requestModel,
-          endpoint,
-          payload: llmLastRef.value.request.payload,
-        });
-        recordTaskLlm(taskTraceRef, {
-          direction: "request",
-          stage: evt.stage,
-          provider: requestProvider,
-          model: requestModel,
-          endpoint,
-          chars: sentChars,
-          payload: evt.payload,
-        });
-        if (traceRef.value) {
-          traceStateRef.value.llmStageStart[evt.stage] = Date.now();
-          logLine(`[trace] llm_request stage=${evt.stage} chars=${sentChars}`);
-        }
-        if (tui) tui.onThinking(evt.stage);
-        if (display) display.onThinking(evt.stage);
-        if (llmStreamRef.value && Object.prototype.hasOwnProperty.call(llmStreamRef.value, evt.stage)) {
-          llmStreamRef.value[evt.stage] = "";
-        }
-        if (tui && evt.stage === "turn") {
-          tui.setLiveThought("Analyzing request...");
-        }
-        const sentTokens = estimateTokenCount(evt.payload);
-        addPendingRequestTokens(evt.stage, sentTokens);
-        if (tui) refreshTuiContextUsage();
-        logLine(`[thinking] request:${evt.stage} endpoint:${endpoint} ${summarizeForLog(evt.payload)}`);
-      }
-      if (evt.type === "llm_response_delta") {
-        recordTaskEvent(taskTraceRef, evt);
-        const trackedThinking = appendThinkingToLlmDebugEvent(llmHistoryRef, evt.stage, evt.delta);
-        void persistLlmSessionEvent(taskTraceRef, workspaceDir, {
-          at: new Date().toISOString(),
-          type: "llm_response_delta",
-          pairId: trackedThinking?.id || null,
-          turnId: traceStateRef.value.turnId,
-          taskId: taskTraceRef.current?.id || "",
-          stage: String(evt.stage || ""),
-          delta: String(evt.delta || ""),
-        });
-        if (llmStreamRef.value && Object.prototype.hasOwnProperty.call(llmStreamRef.value, evt.stage)) {
-          llmStreamRef.value[evt.stage] += String(evt.delta || "");
-        }
-        // Keep streamed model internals out of the user timeline. The UI shows
-        // coarse phase/tool status instead, and explicit thought/tool reasons are
-        // surfaced as short stage updates below.
-      }
-      if (evt.type === "llm_response") {
-        recordTaskEvent(taskTraceRef, evt);
-        const normalizedUsage = normalizeTokenUsage(evt.usage);
-        const responseProvider = providerPrefix(providerRef.value?.kind);
-        const responseModel = String(providerRef.value?.model || "");
-        const responseEndpoint = inferEndpointForProvider(providerOptionsRef.value, providerRef.value);
-        const responseChars = String(evt.payload || "").length;
-        const startedAt = Number(traceStateRef.value.llmStageStart[evt.stage] || 0);
-        const responseDurationMs = startedAt > 0 ? Date.now() - startedAt : 0;
-        llmLastRef.value.response = {
-          at: new Date().toISOString(),
-          stage: String(evt.stage || ""),
-          provider: responseProvider,
-          model: responseModel,
-          endpoint: responseEndpoint,
-          usage: normalizedUsage,
-          payload: String(evt.payload || ""),
-        };
-        const trackedResponse = trackLlmDebugEvent(llmHistoryRef, "response", llmLastRef.value.response);
-        void persistLlmSessionEvent(taskTraceRef, workspaceDir, {
-          at: llmLastRef.value.response.at,
-          type: "llm_response",
-          pairId: trackedResponse?.id || null,
-          turnId: traceStateRef.value.turnId,
-          taskId: taskTraceRef.current?.id || "",
-          stage: llmLastRef.value.response.stage,
-          provider: responseProvider,
-          model: responseModel,
-          endpoint: responseEndpoint,
-          usage: normalizedUsage,
-          durationMs: responseDurationMs,
-          thinking: String(trackedResponse?.thinking || ""),
-          payload: llmLastRef.value.response.payload,
-        });
-        recordTaskLlm(taskTraceRef, {
-          direction: "response",
-          stage: evt.stage,
-          provider: responseProvider,
-          model: responseModel,
-          endpoint: responseEndpoint,
-          usage: normalizedUsage,
-          chars: responseChars,
-          durationMs: responseDurationMs,
-          payload: evt.payload,
-        });
-        if (traceRef.value) {
-          logLine(
-            `[trace] llm_response stage=${evt.stage} chars=${responseChars} duration=${responseDurationMs}ms`
-          );
-        }
-        if (llmStreamRef.value && Object.prototype.hasOwnProperty.call(llmStreamRef.value, evt.stage)) {
-          llmStreamRef.value[evt.stage] = String(evt.payload || "");
-        }
-        if (tui && evt.stage === "turn") {
-          const preview = extractThinkingFromFinalModelPayload(llmStreamRef.value.turn);
-          if (preview) tui.setLiveThought(formatStageUpdate(preview));
-        }
-        const pendingSent = consumePendingRequestTokens(evt.stage);
-        let sentTokens = normalizedUsage?.input_tokens ?? null;
-        let receivedTokens = normalizedUsage?.output_tokens ?? null;
-        if (sentTokens == null) sentTokens = pendingSent > 0 ? pendingSent : null;
-        if (receivedTokens == null && normalizedUsage?.total_tokens != null) {
-          const derivedSent = sentTokens != null ? sentTokens : pendingSent;
-          const total = normalizedUsage.total_tokens;
-          receivedTokens = Math.max(0, total - Math.max(0, derivedSent || 0));
-        }
-        if (sentTokens == null) sentTokens = 0;
-        if (receivedTokens == null) receivedTokens = estimateTokenCount(evt.payload);
-        if (tui) {
-          tui.addTokenUsage({ sent: sentTokens, received: receivedTokens });
-          refreshTuiContextUsage();
-        }
-        logLine(`[thinking] response:${evt.stage} ${summarizeThinkingResponseForLog(evt.payload)}`);
-      }
-      if (evt.type === "thinking_done") {
-        recordTaskEvent(taskTraceRef, evt);
-        if (tui) tui.onThinkingDone();
-        if (display) display.onThinkingDone();
-      }
-      if (evt.type === "thought") {
-        recordTaskEvent(taskTraceRef, evt);
-        const update = formatStageUpdate(evt.content);
-        if (tui && update) tui.setLiveThought(update);
-        if (display && update) display.onThought(update);
-        if (update) logLine(`[thought] ${update}`);
-      }
-      if (evt.type === "tool_batch_start") {
-        recordTaskEvent(taskTraceRef, evt);
-        if (display) display.onToolBatchUse(evt.calls);
-        const calls = Array.isArray(evt.calls) ? evt.calls : [];
-        const label = traceRef.value || verboseToolLogs ? formatToolBatchSummary(calls) : formatToolCounts(calls.map((call) => call?.tool));
-        logLine(`[tools] ${label || "tools"}`);
-      }
-      if (evt.type === "tool_use") {
-        recordTaskEvent(taskTraceRef, evt);
-        const isTodoTool = evt.tool === "todo_write" || evt.tool === "todowrite";
-        if (turnSummaryRef.value.active) {
-          turnSummaryRef.value.tools.push(evt.tool);
-          if (evt.tool === "write_file" && evt.input?.path) {
-            turnSummaryRef.value.filesChanged.add(String(evt.input.path));
-          }
-          if (evt.tool === "edit_file" && evt.input?.path) {
-            turnSummaryRef.value.filesChanged.add(String(evt.input.path));
-          }
-          if (evt.tool === "apply_patch" && evt.input?.path) {
-            turnSummaryRef.value.filesChanged.add(String(evt.input.path));
-          }
-          if (evt.tool === "replace_in_files" && evt.input?.apply) {
-            const root = String(evt.input?.path || ".").trim();
-            turnSummaryRef.value.filesChanged.add(root || ".");
-          }
-        }
-        if (tui) tui.onToolUse(evt.tool);
-        if (tui && evt.reason) {
-          const update = formatStageUpdate(evt.reason);
-          if (update) tui.setLiveThought(update);
-        }
-        if (display && !evt.parallel) display.onToolUse(evt.tool, evt.input, evt.reason);
-        const summary = formatToolInputSummary(evt.tool, evt.input, 100);
-        if (isTodoTool) {
-          // keep todo activity in status bar only
-        } else if (evt.parallel) {
-          // batch header already logged by tool_batch_start
-        } else if (traceRef.value || verboseToolLogs) {
-          const details = Object.entries(evt.input || {})
-            .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-            .join(" ");
-          logLine(
-            `[tool] ${evt.tool}${evt.reason ? ` - ${summarizeForLog(evt.reason, 120)}` : ""}${details ? ` (${details})` : ""}`
-          );
-        } else {
-          logLine(`[tool] ${evt.tool}${summary ? ` (${summary})` : ""}`);
-        }
-      }
-      if (evt.type === "tool_start") {
-        recordTaskEvent(taskTraceRef, evt);
-        if (traceRef.value) {
-          traceStateRef.value.toolStartByName[evt.tool] = Date.now();
-          logLine(`[trace] tool_start name=${evt.tool}`);
-        }
-        if (display) display.onToolStart(evt.tool, evt.input);
-        if (traceRef.value || verboseToolLogs) {
-          const details = Object.entries(evt.input || {})
-            .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-            .join(" ");
-          logLine(`[run] ${evt.tool}${details ? ` ${details}` : ""}`);
-        } else {
-          logLine(`[run] ${evt.tool}`);
-        }
-        if (todoAutoTrackRef.value && evt.tool !== "todo_write" && evt.tool !== "todowrite") {
-          const advanced = advanceTodosOnToolStart(todosRef.value);
-          if (advanced.length > 0) {
-            todosRef.value = advanced;
-            sessionBus.emit("todos.update", { todos: todosRef.value });
-            if (tui) tui.setTodos(todosRef.value);
-          }
-        }
-      }
-      if (evt.type === "tool_end") {
-        recordTaskEvent(taskTraceRef, evt);
-        if (traceRef.value) {
-          const startedAt = Number(traceStateRef.value.toolStartByName[evt.tool] || 0);
-          const durationMs = startedAt > 0 ? Date.now() - startedAt : 0;
-          const err = evt.error ? "yes" : "no";
-          logLine(`[trace] tool_end name=${evt.tool} duration=${durationMs}ms error=${err}`);
-        }
-        if (display) display.onToolEnd(evt.tool, evt.result, evt.error);
-        if (tui) {
-          const toolLines = formatToolResultLinesForTimeline(evt.tool, evt.result, evt.error);
-          for (const line of toolLines) logLine(line);
-        }
-      }
-    },
+    onEvent: createAgentEventHandler({
+      sessionBus,
+      recordTaskEvent,
+      taskTraceRef,
+      updateSubagentState,
+      subagentsRef,
+      logLine,
+      summarizeForLog,
+      formatProviderModel,
+      tui,
+      display,
+      shouldAutoTrackTodosFromPlan,
+      seedTodosFromPlan,
+      applyTodoState,
+      todosRef,
+      todoAutoTrackRef,
+      refreshTuiContextUsage,
+      formatCompactNumber,
+      inferEndpointForProvider,
+      providerOptionsRef,
+      providerRef,
+      llmLastRef,
+      trackLlmDebugEvent,
+      llmHistoryRef,
+      persistLlmSessionEvent,
+      workspaceDir,
+      traceStateRef,
+      recordTaskLlm,
+      traceRef,
+      llmStreamRef,
+      estimateTokenCount,
+      addPendingRequestTokens,
+      summarizeThinkingResponseForLog,
+      appendThinkingToLlmDebugEvent,
+      extractThinkingFromFinalModelPayload,
+      formatStageUpdate,
+      normalizeTokenUsage,
+      consumePendingRequestTokens,
+      providerPrefix,
+      verboseToolLogs,
+      formatToolBatchSummary,
+      formatToolCounts,
+      formatToolInputSummary,
+      formatReadableToolRunLine,
+      formatToolResultLinesForTimeline,
+      advanceTodosOnToolStart,
+    }),
   });
+
+  if (startupResumeSession) {
+    agent.history = Array.isArray(startupResumeSession.agentHistory) ? startupResumeSession.agentHistory : [];
+    applyTodoState(todosRef, Array.isArray(startupResumeSession.todos) ? startupResumeSession.todos : [], {
+      sessionBus,
+      tui,
+      autoTrackRef: todoAutoTrackRef,
+      autoTrack: false,
+    });
+  }
 
   const refreshMcpHub = async ({ announce = true } = {}) => {
     const merged = await mergeCommonMcpServers(settings, {
@@ -5022,13 +5355,17 @@ async function main() {
   };
 
   let shutdownComplete = false;
-  const shutdown = async () => {
+  const shutdown = async ({ announceSession = false, savedSession = null } = {}) => {
     if (shutdownComplete) return;
     shutdownComplete = true;
+    const exitSummaryLines = announceSession
+      ? formatSessionExitSummary(savedSession || { sessionId: taskTraceRef.sessionId })
+      : [];
     try {
       await saveHistory(historyFile, rl.history);
     } finally {
       if (mcpHubRef.value) await mcpHubRef.value.close();
+      if (tmuxSubagentWatcher && typeof tmuxSubagentWatcher.close === "function") tmuxSubagentWatcher.close();
       if (onKeypress && keypressSource && typeof keypressSource.off === "function") {
         keypressSource.off("keypress", onKeypress);
       }
@@ -5042,6 +5379,7 @@ async function main() {
       }
       if (tui) tui.stop();
       rl.close();
+      for (const line of exitSummaryLines) console.log(line);
     }
   };
 
@@ -5065,6 +5403,10 @@ async function main() {
       const autoSkillResult = await autoEnableSkills(args.prompt, activeSkillsRef, skillIndex);
       if (autoSkillResult.enabled.length > 0) {
         console.log(`auto-enabled skills: ${autoSkillResult.enabled.join(", ")}`);
+      }
+      const autoPluginResult = await autoEnablePlugins(args.prompt, activePluginsRef, pluginIndex);
+      if (autoPluginResult.enabled.length > 0) {
+        console.log(`auto-enabled plugins: ${autoPluginResult.enabled.join(", ")}`);
       }
 
       try {
@@ -5104,6 +5446,9 @@ async function main() {
     if (activeSkillsRef.value.length > 0) {
       tui.event(`skills: ${activeSkillsRef.value.map((s) => s.name).join(", ")}`);
     }
+    if (activePluginsRef.value.length > 0) {
+      tui.event(`plugins: ${activePluginsRef.value.map((p) => p.name).join(", ")}`);
+    }
     if (startupAutoSkills.enabled.length > 0) {
       tui.event(`auto-loaded skills: ${startupAutoSkills.enabled.join(", ")}`);
     }
@@ -5112,6 +5457,10 @@ async function main() {
     }
     if (planModeRef.value) {
       tui.event("plan mode: on (safe read-only tools allowed, no file changes)");
+    }
+    if (startupResumeSession) {
+      tui.event(`resumed session ${startupResumeSession.sessionId} (${startupResumeSession.messages?.length || agent.history.length} messages)`);
+      refreshTuiContextUsage?.();
     }
     tui.render(currentInputRef.value, "Type /help for commands");
   } else {
@@ -5130,6 +5479,9 @@ async function main() {
     if (activeSkillsRef.value.length > 0) {
       console.log(`skills: ${activeSkillsRef.value.map((s) => s.name).join(", ")}`);
     }
+    if (activePluginsRef.value.length > 0) {
+      console.log(`plugins: ${activePluginsRef.value.map((p) => p.name).join(", ")}`);
+    }
     if (startupAutoSkills.enabled.length > 0) {
       console.log(`auto-loaded skills: ${startupAutoSkills.enabled.join(", ")}`);
     }
@@ -5138,6 +5490,10 @@ async function main() {
     }
     if (planModeRef.value) {
       console.log("plan mode: on (safe read-only tools allowed, no file changes)");
+    }
+    if (startupResumeSession) {
+      console.log(`resumed session ${startupResumeSession.sessionId} (${startupResumeSession.messages?.length || agent.history.length} messages)`);
+      refreshTuiContextUsage?.();
     }
     console.log("Type /help for commands.");
   }
@@ -5187,6 +5543,7 @@ async function main() {
       if (!isInputAbort) throw err;
 
       if (tui) {
+        if (userExitRequestedRef.value) break;
         if (!exitArmedRef.value && String(rl.line || "").trim().length === 0) {
           exitArmedRef.value = true;
           tui.setInputHint("Press CTRL+D again to exit.");
@@ -5283,6 +5640,9 @@ async function main() {
       providerRef,
       skillIndex,
       activeSkillsRef,
+      pluginIndex,
+      activePluginsRef,
+      refreshPluginIndex,
       logLine,
       rl,
       skillRoots,
@@ -5303,6 +5663,8 @@ async function main() {
       todoAutoTrackRef,
       llmLastRef,
       llmHistoryRef,
+      taskTraceRef,
+      contextWindowRef,
       sessionBus,
       refreshTuiContextUsage,
       commandRunRef,
@@ -5331,7 +5693,8 @@ async function main() {
     const agentInput = commandRun?.input || finalInput;
     if (commandRun) {
       startTaskTrace(taskTraceRef, { sessionBus, input: finalInput, kind: "agent" });
-      logLine(`[task] ${commandRun.displayName} ${commandRun.skillName ? `(${commandRun.skillName})` : ""}`.trim());
+      const owner = commandRun.skillName || commandRun.pluginName || "";
+      logLine(`[task] ${commandRun.displayName} ${owner ? `(${owner})` : ""}`.trim());
       if (tui) tui.setProjectInstructionsVisible(false);
     }
 
@@ -5345,6 +5708,7 @@ async function main() {
     }
 
     await maybeAutoEnableSkills(agentInput, activeSkillsRef, skillIndex, logLine);
+    await maybeAutoEnablePlugins(agentInput, activePluginsRef, pluginIndex, logLine);
     const turnAttachments = Array.isArray(pendingAttachmentsRef.value) ? pendingAttachmentsRef.value : [];
     pendingAttachmentsRef.value = [];
     if (turnAttachments.length > 0) {
@@ -5359,7 +5723,6 @@ async function main() {
         tui,
         logLine,
         display,
-        turnSummaryRef,
         workspaceDir,
         { planOnly: planModeRef.value, attachments: turnAttachments }
       );
@@ -5380,6 +5743,15 @@ async function main() {
       }
       if (tui) tui.clearInputHint();
     }
+    if (todoAutoTrackRef.value) {
+      const advancedAfterTurn = advanceTodosOnTurnDone(todosRef.value);
+      if (advancedAfterTurn.length > 0) {
+        applyTodoState(todosRef, advancedAfterTurn, {
+          sessionBus,
+          tui,
+        });
+      }
+    }
     await saveCliResumableSession({
       workspaceDir,
       taskTraceRef,
@@ -5394,18 +5766,18 @@ async function main() {
         : 0;
       logLine(`[trace] turn_end id=${traceStateRef.value.turnId} duration=${elapsed}ms`);
     }
-    if (todoAutoTrackRef.value) {
-      const advancedAfterTurn = advanceTodosOnTurnDone(todosRef.value);
-      if (advancedAfterTurn.length > 0) {
-        todosRef.value = advancedAfterTurn;
-        sessionBus.emit("todos.update", { todos: todosRef.value });
-        if (tui) tui.setTodos(todosRef.value);
-      }
-    }
     currentInputRef.value = "";
   }
 
-  await shutdown();
+  const finalSavedSession = await saveCliResumableSession({
+    workspaceDir,
+    taskTraceRef,
+    agent,
+    todosRef,
+    providerRef,
+    force: true,
+  });
+  await shutdown({ announceSession: true, savedSession: finalSavedSession });
 }
 
 main().catch((err) => {

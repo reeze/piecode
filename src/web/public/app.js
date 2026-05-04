@@ -1,3 +1,6 @@
+const authToken = new URLSearchParams(window.location.search).get("token") || "";
+const apiUrl = (path) => authToken ? `${path}${path.includes("?") ? "&" : "?"}token=${encodeURIComponent(authToken)}` : path;
+
 const state = {
   connected: false,
   running: false,
@@ -30,11 +33,27 @@ const el = {
   abortBtn: document.getElementById("abortBtn"),
   planOnly: document.getElementById("planOnly"),
   autoApprove: document.getElementById("autoApprove"),
+  detailMode: document.getElementById("detailMode"),
   approvalList: document.getElementById("approvalList"),
   sessionIdLabel: document.getElementById("sessionIdLabel"),
   recentSessions: document.getElementById("recentSessions"),
   todoList: document.getElementById("todoList"),
   eventStrip: document.getElementById("eventStrip"),
+  sessionDiffBtn: document.getElementById("sessionDiffBtn"),
+  diffOverlay: document.getElementById("diffOverlay"),
+  diffBody: document.getElementById("diffBody"),
+  diffMeta: document.getElementById("diffMeta"),
+  refreshDiffBtn: document.getElementById("refreshDiffBtn"),
+  closeDiffBtn: document.getElementById("closeDiffBtn"),
+  mobileMenuBtn: document.getElementById("mobileMenuBtn"),
+  mobileMoreBtn: document.getElementById("mobileMoreBtn"),
+  mobileNewBtn: document.getElementById("mobileNewBtn"),
+  mobileAbortBtn: document.getElementById("mobileAbortBtn"),
+  mobileCloseMenuBtn: document.getElementById("mobileCloseMenuBtn"),
+  sidebarBackdrop: document.getElementById("sidebarBackdrop"),
+  mobileApprovalPanel: document.getElementById("mobileApprovalPanel"),
+  mobileApprovalList: document.getElementById("mobileApprovalList"),
+  contextUsage: document.getElementById("contextUsage"),
 };
 
 function escapeHtml(value) {
@@ -65,6 +84,27 @@ function renderMarkdownLite(text) {
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
 }
 
+function compactNumber(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return "0";
+  if (num >= 1_000_000) return `${(num / 1_000_000).toFixed(num >= 10_000_000 ? 0 : 1)}m`;
+  if (num >= 1_000) return `${(num / 1_000).toFixed(num >= 10_000 ? 0 : 1)}k`;
+  return String(Math.round(num));
+}
+
+function renderContextUsage(usage = {}) {
+  const ctx = usage && typeof usage === "object" ? usage : {};
+  const used = Number(ctx.used || 0);
+  const limit = Number(ctx.limit || 0);
+  const percent = limit > 0 ? Math.min(999, Math.round((used / limit) * 100)) : Number(ctx.percent || 0);
+  const last = ctx.last && typeof ctx.last === "object" ? ctx.last : null;
+  const lastTotal = Number(last?.total_tokens || 0);
+  const tokenText = lastTotal > 0 ? ` · last ${compactNumber(last?.input_tokens)}↑ ${compactNumber(last?.output_tokens)}↓` : "";
+  el.contextUsage.textContent = limit > 0
+    ? `ctx ${compactNumber(used)}/${compactNumber(limit)} (${percent}%)${tokenText}`
+    : `ctx ${compactNumber(used)}${tokenText}`;
+}
+
 function renderStatus(snapshot = {}) {
   state.status = { ...state.status, ...(snapshot || {}) };
   snapshot = state.status;
@@ -77,8 +117,11 @@ function renderStatus(snapshot = {}) {
   el.mcpLabel.textContent = Array.isArray(snapshot.mcpServers) && snapshot.mcpServers.length ? snapshot.mcpServers.join(", ") : "none";
   el.autoApprove.checked = Boolean(snapshot.autoApprove);
   el.planOnly.checked = Boolean(snapshot.planOnly);
+  el.detailMode.checked = Boolean(snapshot.detailMode);
   el.abortBtn.disabled = !state.running;
+  el.mobileAbortBtn.hidden = !state.running;
   el.sendBtn.disabled = state.running;
+  renderContextUsage(snapshot.contextUsage);
 }
 
 function toolTitle(item) {
@@ -98,6 +141,21 @@ function toolSubject(item) {
   if (input.command) return input.command;
   if (input.query || input.regex || input.pattern) return input.query || input.regex || input.pattern;
   return "";
+}
+
+function summarizeToolInput(item) {
+  const input = item.input && typeof item.input === "object" ? item.input : {};
+  const subject = toolSubject(item);
+  if (subject) return subject;
+  const keys = Object.keys(input).filter((key) => input[key] != null && input[key] !== "");
+  if (!keys.length) return "No input";
+  return keys.slice(0, 3).map((key) => `${key}: ${String(input[key]).replace(/\s+/g, " ").slice(0, 80)}`).join(" · ");
+}
+
+function renderJsonBlock(label, value) {
+  if (value == null || value === "") return "";
+  const text = typeof value === "string" ? value : JSON.stringify(value, null, 2);
+  return `<div class="tool-section"><div class="tool-section-title">${escapeHtml(label)}</div><pre><code>${escapeHtml(text)}</code></pre></div>`;
 }
 
 function renderToolResult(result = {}) {
@@ -132,27 +190,32 @@ function renderTimelineItem(item) {
   }
   if (item.type === "tool") {
     const status = String(item.status || "queued");
-    const subject = toolSubject(item);
-    return `<article class="tool-card ${escapeHtml(status)}" data-id="${escapeHtml(item.id)}">
-      <div class="tool-head">
-        <span class="tool-icon">${status === "done" ? "✓" : status === "error" ? "!" : "↯"}</span>
-        <div>
+    const summary = summarizeToolInput(item);
+    const icon = status === "done" ? "✓" : status === "error" ? "!" : "↯";
+    const openAttr = state.status.detailMode ? " open" : "";
+    return `<details class="tool-card ${escapeHtml(status)}" data-id="${escapeHtml(item.id)}"${openAttr}>
+      <summary class="tool-summary">
+        <span class="tool-icon">${icon}</span>
+        <span class="tool-main">
           <strong>${escapeHtml(toolTitle(item))}</strong>
-          ${subject ? `<code>${escapeHtml(subject)}</code>` : ""}
-        </div>
+          <code>${escapeHtml(summary)}</code>
+        </span>
         <span class="tool-status">${escapeHtml(status)}</span>
+      </summary>
+      <div class="tool-body">
+        ${item.reason ? `<div class="tool-reason">${escapeHtml(item.reason)}</div>` : ""}
+        ${renderJsonBlock("Input", item.input || {})}
+        ${item.error ? `<div class="tool-error">${escapeHtml(item.error)}</div>` : ""}
+        ${renderToolResult(item.result)}
       </div>
-      ${item.reason ? `<div class="tool-reason">${escapeHtml(item.reason)}</div>` : ""}
-      ${item.error ? `<div class="tool-error">${escapeHtml(item.error)}</div>` : ""}
-      ${renderToolResult(item.result)}
-    </article>`;
+    </details>`;
   }
   return "";
 }
 
 function renderMessages() {
   if (!state.timeline.length) {
-    el.messages.innerHTML = `<div class="empty-state"><div><h3>Ready to cook</h3><p>Ask for an inspection, a small edit, or a test run. Tool calls and file diffs will appear inline here.</p></div></div>`;
+    el.messages.innerHTML = `<div class="empty-state"><div><h3>Ready</h3><p>Ask PieCode to inspect the workspace, make a focused edit, or run verification.</p></div></div>`;
     return;
   }
   el.messages.innerHTML = state.timeline.map(renderTimelineItem).join("");
@@ -186,13 +249,7 @@ function approvalReason(item) {
 }
 
 function renderApprovals() {
-  if (!state.approvals.length) {
-    el.approvalList.className = "muted";
-    el.approvalList.innerHTML = "No pending approvals";
-    return;
-  }
-  el.approvalList.className = "";
-  el.approvalList.innerHTML = state.approvals
+  const approvalHtml = state.approvals
     .map((item) => `<div class="approval-item">
       <strong>${escapeHtml(item.kind === "shell" ? "Shell command" : item.kind)}</strong>
       <code>${escapeHtml(approvalCommand(item))}</code>
@@ -205,6 +262,18 @@ function renderApprovals() {
       </div>
     </div>`)
     .join("");
+
+  if (!state.approvals.length) {
+    el.approvalList.className = "muted";
+    el.approvalList.innerHTML = "No pending approvals";
+    el.mobileApprovalPanel.hidden = true;
+    el.mobileApprovalList.innerHTML = "";
+    return;
+  }
+  el.approvalList.className = "";
+  el.approvalList.innerHTML = approvalHtml;
+  el.mobileApprovalPanel.hidden = false;
+  el.mobileApprovalList.innerHTML = approvalHtml;
 }
 
 function renderSessions() {
@@ -247,7 +316,7 @@ function renderTodos() {
 function commandInsertText(command) {
   const name = String(command?.name || command || "").trim();
   if (!name) return "";
-  if (["/skills use", "/skills off", "/use", "/plan", "/approve"].includes(name)) return `${name} `;
+  if (["/skills use", "/skills off", "/use", "/plan", "/approve", "/detail", "/btw"].includes(name)) return `${name} `;
   return name;
 }
 
@@ -302,6 +371,49 @@ function pushEvent(text) {
   state.recentEvents.unshift(clean);
   state.recentEvents = state.recentEvents.slice(0, 3);
   el.eventStrip.textContent = state.recentEvents.join(" · ");
+}
+
+function renderDiffHtml(diffText) {
+  const lines = String(diffText || "").split("\n");
+  return lines.map((line) => {
+    let cls = "diff-line";
+    if (line.startsWith("@@")) cls += " hunk";
+    else if (line.startsWith("+") && !line.startsWith("+++")) cls += " add";
+    else if (line.startsWith("-") && !line.startsWith("---")) cls += " del";
+    else if (line.startsWith("diff --git") || line.startsWith("# ")) cls += " file";
+    return `<span class="${cls}">${escapeHtml(line || " ")}</span>`;
+  }).join("\n");
+}
+
+function closeDiffOverlay() {
+  el.diffOverlay.hidden = true;
+}
+
+async function openDiffOverlay() {
+  el.diffOverlay.hidden = false;
+  el.diffMeta.textContent = "Loading working tree changes...";
+  el.diffBody.innerHTML = `<div class="diff-loading">Loading diff...</div>`;
+  try {
+    const res = await fetch(apiUrl("/api/session/diff"));
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+    if (!data.ok && data.error) {
+      el.diffMeta.textContent = "Diff unavailable.";
+      el.diffBody.innerHTML = `<div class="diff-empty">${escapeHtml(data.error)}</div>`;
+      return;
+    }
+    const untrackedCount = Array.isArray(data.untrackedFiles) ? data.untrackedFiles.length : 0;
+    const truncated = data.truncated ? ` · truncated${data.omittedChars ? ` (${data.omittedChars} chars omitted)` : ""}` : "";
+    el.diffMeta.textContent = `Generated ${timeLabel(data.generatedAt)} · ${untrackedCount} untracked file(s)${truncated}`;
+    if (!String(data.diff || "").trim()) {
+      el.diffBody.innerHTML = `<div class="diff-empty">No tracked changes or untracked files in this workspace.</div>`;
+      return;
+    }
+    el.diffBody.innerHTML = `<pre class="session-diff"><code>${renderDiffHtml(data.diff)}</code></pre>`;
+  } catch (err) {
+    el.diffMeta.textContent = "Diff request failed.";
+    el.diffBody.innerHTML = `<div class="diff-empty error">${escapeHtml(err.message)}</div>`;
+  }
 }
 
 function applySnapshot(snapshot) {
@@ -362,6 +474,19 @@ function handleEvent(event) {
     renderSessions();
     return;
   }
+  if (type === "context.update") {
+    renderStatus({ contextUsage: payload.contextUsage || {} });
+    return;
+  }
+  if (type === "llm_response" && payload.usage) {
+    renderStatus({
+      contextUsage: {
+        ...(state.status.contextUsage || {}),
+        last: payload.usage,
+      },
+    });
+    return;
+  }
   if (type === "task.start") {
     renderStatus({ running: true, activeTask: payload.input });
     pushEvent("Task started");
@@ -391,9 +516,9 @@ function handleEvent(event) {
 }
 
 async function postJson(url, body) {
-  const res = await fetch(url, {
+  const res = await fetch(apiUrl(url), {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", ...(authToken ? { "x-piecode-token": authToken } : {}) },
     body: JSON.stringify(body || {}),
   });
   if (!res.ok) {
@@ -404,12 +529,12 @@ async function postJson(url, body) {
 }
 
 async function loadInitialState() {
-  const res = await fetch("/api/state");
+  const res = await fetch(apiUrl("/api/state"), { headers: authToken ? { "x-piecode-token": authToken } : {} });
   if (res.ok) applySnapshot(await res.json());
 }
 
 function connectEvents() {
-  const source = new EventSource("/api/events");
+  const source = new EventSource(apiUrl("/api/events"));
   source.onopen = () => {
     state.connected = true;
     el.connection.textContent = "online";
@@ -423,7 +548,7 @@ function connectEvents() {
   const eventTypes = [
     "snapshot", "ready", "message", "timeline", "timeline.update", "approval.request", "approval.resolved", "todos", "sessions",
     "task.start", "task.done", "task.error", "tool_use", "tool_start", "tool_end",
-    "plan", "replan", "thought", "log",
+    "plan", "replan", "thought", "log", "llm_response", "context.update",
   ];
   for (const type of eventTypes) {
     source.addEventListener(type, (raw) => {
@@ -485,6 +610,31 @@ el.slashHelpBtn.addEventListener("click", () => {
   applySuggestion("/help");
 });
 
+el.mobileMenuBtn?.addEventListener("click", () => {
+  document.body.classList.toggle("sidebar-open");
+});
+
+el.mobileCloseMenuBtn?.addEventListener("click", () => {
+  document.body.classList.remove("sidebar-open");
+});
+
+el.sidebarBackdrop?.addEventListener("click", () => {
+  document.body.classList.remove("sidebar-open");
+});
+
+el.mobileMoreBtn?.addEventListener("click", () => {
+  applySuggestion("/");
+});
+
+el.mobileNewBtn?.addEventListener("click", async () => {
+  try {
+    await postJson("/api/messages", { message: "/clear" });
+    document.body.classList.remove("sidebar-open");
+  } catch (err) {
+    pushEvent(err.message);
+  }
+});
+
 el.recentSessions.addEventListener("click", async (evt) => {
   const button = evt.target.closest("button[data-resume]");
   if (!button) return;
@@ -498,7 +648,7 @@ el.recentSessions.addEventListener("click", async (evt) => {
   }
 });
 
-el.approvalList.addEventListener("click", async (evt) => {
+async function handleApprovalClick(evt) {
   const button = evt.target.closest("button[data-approval]");
   if (!button) return;
   button.disabled = true;
@@ -507,9 +657,16 @@ el.approvalList.addEventListener("click", async (evt) => {
   } catch (err) {
     pushEvent(err.message);
   }
-});
+}
+
+el.approvalList.addEventListener("click", handleApprovalClick);
+el.mobileApprovalList.addEventListener("click", handleApprovalClick);
 
 el.abortBtn.addEventListener("click", async () => {
+  await postJson("/api/abort", {});
+});
+
+el.mobileAbortBtn?.addEventListener("click", async () => {
   await postJson("/api/abort", {});
 });
 
@@ -520,6 +677,34 @@ el.autoApprove.addEventListener("change", async () => {
 el.planOnly.addEventListener("change", () => {
   state.status.planOnly = el.planOnly.checked;
   pushEvent(`Plan mode ${el.planOnly.checked ? "on" : "off"}`);
+});
+
+el.detailMode.addEventListener("change", async () => {
+  state.status.detailMode = el.detailMode.checked;
+  renderMessages();
+  await postJson("/api/detail-mode", { enabled: el.detailMode.checked });
+  pushEvent(`Detail mode ${el.detailMode.checked ? "on" : "off"}`);
+});
+
+el.sessionDiffBtn.addEventListener("click", () => {
+  openDiffOverlay();
+});
+
+el.refreshDiffBtn.addEventListener("click", () => {
+  openDiffOverlay();
+});
+
+el.closeDiffBtn.addEventListener("click", () => {
+  closeDiffOverlay();
+});
+
+el.diffOverlay.addEventListener("click", (evt) => {
+  if (evt.target === el.diffOverlay) closeDiffOverlay();
+});
+
+document.addEventListener("keydown", (evt) => {
+  if (evt.key === "Escape" && !el.diffOverlay.hidden) closeDiffOverlay();
+  if (evt.key === "Escape") document.body.classList.remove("sidebar-open");
 });
 
 loadInitialState().catch(() => {});

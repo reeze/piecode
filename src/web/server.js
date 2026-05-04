@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import http from "node:http";
+import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
@@ -27,6 +28,7 @@ import {
   saveResumableSession,
   shortSessionId,
 } from "../lib/resumableSessions.js";
+import { getSessionDiff, parseToolResultDetails } from "./core.js";
 
 const DEFAULT_PORT = 3737;
 const MAX_BODY_BYTES = 1024 * 1024;
@@ -36,6 +38,8 @@ const WEB_SLASH_COMMANDS = [
   { name: "/sessions", description: "List recent resumable sessions" },
   { name: "/resume", description: "Resume a previous session by short or full ID" },
   { name: "/clear", description: "Clear conversation timeline and todos" },
+  { name: "/btw", description: "Run a background strict-read-only side question" },
+  { name: "/detail", description: "Toggle expanded tool details" },
   { name: "/plan", description: "Show or change plan mode" },
   { name: "/approve", description: "Toggle shell auto-approval" },
   { name: "/model", description: "Show active provider/model" },
@@ -121,6 +125,27 @@ function normalizeBoolean(value) {
   return null;
 }
 
+function toPositiveInteger(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num) || num <= 0) return 0;
+  return Math.round(num);
+}
+
+function resolveConfiguredContextWindow(settings = {}, providerOptions = {}) {
+  const provider = providerOptions.provider || settings.provider || "";
+  const providerSettings = provider && settings.providers && typeof settings.providers === "object" ? settings.providers[provider] || {} : {};
+  return toPositiveInteger(
+    providerSettings.contextWindow ??
+      providerSettings.context_window ??
+      providerSettings.contextLength ??
+      providerSettings.context_length ??
+      settings.contextWindow ??
+      settings.context_window ??
+      settings.contextLength ??
+      settings.context_length
+  );
+}
+
 function makeAssistantContent(lines) {
   return Array.isArray(lines) ? lines.filter(Boolean).join("\n") : String(lines || "");
 }
@@ -153,70 +178,6 @@ function redactInput(input) {
   return out;
 }
 
-function clipText(value, max = 20000) {
-  const text = String(value || "");
-  const limit = Math.max(500, Number(max) || 20000);
-  if (text.length <= limit) return text;
-  return `${text.slice(0, limit)}\n[clipped ${text.length - limit} chars]`;
-}
-
-function parseToolResultDetails(tool, result) {
-  const raw = String(result || "");
-  const details = {
-    kind: "text",
-    preview: clipText(raw, 4000),
-    expandable: false,
-  };
-
-  if (tool === "edit_file") {
-    try {
-      const parsed = JSON.parse(raw);
-      const diff = String(parsed?.details?.diff || "");
-      return {
-        kind: "file_edit",
-        path: String(parsed?.path || ""),
-        changed: Boolean(parsed?.changed),
-        message: String(parsed?.message || ""),
-        diffStat: String(parsed?.details?.diffStat || ""),
-        diff: clipText(diff, 30000),
-        expandable: Boolean(diff),
-        preview: String(parsed?.message || parsed?.details?.diffStat || raw).trim(),
-      };
-    } catch {
-      return details;
-    }
-  }
-
-  if (tool === "replace_in_files") {
-    try {
-      const parsed = JSON.parse(raw);
-      return {
-        kind: "bulk_replace",
-        mode: String(parsed?.mode || ""),
-        path: String(parsed?.path || ""),
-        scannedFiles: Number(parsed?.scanned_files || 0),
-        matchedFiles: Number(parsed?.matched_files || 0),
-        replacements: Number(parsed?.replacements || 0),
-        files: Array.isArray(parsed?.files) ? parsed.files.slice(0, 200) : [],
-        expandable: Array.isArray(parsed?.files) && parsed.files.length > 0,
-        preview: `${parsed?.mode || "replace"}: ${parsed?.matched_files || 0} file(s), ${parsed?.replacements || 0} replacement(s)`,
-      };
-    } catch {
-      return details;
-    }
-  }
-
-  if (tool === "write_file" || tool === "apply_patch") {
-    return {
-      ...details,
-      kind: "file_write",
-      expandable: raw.length > 0,
-    };
-  }
-
-  return details;
-}
-
 function makePublicEvent(type, payload = {}) {
   return {
     id: makeId("event"),
@@ -224,6 +185,40 @@ function makePublicEvent(type, payload = {}) {
     type,
     payload,
   };
+}
+
+export function resolveWebBindOptions(env = process.env) {
+  const port = Number.parseInt(env.PIECODE_WEB_PORT || "", 10) || DEFAULT_PORT;
+  const host = String(env.PIECODE_WEB_HOST || "127.0.0.1").trim() || "127.0.0.1";
+  return { host, port };
+}
+
+export function createWebAuthToken(env = process.env) {
+  const configured = String(env.PIECODE_WEB_TOKEN || "").trim();
+  return configured || crypto.randomBytes(24).toString("hex");
+}
+
+export function isAuthorizedWebRequest(req, url, token) {
+  const expected = String(token || "").trim();
+  if (!expected) return true;
+  const header = String(req?.headers?.["x-piecode-token"] || "").trim();
+  const query = String(url?.searchParams?.get("token") || "").trim();
+  return header === expected || query === expected;
+}
+
+export function validateWebOrigin(req, host = "127.0.0.1", port = DEFAULT_PORT) {
+  const origin = String(req?.headers?.origin || "").trim();
+  if (!origin) return { ok: true, reason: "" };
+  try {
+    const parsed = new URL(origin);
+    const hostname = parsed.hostname.toLowerCase();
+    const allowedHosts = new Set(["localhost", "127.0.0.1", "::1", String(host || "").toLowerCase()]);
+    const originPort = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+    if (allowedHosts.has(hostname) && String(originPort) === String(port)) return { ok: true, reason: "" };
+  } catch {
+    return { ok: false, reason: "invalid origin" };
+  }
+  return { ok: false, reason: "origin not allowed" };
 }
 
 function jsonResponse(res, status, data) {
@@ -312,10 +307,13 @@ class WebAgentSession {
     this.activeToolRuns = new Map();
     this.todos = [];
     this.planOnly = false;
+    this.detailMode = false;
     this.running = false;
     this.activeTask = "";
     this.lastError = "";
+    this.tokenUsage = { sent: 0, received: 0, last: null };
     this.autoApproveRef = { value: false };
+    this.contextWindowRef = { value: 0 };
     this.shellPermissionRef = { value: { allowAllSession: false, rememberedCommands: new Set() } };
     this.activeSkillsRef = { value: [] };
     this.projectInstructionsRef = { value: null };
@@ -335,6 +333,7 @@ class WebAgentSession {
 
     const providerOptions = resolveProviderOptions(this.settings);
     this.provider = getProvider(providerOptions);
+    this.contextWindowRef.value = resolveConfiguredContextWindow(this.settings, providerOptions);
     const mergedMcpSettings = await mergeCommonMcpServers(this.settings, {
       workspaceDir: this.workspaceDir,
       onLog: (line) => this.publish("log", { line }),
@@ -348,6 +347,7 @@ class WebAgentSession {
     this.agent = new Agent({
       provider: this.provider,
       workspaceDir: this.workspaceDir,
+      contextWindowRef: this.contextWindowRef,
       autoApproveRef: this.autoApproveRef,
       shellPermissionRef: this.shellPermissionRef,
       askApproval: (kind, details) => this.askApproval(kind, details),
@@ -441,6 +441,23 @@ class WebAgentSession {
     });
   }
 
+  getContextUsage() {
+    const used =
+      typeof this.agent?.estimateMessagesTokens === "function"
+        ? toPositiveInteger(this.agent.estimateMessagesTokens(this.agent.history || []))
+        : 0;
+    const limit = toPositiveInteger(this.contextWindowRef?.value);
+    const percent = limit > 0 ? Math.min(999, Math.round((used / limit) * 100)) : 0;
+    return {
+      used,
+      limit,
+      percent,
+      sent: toPositiveInteger(this.tokenUsage?.sent),
+      received: toPositiveInteger(this.tokenUsage?.received),
+      last: this.tokenUsage?.last || null,
+    };
+  }
+
   snapshot() {
     return {
       sessionId: this.sessionId,
@@ -456,6 +473,7 @@ class WebAgentSession {
       lastError: this.lastError,
       autoApprove: Boolean(this.autoApproveRef.value),
       planOnly: Boolean(this.planOnly),
+      detailMode: Boolean(this.detailMode),
       shellPermissions: {
         allowAllSession: Boolean(this.shellPermissionRef.value?.allowAllSession),
         rememberedCommands: [...(this.shellPermissionRef.value?.rememberedCommands || [])],
@@ -470,6 +488,7 @@ class WebAgentSession {
       messages: this.messages.slice(-100),
       timeline: this.timeline.slice(-200),
       approvals: this.approvals.list(),
+      contextUsage: this.getContextUsage(),
     };
   }
 
@@ -500,6 +519,40 @@ class WebAgentSession {
     this.recentSessions = await listResumableSessions(this.workspaceDir, 3);
     this.publish("snapshot", this.snapshot());
     return loaded;
+  }
+
+  startBtwTask(input) {
+    const raw = String(input || "").trim();
+    const task = raw.replace(/^\/btw(?:\s+|$)/i, "").trim();
+    if (!task) return "Usage: `/btw <read-only question>`.";
+    if (!this.agent || typeof this.agent.runSubagent !== "function") {
+      return "/btw unavailable: subagent support is not configured.";
+    }
+    const started = `Started background read-only task: ${task}`;
+    void this.agent
+      .runSubagent(
+        {
+          task,
+          context: [
+            "This is a user-invoked /btw background task from the Web UI.",
+            "It must be strict read-only and must not modify files, todos, memory, settings, shell state, services, or external systems.",
+            "Answer concisely so the main task can continue uninterrupted.",
+            this.activeTask ? `Main task currently running: ${this.activeTask}` : "",
+          ]
+            .filter(Boolean)
+            .join("\n"),
+          mode: "analysis",
+          toolBudget: 3,
+        },
+        { strictReadOnly: true }
+      )
+      .then((result) => {
+        this.addAssistantMessage(`BTW result for: ${task}\n\n${String(result || "").trim()}`);
+      })
+      .catch((err) => {
+        this.addAssistantMessage(`BTW failed for: ${task}\n\n${String(err?.message || err)}`);
+      });
+    return started;
   }
 
   formatSessionList(sessions) {
@@ -540,11 +593,34 @@ class WebAgentSession {
     return normalized;
   }
 
+  updateTimelineItem(id, patch = {}) {
+    const targetId = String(id || "");
+    if (!targetId) return null;
+    const idx = this.timeline.findIndex((item) => String(item?.id || "") === targetId);
+    if (idx < 0) return null;
+    const updated = { ...this.timeline[idx], ...(patch || {}) };
+    this.timeline[idx] = updated;
+    this.publish("timeline.update", { id: targetId, patch });
+    return updated;
+  }
+
   makeToolRunKey(evt = {}) {
     const tool = String(evt.tool || "tool");
     const input = evt.input && typeof evt.input === "object" ? evt.input : {};
     const signature = JSON.stringify({ tool, input: redactInput(input), parallel: Boolean(evt.parallel) });
     return `${tool}:${signature}`;
+  }
+
+  findLatestToolTimelineId(tool, statuses = []) {
+    const targetTool = String(tool || "tool");
+    const wanted = new Set(statuses.map((status) => String(status)));
+    for (let i = this.timeline.length - 1; i >= 0; i -= 1) {
+      const item = this.timeline[i];
+      if (item?.type !== "tool" || String(item.tool || "tool") !== targetTool) continue;
+      if (wanted.size > 0 && !wanted.has(String(item.status || ""))) continue;
+      return item.id;
+    }
+    return "";
   }
 
   handleAgentEvent(evt = {}) {
@@ -565,9 +641,14 @@ class WebAgentSession {
     }
     if (type === "tool_start") {
       const key = this.makeToolRunKey(evt);
-      const existingId = this.activeToolRuns.get(key);
+      const existingId = this.activeToolRuns.get(key) || this.findLatestToolTimelineId(evt.tool, ["queued"]);
       if (existingId) {
-        this.publish("timeline.update", { id: existingId, patch: { status: "running", startedAt: new Date().toISOString() } });
+        this.activeToolRuns.set(key, existingId);
+        this.updateTimelineItem(existingId, {
+          status: "running",
+          input: redactInput(evt.input),
+          startedAt: new Date().toISOString(),
+        });
       } else {
         const item = this.addTimelineItem({
           type: "tool",
@@ -584,17 +665,15 @@ class WebAgentSession {
       const result = String(evt.result || "");
       const details = parseToolResultDetails(evt.tool, result);
       const candidates = [...this.activeToolRuns.entries()].filter(([key]) => key.startsWith(`${evt.tool}:`));
-      const [key, timelineId] = candidates[candidates.length - 1] || [];
+      const [key, activeTimelineId] = candidates[candidates.length - 1] || [];
+      const timelineId = activeTimelineId || this.findLatestToolTimelineId(evt.tool, ["running", "queued"]);
       if (key) this.activeToolRuns.delete(key);
       if (timelineId) {
-        this.publish("timeline.update", {
-          id: timelineId,
-          patch: {
-            status: evt.error ? "error" : "done",
-            error: evt.error || "",
-            result: details,
-            finishedAt: new Date().toISOString(),
-          },
+        this.updateTimelineItem(timelineId, {
+          status: evt.error ? "error" : "done",
+          error: evt.error || "",
+          result: details,
+          finishedAt: new Date().toISOString(),
         });
       } else {
         this.addTimelineItem({
@@ -620,7 +699,22 @@ class WebAgentSession {
       return;
     }
     if (type === "llm_response") {
+      const usage = evt.usage && typeof evt.usage === "object" ? evt.usage : null;
+      const inputTokens = toPositiveInteger(usage?.input_tokens ?? usage?.prompt_tokens ?? usage?.tokens_in);
+      let outputTokens = toPositiveInteger(usage?.output_tokens ?? usage?.completion_tokens ?? usage?.tokens_out);
+      const totalTokens = toPositiveInteger(usage?.total_tokens ?? usage?.tokens);
+      if (!outputTokens && totalTokens && inputTokens) outputTokens = Math.max(0, totalTokens - inputTokens);
+      if (inputTokens || outputTokens || totalTokens) {
+        this.tokenUsage.sent += inputTokens;
+        this.tokenUsage.received += outputTokens;
+        this.tokenUsage.last = {
+          input_tokens: inputTokens || null,
+          output_tokens: outputTokens || null,
+          total_tokens: totalTokens || inputTokens + outputTokens || null,
+        };
+      }
       this.publish(type, { stage: evt.stage, usage: evt.usage || null, preview: String(evt.payload || "").slice(0, 800) });
+      this.publish("context.update", { contextUsage: this.getContextUsage() });
       return;
     }
     if (type === "llm_response_delta") {
@@ -663,6 +757,19 @@ class WebAgentSession {
       this.publish("todos", { todos: [] });
       this.publish("snapshot", this.snapshot());
       return { handled: true, message: "Conversation context cleared." };
+    }
+    if (lower === "/btw" || lower.startsWith("/btw ")) {
+      return { handled: true, message: this.startBtwTask(raw) };
+    }
+    if (lower === "/detail") {
+      return { handled: true, patch: { detailMode: Boolean(this.detailMode) }, message: `Detail mode: ${this.detailMode ? "on" : "off"}. Use \`/detail on\` or \`/detail off\`.` };
+    }
+    if (lower.startsWith("/detail ")) {
+      const enabled = normalizeBoolean(argAfter("/detail "));
+      if (enabled === null) return { handled: true, message: "Usage: `/detail on` or `/detail off`." };
+      this.detailMode = enabled;
+      this.publish("snapshot", this.snapshot());
+      return { handled: true, patch: { detailMode: enabled }, message: `Detail mode ${enabled ? "enabled" : "disabled"}.` };
     }
     if (lower === "/plan") {
       return { handled: true, patch: { planOnly: Boolean(this.planOnly) }, message: `Plan mode: ${this.planOnly ? "on" : "off"}. Use \`/plan on\` or \`/plan off\`.` };
@@ -748,7 +855,8 @@ class WebAgentSession {
   async sendMessage(content, options = {}) {
     const text = String(content || "").trim();
     if (!text) throw new Error("Message is required");
-    if (this.running) throw new Error("A task is already running");
+    const isBtw = /^\/btw(?:\s+|$)/i.test(text);
+    if (this.running && !isBtw) throw new Error("A task is already running");
 
     if (text.startsWith("/")) {
       const slash = await this.handleSlashCommand(text);
@@ -830,16 +938,30 @@ async function serveStatic(reqPath, res) {
   }
 }
 
-async function main() {
+export async function main() {
   const settingsFile = getSettingsFilePath();
   const settings = await loadSettings(settingsFile);
   const workspaceDir = process.cwd();
   const session = new WebAgentSession({ workspaceDir, settings, settingsFile });
   await session.init();
 
+  const { host, port } = resolveWebBindOptions(process.env);
+  const authToken = createWebAuthToken(process.env);
+
   const server = http.createServer(async (req, res) => {
     try {
-      const url = new URL(req.url || "/", "http://localhost");
+      const url = new URL(req.url || "/", `http://${host}:${port}`);
+      if (url.pathname.startsWith("/api/")) {
+        const origin = validateWebOrigin(req, host, port);
+        if (!origin.ok) {
+          jsonResponse(res, 403, { error: origin.reason || "forbidden" });
+          return;
+        }
+        if (!isAuthorizedWebRequest(req, url, authToken)) {
+          jsonResponse(res, 401, { error: "unauthorized" });
+          return;
+        }
+      }
       if (req.method === "GET" && url.pathname === "/api/events") {
         session.subscribe(res);
         return;
@@ -848,10 +970,23 @@ async function main() {
         jsonResponse(res, 200, session.snapshot());
         return;
       }
+      if (req.method === "GET" && url.pathname === "/api/session/diff") {
+        jsonResponse(res, 200, await getSessionDiff(session.workspaceDir));
+        return;
+      }
       if (req.method === "POST" && url.pathname === "/api/messages") {
         const body = await readJsonBody(req);
+        const message = String(body.message || "").trim();
+        if (session.running && !/^\/btw(?:\s+|$)/i.test(message)) {
+          jsonResponse(res, 409, { error: "A task is already running" });
+          return;
+        }
         if (typeof body.planOnly === "boolean") session.planOnly = body.planOnly;
-        session.sendMessage(body.message, { planOnly: session.planOnly }).catch(() => {});
+        session.sendMessage(message, { planOnly: session.planOnly }).catch((err) => {
+          const error = String(err?.message || err || "message failed");
+          session.lastError = error;
+          session.publish("task.error", { error });
+        });
         jsonResponse(res, 202, { ok: true });
         return;
       }
@@ -886,6 +1021,13 @@ async function main() {
         jsonResponse(res, 200, { ok: true, enabled: session.autoApproveRef.value });
         return;
       }
+      if (req.method === "POST" && url.pathname === "/api/detail-mode") {
+        const body = await readJsonBody(req);
+        session.detailMode = Boolean(body.enabled);
+        session.publish("snapshot", session.snapshot());
+        jsonResponse(res, 200, { ok: true, enabled: session.detailMode });
+        return;
+      }
       if (req.method === "GET") {
         await serveStatic(url.pathname, res);
         return;
@@ -896,12 +1038,11 @@ async function main() {
     }
   });
 
-  const port = Number.parseInt(process.env.PIECODE_WEB_PORT || "", 10) || DEFAULT_PORT;
-  const host = process.env.PIECODE_WEB_HOST || "0.0.0.0";
   server.listen(port, host, () => {
-    const urls = getLocalNetworkUrls(port);
+    const urls = host === "127.0.0.1" || host === "localhost" ? [`http://localhost:${port}`] : getLocalNetworkUrls(port);
     console.log("PieCode Web is running:");
-    for (const item of urls) console.log(`  ${item}`);
+    for (const item of urls) console.log(`  ${item}?token=${authToken}`);
+    if (host === "0.0.0.0") console.log("warning: web UI is bound to all interfaces; keep the token private.");
     console.log(`Current Session ID: ${session.sessionId} (short: ${shortSessionId(session.sessionId)})`);
     if (session.recentSessions.length > 0) {
       console.log("Recent resumable sessions:");
@@ -923,7 +1064,9 @@ async function main() {
   process.on("SIGTERM", shutdown);
 }
 
-main().catch((err) => {
-  console.error(`fatal: ${err.message}`);
-  process.exit(1);
-});
+if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+  main().catch((err) => {
+    console.error(`fatal: ${err.message}`);
+    process.exit(1);
+  });
+}

@@ -18,6 +18,43 @@ export function normalizeMemoryScope(scope) {
   return "project";
 }
 
+function canonicalMemoryEntry(content) {
+  return String(content || "")
+    .trim()
+    .replace(/^\s*[-*]\s+/, "")
+    .replace(/\s+/g, " ")
+    .toLowerCase();
+}
+
+function parseMemoryEntries(content) {
+  const text = String(content || "");
+  const entries = [];
+  let current = "";
+  for (const rawLine of text.split("\n")) {
+    const line = rawLine.trimEnd();
+    if (/^\s*[-*]\s+/.test(line)) {
+      if (current.trim()) entries.push(current.trim());
+      current = line.replace(/^\s*[-*]\s+/, "");
+      continue;
+    }
+    if (current && /^\s{2,}\S/.test(rawLine)) {
+      current += `\n${line.trim()}`;
+    }
+  }
+  if (current.trim()) entries.push(current.trim());
+  return entries;
+}
+
+function looksSensitiveMemory(content) {
+  const text = String(content || "");
+  const lower = text.toLowerCase();
+  if (/\b(api[_-]?key|secret|token|password|passwd|credential|private[_-]?key|access[_-]?key)\b/.test(lower)) return true;
+  if (/\b(?:sk|pk|ghp|gho|github_pat|xox[baprs])_[a-z0-9_=-]{16,}\b/i.test(text)) return true;
+  if (/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(text)) return true;
+  if (/\b[A-Za-z0-9+/]{32,}={0,2}\b/.test(text) && /\b(secret|token|key|password)\b/i.test(text)) return true;
+  return false;
+}
+
 async function readMemoryFile(filePath, scope) {
   try {
     const raw = await fs.readFile(filePath, "utf8");
@@ -98,6 +135,9 @@ export async function appendMemory({ workspaceDir, scope = "project", content, g
   const normalizedScope = normalizeMemoryScope(scope);
   const body = normalizeMemoryContent(content);
   if (!body) throw new Error("Missing required parameter: content");
+  if (looksSensitiveMemory(body)) {
+    throw new Error("Refusing to save memory that looks like a secret or credential.");
+  }
   const root = workspaceDir || process.cwd();
   const filePath = normalizedScope === "global" ? globalPath : getProjectMemoryPath(root);
   await fs.mkdir(path.dirname(filePath), { recursive: true });
@@ -110,6 +150,18 @@ export async function appendMemory({ workspaceDir, scope = "project", content, g
   }
 
   const trimmedExisting = String(existing || "").trimEnd();
+  const existingEntries = new Set(parseMemoryEntries(trimmedExisting).map(canonicalMemoryEntry).filter(Boolean));
+  const canonicalBody = canonicalMemoryEntry(body);
+  if (existingEntries.has(canonicalBody)) {
+    return {
+      scope: normalizedScope,
+      path: filePath,
+      relPath: normalizedScope === "global" ? filePath : ".piecode/MEMORY.md",
+      bytes: 0,
+      skipped: true,
+      reason: "duplicate",
+    };
+  }
   const header = trimmedExisting ? "" : "# Memory\n\n";
   const entry = `- ${body.replace(/\n+/g, "\n  ")}`;
   const next = `${trimmedExisting}${trimmedExisting ? "\n" : header}${entry}\n`;

@@ -18,7 +18,8 @@
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js",
     "test:watch": "node --experimental-vm-modules node_modules/jest/bin/jest.js --watch",
     "test:coverage": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage",
-    "lint": "node_modules/eslint/bin/eslint.js src --fix"
+    "lint": "node_modules/eslint/bin/eslint.js src",
+    "lint:fix": "node_modules/eslint/bin/eslint.js src --fix"
   },
   "engines": {
     "node": ">=18"

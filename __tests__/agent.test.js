@@ -217,6 +217,64 @@ describe("agent context controls", () => {
     expect(events.some((evt) => evt?.type === "subagent_end" && evt.status === "done")).toBe(true);
   });
 
+  test("runSubagent summarizes repeated tool names with counts", async () => {
+    let calls = 0;
+    const events = [];
+    const agent = createAgentWithProvider({
+      async complete() {
+        calls += 1;
+        if (calls <= 2) {
+          return JSON.stringify({
+            type: "tool_use",
+            tool: "read_file",
+            input: { path: "README.md" },
+          });
+        }
+        return JSON.stringify({ type: "final", message: "done" });
+      },
+    });
+    agent.onEvent = (evt) => events.push(evt);
+
+    const result = await agent.runSubagent({ task: "read twice", toolBudget: 3 });
+    const end = events.find((evt) => evt?.type === "subagent_end");
+
+    expect(result).toContain("Subagent tools used: read_file x2");
+    expect(end?.tools).toEqual(["read_file x2"]);
+  });
+
+  test("runSubagent strictReadOnly blocks shell side effects", async () => {
+    let calls = 0;
+    const agent = createAgentWithProvider({
+      async complete({ prompt }) {
+        calls += 1;
+        if (calls === 1) {
+          return JSON.stringify({
+            type: "tool_use",
+            tool: "shell",
+            input: { command: "touch should-not-run" },
+            reason: "try a shell command",
+          });
+        }
+        expect(prompt).toContain("strict read-only");
+        expect(prompt).toContain("Tool error: this background task is strict read-only");
+        return JSON.stringify({ type: "final", message: "shell was blocked" });
+      },
+    });
+    agent.askApproval = async () => {
+      throw new Error("strict read-only shell should not request approval");
+    };
+
+    const result = await agent.runSubagent(
+      {
+        task: "Check something in the background",
+        toolBudget: 2,
+      },
+      { strictReadOnly: true }
+    );
+
+    expect(result).toContain("shell was blocked");
+  });
+
   test("runSubagent applies named agent definitions", async () => {
     const events = [];
     let capturedPrompt = "";

@@ -1,3 +1,5 @@
+import { DEFAULT_INPUT_HINTS, sanitizeInputHints } from "./inputHints.js";
+
 const ANSI_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
 
 function stripAnsi(text) {
@@ -116,6 +118,12 @@ function color(text, code) {
 
 function renderInlineMarkdown(line) {
   let out = String(line || "");
+
+  // Images first so they do not get picked up as normal links.
+  out = out.replace(
+    /!\[([^\]]*)\]\(([^)]+)\)/g,
+    (_m, alt, url) => `${color("image", "1;35")}${alt ? color(` ${alt}`, "35") : ""}${color(` (${url})`, "2;37")}`
+  );
   out = out.replace(
     /`([^`]+)`/g,
     (_m, content) => color(content, "34")
@@ -125,71 +133,318 @@ function renderInlineMarkdown(line) {
     (_m, _d, content) => color(content, "1")
   );
   out = out.replace(
+    /(~~)(?!\s)(.+?)(?<!\s)\1/g,
+    (_m, _d, content) => color(content, "9;2")
+  );
+  out = out.replace(
+    /(^|[^*_])([*_])(?!\s)([^*_]+?)(?<!\s)\2/g,
+    (_m, prefix, _d, content) => `${prefix}${color(content, "3")}`
+  );
+  out = out.replace(
     /\[([^\]]+)\]\(([^)]+)\)/g,
     (_m, text, url) => `${color(text, "4;34")}${color(` (${url})`, "2;37")}`
   );
   return out;
 }
 
-function renderMarkdownLines(text) {
-  const source = String(text || "");
-  const lines = source.split("\n");
-  const out = [];
-  let inCode = false;
-  let codeLang = "";
+function stripMarkdownForTableCell(value) {
+  return stripAnsi(renderInlineMarkdown(String(value || "").trim()));
+}
 
-  for (const line of lines) {
-    const fence = line.match(/^\s*```\s*([\w.+-]*)\s*$/);
-    if (fence) {
-      if (!inCode) {
-        inCode = true;
-        codeLang = String(fence[1] || "").trim();
-        const label = codeLang ? ` ${codeLang} ` : " code ";
-        out.push(color(`${label}${"-".repeat(Math.max(8, 56 - label.length))}`, "2;37"));
-      } else {
-        inCode = false;
-        codeLang = "";
-        out.push(color("-".repeat(56), "2;37"));
-      }
+function splitMarkdownTableRow(line) {
+  const trimmed = String(line || "").trim();
+  if (!trimmed.includes("|")) return null;
+  const inner = trimmed.replace(/^\|/, "").replace(/\|$/, "");
+  const cells = [];
+  let current = "";
+  let escaped = false;
+  for (const ch of inner) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
       continue;
     }
-    if (inCode) {
-      // Keep code monospace-friendly: no wrapping markers, no Markdown inline parsing.
-      // Cyan foreground works consistently across most terminals without relying on
-      // background colors that can become noisy in full-screen redraws.
-      out.push(color(line || " ", "36"));
+    if (ch === "\\") {
+      escaped = true;
+      current += ch;
+      continue;
+    }
+    if (ch === "|") {
+      cells.push(current.trim());
+      current = "";
+      continue;
+    }
+    current += ch;
+  }
+  cells.push(current.trim());
+  return cells.length >= 2 ? cells : null;
+}
+
+function parseMarkdownTableSeparator(line) {
+  const cells = splitMarkdownTableRow(line);
+  if (!cells) return null;
+  const aligns = [];
+  for (const cell of cells) {
+    const value = String(cell || "").trim();
+    if (!/^:?-{3,}:?$/.test(value)) return null;
+    const left = value.startsWith(":");
+    const right = value.endsWith(":");
+    aligns.push(left && right ? "center" : right ? "right" : "left");
+  }
+  return aligns;
+}
+
+function padTableCell(text, width, align = "left") {
+  const value = String(text || "");
+  const pad = Math.max(0, width - stringDisplayWidth(value));
+  if (align === "right") return `${" ".repeat(pad)}${value}`;
+  if (align === "center") {
+    const left = Math.floor(pad / 2);
+    return `${" ".repeat(left)}${value}${" ".repeat(pad - left)}`;
+  }
+  return `${value}${" ".repeat(pad)}`;
+}
+
+function renderMarkdownTable(lines, startIndex) {
+  const header = splitMarkdownTableRow(lines[startIndex]);
+  const aligns = parseMarkdownTableSeparator(lines[startIndex + 1]);
+  if (!header || !aligns) return null;
+
+  const rows = [];
+  let i = startIndex + 2;
+  while (i < lines.length) {
+    const row = splitMarkdownTableRow(lines[i]);
+    if (!row) break;
+    rows.push(row);
+    i += 1;
+  }
+
+  const columnCount = Math.max(header.length, aligns.length, ...rows.map((row) => row.length));
+  const normalize = (row) => Array.from({ length: columnCount }, (_v, idx) => stripMarkdownForTableCell(row[idx] || ""));
+  const normalizedHeader = normalize(header);
+  const normalizedRows = rows.map(normalize);
+  const widths = Array.from({ length: columnCount }, (_v, idx) =>
+    Math.min(
+      40,
+      Math.max(
+        stringDisplayWidth(normalizedHeader[idx] || ""),
+        ...normalizedRows.map((row) => stringDisplayWidth(row[idx] || "")),
+        3
+      )
+    )
+  );
+  const renderRow = (row, style = "") => {
+    const cells = row.map((cell, idx) => padTableCell(cell, widths[idx], aligns[idx] || "left"));
+    const text = `│ ${cells.join(" │ ")} │`;
+    return style ? color(text, style) : text;
+  };
+  const sep = color(`├${widths.map((w) => "─".repeat(w + 2)).join("┼")}┤`, "2;37");
+  return {
+    nextIndex: i,
+    rendered: [renderRow(normalizedHeader, "1"), sep, ...normalizedRows.map((row) => renderRow(row))],
+  };
+}
+
+function parseMarkdownBlocks(text) {
+  const lines = String(text || "").replace(/\r/g, "").split("\n");
+  const blocks = [];
+  let paragraph = [];
+
+  const flushParagraph = () => {
+    if (paragraph.length === 0) return;
+    blocks.push({ type: "paragraph", lines: paragraph });
+    paragraph = [];
+  };
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    const fence = line.match(/^\s*```\s*([\w.+-]*)\s*$/);
+    if (fence) {
+      flushParagraph();
+      const lang = String(fence[1] || "").trim();
+      const codeLines = [];
+      i += 1;
+      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) {
+        codeLines.push(lines[i]);
+        i += 1;
+      }
+      blocks.push({ type: "code", lang, lines: codeLines, closed: i < lines.length });
+      continue;
+    }
+
+    if (!line.trim()) {
+      flushParagraph();
+      blocks.push({ type: "blank" });
+      continue;
+    }
+
+    const table = i + 1 < lines.length ? renderMarkdownTable(lines, i) : null;
+    if (table) {
+      flushParagraph();
+      blocks.push({ type: "table", rendered: table.rendered });
+      i = table.nextIndex - 1;
       continue;
     }
 
     const header = line.match(/^(#{1,6})\s+(.+)$/);
     if (header) {
-      const level = header[1].length;
-      const rendered = renderInlineMarkdown(header[2]);
-      out.push(level <= 2 ? color(rendered, "1;36") : color(rendered, "1"));
+      flushParagraph();
+      blocks.push({ type: "heading", level: header[1].length, text: header[2] });
       continue;
     }
+
     if (/^\s*([-*_])\s*\1\s*\1[\s\1]*$/.test(line)) {
-      out.push(color("-".repeat(56), "2;37"));
+      flushParagraph();
+      blocks.push({ type: "hr" });
       continue;
     }
+
+    const quoteMatch = line.match(/^(>+)\s?(.*)$/);
+    if (quoteMatch) {
+      flushParagraph();
+      const quoteLines = [];
+      let maxDepth = 1;
+      while (i < lines.length) {
+        const q = lines[i].match(/^(>+)\s?(.*)$/);
+        if (!q) break;
+        maxDepth = Math.max(maxDepth, q[1].length);
+        quoteLines.push({ depth: q[1].length, text: q[2] });
+        i += 1;
+      }
+      i -= 1;
+      blocks.push({ type: "quote", lines: quoteLines, depth: maxDepth });
+      continue;
+    }
+
+    const task = line.match(/^(\s*)[-*+]\s+\[([ xX~-])\]\s+(.+)$/);
+    if (task) {
+      flushParagraph();
+      blocks.push({
+        type: "task",
+        indent: task[1],
+        state: String(task[2] || " "),
+        text: task[3],
+      });
+      continue;
+    }
+
     const bullet = line.match(/^(\s*)[-*+]\s+(.+)$/);
     if (bullet) {
-      out.push(`${bullet[1]}${color("•", "2;37")} ${renderInlineMarkdown(bullet[2])}`);
+      flushParagraph();
+      blocks.push({ type: "bullet", indent: bullet[1], text: bullet[2] });
       continue;
     }
+
     const ordered = line.match(/^(\s*)(\d+)[.)]\s+(.+)$/);
     if (ordered) {
-      out.push(`${ordered[1]}${color(`${ordered[2]}.`, "2;37")} ${renderInlineMarkdown(ordered[3])}`);
+      flushParagraph();
+      blocks.push({ type: "ordered", indent: ordered[1], number: ordered[2], text: ordered[3] });
       continue;
     }
-    const quote = line.match(/^>\s?(.*)$/);
-    if (quote) {
-      out.push(`${color("│", "2;37")} ${color(renderInlineMarkdown(quote[1]), "3;37")}`);
+
+    const indentedCode = line.match(/^( {4}|\t)(.*)$/);
+    if (indentedCode) {
+      flushParagraph();
+      const codeLines = [];
+      while (i < lines.length) {
+        const c = lines[i].match(/^( {4}|\t)(.*)$/);
+        if (!c) break;
+        codeLines.push(c[2]);
+        i += 1;
+      }
+      i -= 1;
+      blocks.push({ type: "code", lang: "", lines: codeLines, closed: true, indented: true });
       continue;
     }
-    out.push(renderInlineMarkdown(line));
+
+    paragraph.push(line);
   }
-  return out;
+
+  flushParagraph();
+  return blocks;
+}
+
+function normalizeTimelineSpacing(lines) {
+  const result = [];
+  let previousGroup = "";
+
+  const classify = (line) => {
+    const plain = stripAnsi(String(line || "")).trimStart();
+    if (!plain) return "blank";
+    if (/^◆\s+Task:/i.test(plain)) return "task";
+    if (/^↳\s+/.test(plain)) return "tool-result";
+    if (/^›\s+/.test(plain)) return "tool";
+    if (/^[•✓×]\s+/.test(plain)) return "response";
+    if (/^\s{2,}\S/.test(String(line || ""))) return previousGroup || "continuation";
+    return "content";
+  };
+
+  for (const line of Array.isArray(lines) ? lines : []) {
+    const group = classify(line);
+    const shouldSeparate =
+      result.length > 0 &&
+      group !== "blank" &&
+      previousGroup &&
+      previousGroup !== "blank" &&
+      previousGroup !== group;
+    if (shouldSeparate && result[result.length - 1] !== "") result.push("");
+    result.push(line);
+    previousGroup = group;
+  }
+
+  return result;
+}
+
+function renderMarkdownBlock(block) {
+  if (!block || typeof block !== "object") return [];
+  switch (block.type) {
+    case "blank":
+      return [""];
+    case "code": {
+      const label = block.lang ? ` ${block.lang} ` : " code ";
+      return [
+        color(`${label}${"-".repeat(Math.max(8, 56 - label.length))}`, "2;37"),
+        ...block.lines.map((line) => color(line || " ", "36")),
+        color("-".repeat(56), "2;37"),
+      ];
+    }
+    case "table":
+      return Array.isArray(block.rendered) ? block.rendered : [];
+    case "heading": {
+      const level = Number(block.level) || 1;
+      const prefix = level <= 2 ? "◆" : level <= 4 ? "›" : "·";
+      const rendered = renderInlineMarkdown(block.text);
+      return [level <= 2 ? color(`${prefix} ${rendered}`, "1;36") : color(`${prefix} ${rendered}`, "1")];
+    }
+    case "hr":
+      return [color("-".repeat(56), "2;37")];
+    case "quote":
+      return (Array.isArray(block.lines) ? block.lines : []).map((item) => {
+        const depth = Math.max(1, Number(item.depth) || 1);
+        const bars = color("│".repeat(Math.min(3, depth)), "2;37");
+        return `${bars} ${color(renderInlineMarkdown(item.text), "3;37")}`;
+      });
+    case "task": {
+      const state = String(block.state || " ");
+      const marker = /x/i.test(state) ? color("[x]", "1;32") : /[~-]/.test(state) ? color("[~]", "1;33") : color("[ ]", "2;37");
+      return [`${block.indent || ""}${marker} ${renderInlineMarkdown(block.text)}`];
+    }
+    case "bullet": {
+      const depth = Math.floor(String(block.indent || "").replace(/\t/g, "  ").length / 2);
+      const glyph = depth <= 0 ? "•" : depth === 1 ? "◦" : "▪";
+      return [`${block.indent || ""}${color(glyph, "2;37")} ${renderInlineMarkdown(block.text)}`];
+    }
+    case "ordered":
+      return [`${block.indent || ""}${color(`${block.number}.`, "2;37")} ${renderInlineMarkdown(block.text)}`];
+    case "paragraph":
+      return (Array.isArray(block.lines) ? block.lines : [block.text]).map((line) => renderInlineMarkdown(line));
+    default:
+      return [renderInlineMarkdown(block.text || "")];
+  }
+}
+
+function renderMarkdownLines(text) {
+  return parseMarkdownBlocks(text).flatMap((block) => renderMarkdownBlock(block));
 }
 
 function highlightOverlaySectionLine(line) {
@@ -358,6 +613,8 @@ export class SimpleTui {
     this.approvalMeta = null;
     this.approvalDefaultYes = false;
     this.inputHint = "";
+    this.inputHints = sanitizeInputHints(DEFAULT_INPUT_HINTS);
+    this.inputHintIndex = 0;
     this.currentInput = "";
     this.thinkingTick = 0;
     this.thinkingTimer = null;
@@ -437,7 +694,8 @@ export class SimpleTui {
       this.activity = this.activity.slice(this.activity.length - this.maxActivity);
     }
     const timelineLines = this.formatTimelineLines(String(line || ""));
-    for (const item of timelineLines) {
+    const spacedTimelineLines = this.withTimelineSpacing(timelineLines);
+    for (const item of spacedTimelineLines) {
       this.timeline.push(item);
     }
     if (this.timeline.length > this.maxTimeline) {
@@ -557,7 +815,18 @@ export class SimpleTui {
     const task = String(this.currentTaskText || "").replace(/\s+/g, " ").trim();
     if (!task) return "";
     const elapsed = this.formatElapsedSinceTurnStart();
-    const parts = [color("Task", "1;36"), truncateLine(task, Math.max(16, width - 28)), color(elapsed, "2;37")];
+    const status = this.taskCompletedAt
+      ? this.modelState === "error"
+        ? color("Failed", "1;31")
+        : color("Done", "1;32")
+      : "";
+    const fixedBudget = status ? 37 : 28;
+    const parts = [
+      color("Task", "1;36"),
+      ...(status ? [status] : []),
+      truncateLine(task, Math.max(16, width - fixedBudget)),
+      color(elapsed, "2;37"),
+    ];
     return truncateLine(` ${parts.join(" · ")}`, width);
   }
 
@@ -595,8 +864,8 @@ export class SimpleTui {
   setLiveThought(content) {
     const text = String(content || "").replace(/\s+/g, " ").trim();
     this.thoughtStreamVisible = false;
-    this.thoughtStreamText = text ? `Update: ${text}` : "";
-    if (text) this.lastStatus = truncateLine(`Update: ${text}`, 120);
+    this.thoughtStreamText = text ? `Thinking: ${text}` : "";
+    if (text) this.lastStatus = truncateLine(`Thinking: ${text}`, 120);
     this.render();
   }
 
@@ -723,6 +992,31 @@ export class SimpleTui {
   setInputHint(hint) {
     this.inputHint = String(hint || "").trim();
     this.render();
+  }
+
+  setInputHints(hints = []) {
+    this.inputHints = sanitizeInputHints(hints);
+    this.inputHintIndex = 0;
+    this.render();
+  }
+
+  advanceInputHint() {
+    if (!Array.isArray(this.inputHints) || this.inputHints.length === 0) {
+      this.inputHints = sanitizeInputHints(DEFAULT_INPUT_HINTS);
+      this.inputHintIndex = 0;
+      return "";
+    }
+    this.inputHintIndex = (this.inputHintIndex + 1) % this.inputHints.length;
+    this.render();
+    return this.getCurrentInputHint();
+  }
+
+  getCurrentInputHint() {
+    const hints = sanitizeInputHints(this.inputHints);
+    this.inputHints = hints;
+    const idx = Math.max(0, Math.min(hints.length - 1, Number(this.inputHintIndex) || 0));
+    this.inputHintIndex = idx;
+    return hints[idx] || DEFAULT_INPUT_HINTS[0] || "";
   }
 
   clearInputHint() {
@@ -1033,27 +1327,44 @@ export class SimpleTui {
       question = "Approve command execution?";
     }
 
-    lines.push(color(" APPROVAL REQUIRED", "1;33"));
+    lines.push(color(" ? approval required", "1;33"));
     if (question) {
-      lines.push(truncateLine(` ${color("Question:", "1;36")} ${question}`, width));
+      lines.push(truncateLine(`   ${color("q:", "1;36")} ${question}`, width));
     }
     if (command) {
-      lines.push(truncateLine(` ${color("Command:", "1;35")} ${color(command, "37")}`, width));
+      lines.push(truncateLine(`   ${color("$", "1;35")} ${color(command, "37")}`, width));
     }
     if (!detailsText && prompt && normalize(prompt) !== normalize(question) && normalize(prompt) !== normalize(command)) {
       detailsText = prompt;
     }
     if (detailsText && normalize(detailsText) !== normalize(question)) {
-      lines.push(truncateLine(` ${color("Details:", "1;35")} ${detailsText}`, width));
+      lines.push(truncateLine(`   ${color("why:", "1;35")} ${detailsText}`, width));
     }
     const choiceLine = this.approvalDefaultYes
-      ? `${color("[Y]", "1;32")}once  ${color("[R]", "1;36")}remember  ${color("[A]", "1;33")}all session  ${color("[N]", "1;31")}no  ${color("[ENTER]", "1;33")}=${color("Once", "32")}`
-      : `${color("[Y]", "1;32")}once  ${color("[R]", "1;36")}remember  ${color("[A]", "1;33")}all session  ${color("[N]", "1;31")}no  ${color("[ENTER]", "1;33")}=${color("No", "31")}`;
-    lines.push(truncateLine(` ${choiceLine}`, width));
+      ? `${color("y", "1;32")}:once ${color("r", "1;36")}:remember ${color("a", "1;33")}:session ${color("n", "1;31")}:deny ${color("enter", "1;33")}:${color("once", "32")}`
+      : `${color("y", "1;32")}:once ${color("r", "1;36")}:remember ${color("a", "1;33")}:session ${color("n", "1;31")}:deny ${color("enter", "1;33")}:${color("deny", "31")}`;
+    lines.push(truncateLine(`   ${choiceLine}`, width));
     return lines;
   }
 
+  withTimelineSpacing(lines) {
+    const items = Array.isArray(lines) ? lines : [];
+    if (items.length === 0) return [];
+    const previous = this.timeline.length > 0 ? this.timeline[this.timeline.length - 1] : "";
+    return normalizeTimelineSpacing(previous ? [previous, ...items] : items).slice(previous ? 1 : 0);
+  }
+
   formatTimelineLines(line) {
+    const timelineItem = (marker, text, markerColor = "2;37") => {
+      const body = String(text || "").trim();
+      if (!body) return [];
+      return [` ${color(marker, markerColor)} ${body}`];
+    };
+    const timelineBlock = (marker, lines, markerColor = "2;37") => {
+      const items = (Array.isArray(lines) ? lines : [lines]).map((item) => String(item || "")).filter(Boolean);
+      if (items.length === 0) return [];
+      return items.map((item, index) => (index === 0 ? ` ${color(marker, markerColor)} ${item}` : `   ${item}`));
+    };
     const toolLabel = (tool, details = "") => {
       const name = String(tool || "tool");
       const body = String(details || "").trim();
@@ -1125,12 +1436,13 @@ export class SimpleTui {
     }
     if (line.startsWith("[thought] ")) {
       const details = trimWorkspaceText(line.slice(9).replace(/\s+/g, " ").trim(), 600).text;
-      return padAll([color(`Update: ${details || "<empty>"}`, "35"), ""]);
+      return timelineItem("·", color(`Thinking: ${details || "<empty>"}`, "35"), "35");
     }
-    if (line.startsWith("[run] shell")) {
-      const m = line.match(/command=("[^"]*"|\\S+)/);
+    if (line.startsWith("[run] ")) {
+      const rawRun = line.slice(6).trim();
+      const m = rawRun.match(/^shell\s+command=("[^"]*"|\\S+)/);
       const approvalMatch = line.match(/approval=("[^"]*"|\\S+)/);
-      const shortMatch = line.match(/^\[run\]\s+shell\s+(.+)$/);
+      const shortMatch = line.match(/^\[run\]\s+(?:shell\s+)?(.+)$/);
       let command = "";
       let approval = "";
       if (m?.[1]) {
@@ -1150,7 +1462,7 @@ export class SimpleTui {
       if (!command && shortMatch?.[1]) {
         command = shortMatch[1].trim();
       }
-      const display = command || "shell command";
+      const display = command || rawRun || "tool";
       const safeDisplay = trimWorkspaceText(display, 320).text.replace(/\n/g, " ");
       const tag =
         approval === "approved"
@@ -1158,7 +1470,7 @@ export class SimpleTui {
           : approval === "auto"
           ? color("[AUTO]", "2;32")
           : "";
-      return padAll([`${color("[~]", "1;33")} ${color(`Bash(${safeDisplay})`, "36")}${tag ? ` ${tag}` : ""}`, ""]);
+      return timelineItem("›", `${color("Run", "1;36")} ${color(safeDisplay, "36")}${tag ? ` ${tag}` : ""}`, "1;36");
     }
     if (line.startsWith("[tool] ")) {
       const body = line.slice(7).trim();
@@ -1171,21 +1483,21 @@ export class SimpleTui {
         return [];
       }
       const match = body.match(/^([a-zA-Z0-9_.-]+)\s*(.*)$/);
-      return padAll([`${color("[tool]", "2;36")} ${toolLabel(match?.[1] || body, match?.[2] || "")}`]);
+      return timelineItem("›", toolLabel(match?.[1] || body, match?.[2] || ""), "1;36");
     }
     if (line.startsWith("[tools] ")) {
       const body = line.slice(8).trim();
-      return padAll([`${color("[tools]", "1;36")} ${body}`, ""]);
+      return timelineItem("›", `${color("Run", "1;36")} ${body}`, "1;36");
     }
     if (line.startsWith("[agent] ")) {
-      return padAll([`${color("[agent]", "1;35")} ${trimWorkspaceText(line.slice(8).trim(), 600).text}`]);
+      return timelineItem("◦", `${color("Agent", "1;35")} ${trimWorkspaceText(line.slice(8).trim(), 600).text}`, "1;35");
     }
     if (line.startsWith("[response] ")) {
       const text = trimWorkspaceText(line.slice(11).trim(), 8000).text;
-      if (!text) return padAll(["<empty>", ""]);
+      if (!text) return timelineItem("•", "<empty>");
       const chunks = renderMarkdownLines(text).filter((chunk) => chunk !== undefined);
-      if (chunks.length === 0) return padAll(["<empty>", ""]);
-      return padAll([...chunks, ""]);
+      if (chunks.length === 0) return timelineItem("•", "<empty>");
+      return timelineBlock("•", chunks, "1;32");
     }
     if (line.startsWith("[result] ")) {
       const body = line.slice(9).trim();
@@ -1194,12 +1506,19 @@ export class SimpleTui {
       const ok = !failed && /\b(done|ok|success|succeeded|completed)\b/.test(lower);
       const icon = failed ? "[x]" : ok ? "[ok]" : "[i]";
       const iconColor = failed ? "1;31" : ok ? "1;32" : "2;37";
-      return padAll([`${color(icon, iconColor)} ${color(body, "2;37")}`, ""]);
+      return timelineItem(failed ? "×" : ok ? "✓" : "•", color(body, "2;37"), iconColor);
     }
     if (line.startsWith("[tool-result] ")) {
       const body = trimWorkspaceText(line.slice(14).trim(), 2000).text;
       if (!body) return [];
-      return padAll([color(body, "2;37")]);
+      const compact = body
+        .replace(/\r/g, "")
+        .split("\n")
+        .map((part) => part.trim())
+        .filter(Boolean)
+        .slice(0, 6);
+      const rendered = compact.length > 0 ? compact : [body];
+      return timelineBlock("↳", rendered.map((part) => color(part, "2;37")), "2;37");
     }
     if (line.startsWith("[banner-1] ")) {
       return [color(line.slice(11), "1;82")];
@@ -1268,7 +1587,7 @@ export class SimpleTui {
       // Hide internal event noise in workspace timeline.
       return [];
     }
-    return padAll([trimWorkspaceText(line, 1200).text]);
+    return timelineItem("•", trimWorkspaceText(line, 1200).text);
   }
 
   buildInputState(input, width, cursorIndex = null) {
@@ -1283,7 +1602,7 @@ export class SimpleTui {
     const promptGlyph = "❯";
     const firstPrefix = ` ${promptGlyph} `;
     const contPrefix = "   ";
-    const placeholder = 'Try "fix lint errors"';
+    const placeholder = this.getCurrentInputHint() || 'Try "fix lint errors"';
     const hasContent = normalizedSource.length > 0;
     const logicalLines = hasContent ? normalizedSource.split("\n") : [""];
     const wrapInputLine = (lineText, firstWidth, continuationWidth) => {
@@ -1495,7 +1814,7 @@ export class SimpleTui {
       : 0;
     const hintLines = this.inputHint ? 1 : 0;
     const taskContextLine = this.formatTaskContextLine(width);
-    const taskContextLines = taskContextLine ? 1 : 0;
+    const taskContextLines = taskContextLine ? 2 : 0;
     const thinkingLines = this.thinking ? 1 : 0;
     const thoughtWrapped = [];
     const thoughtStreamLines = 0;
@@ -1537,13 +1856,12 @@ export class SimpleTui {
         : "";
     const tokStatus =
       this.sessionTokensSent > 0 || this.sessionTokensReceived > 0
-        ? ` | session tok:↑${formatCompactNumber(this.sessionTokensSent)} ↓${formatCompactNumber(this.sessionTokensReceived)}`
+        ? ` | tok:↑${formatCompactNumber(this.sessionTokensSent)} ↓${formatCompactNumber(this.sessionTokensReceived)}`
         : "";
     const todoDone = this.todos.filter((t) => String(t?.status || "").toLowerCase() === "completed").length;
     const todoStatus = this.todos.length > 0 ? ` | TODO(${todoDone}/${this.todos.length})` : "";
     const planStatus = this.planModeEnabled ? " | plan:on" : "";
-    const scrollHint = this.scrollOffset > 0 ? " | PgDn/End:bottom" : (this.lastScrollMax > 0 ? " | PgUp/↑:history" : "");
-    const promptStatusRaw = `status: ${this.lastStatus || "idle"}${planStatus}${ctxStatus}${tokStatus}${todoStatus}${scrollLabel}${scrollHint}`;
+    const promptStatusRaw = `status: ${this.lastStatus || "idle"}${planStatus}${ctxStatus}${tokStatus}${todoStatus}${scrollLabel}`;
     const bashMode = /^\s*!/.test(this.currentInput) ? " | mode:bash" : "";
     const leftStatusLabel = this.formatTransientStatusLabel() || this.formatProjectInstructionsLabel();
     let promptStatus = "";
@@ -1562,12 +1880,14 @@ export class SimpleTui {
           : `${" ".repeat(Math.max(0, width - raw.length))}${raw}`;
     }
     const approvalBlock = this.approvalPrompt ? [sep, ...approvalContentLines] : [];
-    const taskContextBlock = taskContextLine ? [taskContextLine] : [];
+    const taskContextBlock = taskContextLine ? ["", taskContextLine] : [];
     const thinkingColors = ["82", "118", "154", "190", "201"];
     const thinkingColor = thinkingColors[this.thinkingTick % thinkingColors.length];
     const spinFrames = ["|", "/", "-", "\\"];
     const spin = spinFrames[this.thinkingTick % spinFrames.length];
-    const runningLine = `↳ | ${spin} running | ${this.formatElapsedSinceTurnStart()} | tok ↑${formatCompactNumber(this.turnTokensSent)} ↓${formatCompactNumber(this.turnTokensReceived)}`;
+    const thought = String(this.thoughtStreamText || "").trim();
+    const thoughtSuffix = thought ? ` | ${truncateLine(thought, Math.max(20, width - 54))}` : "";
+    const runningLine = `↳ | ${spin} thinking${this.thinkingStage ? `:${this.thinkingStage}` : ""} | ${this.formatElapsedSinceTurnStart()} | tok ↑${formatCompactNumber(this.turnTokensSent)} ↓${formatCompactNumber(this.turnTokensReceived)}${thoughtSuffix}`;
     const thinkingBlock = this.thinking ? [color(runningLine, `1;${thinkingColor}`)] : [];
     const thoughtStreamBlock = [];
 
@@ -1628,14 +1948,13 @@ export class SimpleTui {
       ...taskContextBlock,
       ...thinkingBlock,
       ...thoughtStreamBlock,
-      sep, // separator directly above input
+      sep,
     ];
     const frameLines = [
       ...beforeInputLines,
       ...inputState.lines.map((line) => `\x1b[1m${line}\x1b[0m`),
       ...commandSuggestionBlock,
       ...modelSuggestionBlock,
-      sep,
       `\x1b[2m${promptStatus}\x1b[0m`,
       ...(this.inputHint ? [`\x1b[2m${truncateLine(` ${this.inputHint}`, width)}\x1b[0m`] : []),
     ];

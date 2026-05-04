@@ -23,11 +23,7 @@ const SAFE_COMMANDS = new Set([
   "cut",
   "rg",
   "grep",
-  "find",
-  "sed",
-  "awk",
   "tr",
-  "xargs",
   "basename",
   "dirname",
   "realpath",
@@ -37,8 +33,6 @@ const SAFE_COMMANDS = new Set([
   "ps",
   "which",
   "type",
-  "env",
-  "printenv",
   "date",
   "uname",
   "id",
@@ -137,10 +131,14 @@ function extractCommandDescriptor(segment) {
   }
 
   if (idx < tokens.length && tokens[idx] === "env") {
+    if (idx === tokens.length - 1) {
+      return { name: "env", args: [] };
+    }
     idx += 1;
     while (idx < tokens.length && (tokens[idx].startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=.*/.test(tokens[idx]))) {
       idx += 1;
     }
+    if (idx >= tokens.length) return { name: "env", args: tokens.slice(1) };
   }
 
   const first = stripOuterQuotes(tokens[idx] || "").toLowerCase();
@@ -149,6 +147,29 @@ function extractCommandDescriptor(segment) {
     name: first,
     args: tokens.slice(idx + 1),
   };
+}
+
+function hasArg(args, names) {
+  const wanted = new Set(Array.isArray(names) ? names : [names]);
+  return args.some((arg) => wanted.has(stripOuterQuotes(arg).toLowerCase()));
+}
+
+function classifyDangerousDescriptor(descriptor) {
+  const name = descriptor.name;
+  const args = descriptor.args || [];
+  if (name === "find" && hasArg(args, "-delete")) {
+    return { level: "dangerous", reason: "find -delete may remove files" };
+  }
+  if (name === "sed" && args.some((arg) => /^-.*i/.test(stripOuterQuotes(arg)) || stripOuterQuotes(arg) === "--in-place")) {
+    return { level: "dangerous", reason: "sed in-place editing may modify files" };
+  }
+  if (name === "xargs") {
+    const joined = args.map(stripOuterQuotes).join(" ").toLowerCase();
+    if (/\b(rm|mv|cp|chmod|chown|sh|bash|zsh)\b/.test(joined)) {
+      return { level: "dangerous", reason: "xargs can invoke destructive commands" };
+    }
+  }
+  return null;
 }
 
 function classifyGitSubcommand(args) {
@@ -205,6 +226,8 @@ export function classifyShellCommand(command) {
   let hasUnclassified = false;
 
   for (const descriptor of descriptors) {
+    const dangerous = classifyDangerousDescriptor(descriptor);
+    if (dangerous) return dangerous;
     if (DANGEROUS_COMMANDS.has(descriptor.name)) {
       return { level: "dangerous", reason: "contains potentially destructive command" };
     }
@@ -226,13 +249,82 @@ export function classifyShellCommand(command) {
   return { level: "unclassified", reason: "command is neither known safe nor explicitly dangerous" };
 }
 
-function resolveInsideRoot(root, candidatePath) {
+function assertLexicallyInsideRoot(root, candidatePath) {
   const resolved = path.resolve(root, candidatePath || ".");
   const rel = path.relative(root, resolved);
   if (rel.startsWith("..") || path.isAbsolute(rel)) {
     throw new Error(`Path escapes workspace: ${candidatePath}`);
   }
   return resolved;
+}
+
+function isPathInside(realRoot, realTarget) {
+  const rel = path.relative(realRoot, realTarget);
+  return rel === "" || (!rel.startsWith("..") && !path.isAbsolute(rel));
+}
+
+async function resolveExistingInsideRoot(root, candidatePath) {
+  const lexical = assertLexicallyInsideRoot(root, candidatePath);
+  const realRoot = await fs.realpath(root);
+  const realTarget = await fs.realpath(lexical);
+  if (!isPathInside(realRoot, realTarget)) {
+    throw new Error(`Path escapes workspace: ${candidatePath}`);
+  }
+  return realTarget;
+}
+
+async function nearestExistingParent(targetPath) {
+  let current = targetPath;
+  while (true) {
+    try {
+      const stat = await fs.lstat(current);
+      return stat.isDirectory() ? current : path.dirname(current);
+    } catch (error) {
+      if (error?.code !== "ENOENT") throw error;
+      const parent = path.dirname(current);
+      if (parent === current) throw error;
+      current = parent;
+    }
+  }
+}
+
+async function resolveWritableInsideRoot(root, candidatePath) {
+  const lexical = assertLexicallyInsideRoot(root, candidatePath);
+  const realRoot = await fs.realpath(root);
+  try {
+    const realTarget = await fs.realpath(lexical);
+    if (!isPathInside(realRoot, realTarget)) throw new Error(`Path escapes workspace: ${candidatePath}`);
+    return realTarget;
+  } catch (error) {
+    if (error?.code !== "ENOENT") throw error;
+  }
+
+  const segments = path.relative(root, lexical).split(path.sep).filter(Boolean);
+  let cursor = root;
+  for (const segment of segments.slice(0, -1)) {
+    cursor = path.join(cursor, segment);
+    try {
+      const stat = await fs.lstat(cursor);
+      if (stat.isSymbolicLink()) {
+        const realCursor = await fs.realpath(cursor);
+        if (!isPathInside(realRoot, realCursor)) throw new Error(`Path escapes workspace: ${candidatePath}`);
+      }
+    } catch (error) {
+      if (error?.code === "ENOENT") break;
+      throw error;
+    }
+  }
+
+  const parent = await nearestExistingParent(path.dirname(lexical));
+  const realParent = await fs.realpath(parent);
+  if (!isPathInside(realRoot, realParent)) {
+    throw new Error(`Path escapes workspace: ${candidatePath}`);
+  }
+  return lexical;
+}
+
+function resolveInsideRoot(root, candidatePath) {
+  return assertLexicallyInsideRoot(root, candidatePath);
 }
 
 function normalizeTodoItems(items) {
@@ -755,14 +847,14 @@ export function createToolset({
 
   const readFile = async ({ path: relPath } = {}) => {
     onToolStart?.("read_file", { path: relPath });
-    const abs = resolveInsideRoot(workspaceDir, relPath);
+    const abs = await resolveExistingInsideRoot(workspaceDir, relPath);
     const content = await fs.readFile(abs, "utf8");
     return content;
   };
 
   const writeFile = async ({ path: relPath, content } = {}) => {
     onToolStart?.("write_file", { path: relPath });
-    const abs = resolveInsideRoot(workspaceDir, relPath);
+    const abs = await resolveWritableInsideRoot(workspaceDir, relPath);
     await fs.mkdir(path.dirname(abs), { recursive: true });
     await fs.writeFile(abs, content, "utf8");
     return `Wrote ${content.length} bytes to ${relPath}`;
@@ -785,7 +877,7 @@ export function createToolset({
       throw new Error("Missing required parameter: oldText (or old_text)");
     }
 
-    const abs = resolveInsideRoot(workspaceDir, normalizedPath);
+    const abs = await resolveExistingInsideRoot(workspaceDir, normalizedPath);
     let fileContent = "";
     try {
       fileContent = await fs.readFile(abs, "utf8");
@@ -872,7 +964,7 @@ export function createToolset({
       include_hidden: includeHidden,
       include_ignored: includeIgnored,
     });
-    const abs = resolveInsideRoot(workspaceDir, relPath);
+    const abs = await resolveExistingInsideRoot(workspaceDir, relPath);
     const cap = Math.min(Math.max(Number(maxEntries) || 200, 1), 2000);
     const out = [];
 
@@ -928,7 +1020,7 @@ export function createToolset({
         continue;
       }
       try {
-        const abs = resolveInsideRoot(workspaceDir, relPath);
+        const abs = await resolveExistingInsideRoot(workspaceDir, relPath);
         const content = await fs.readFile(abs, "utf8");
         const remaining = Math.max(0, totalCap - totalChars);
         const effectiveCap = Math.max(200, Math.min(cap, remaining));
@@ -968,7 +1060,7 @@ export function createToolset({
       max_results: maxResults,
       include_hidden: includeHidden,
     });
-    const abs = resolveInsideRoot(workspaceDir, relPath);
+    const abs = await resolveExistingInsideRoot(workspaceDir, relPath);
     const limit = Math.min(Math.max(Number(maxResults) || 200, 1), 2000);
     const matcher = globToRegExp(String(pattern || "**/*"));
     const out = [];
@@ -1001,7 +1093,7 @@ export function createToolset({
     });
     const needle = String(query || "").trim().toLowerCase();
     if (!needle) throw new Error("Missing required parameter: query");
-    const abs = resolveInsideRoot(workspaceDir, relPath);
+    const abs = await resolveExistingInsideRoot(workspaceDir, relPath);
     const limit = Math.min(Math.max(Number(maxResults) || 200, 1), 2000);
     const out = [];
     await walkWorkspaceFiles({
@@ -1029,7 +1121,7 @@ export function createToolset({
     onToolStart?.("apply_patch", { path: relPath, all, dry_run: dryRun, edits });
     const normalizedPath = String(relPath || "").trim();
     if (!normalizedPath) throw new Error("Missing required parameter: path");
-    const abs = resolveInsideRoot(workspaceDir, normalizedPath);
+    const abs = await resolveExistingInsideRoot(workspaceDir, normalizedPath);
     const fileContent = await fs.readFile(abs, "utf8");
 
     const editOps = Array.isArray(edits)
@@ -1088,7 +1180,7 @@ export function createToolset({
       use_regex: useRegex,
       apply,
     });
-    const abs = resolveInsideRoot(workspaceDir, relPath);
+    const abs = await resolveExistingInsideRoot(workspaceDir, relPath);
     const needle = String(find || "");
     if (!needle) throw new Error("Missing required parameter: find");
     const limitFiles = Math.min(Math.max(Number(maxFiles) || 200, 1), 2000);
@@ -1277,6 +1369,9 @@ export function createToolset({
     }
     const result = await writeMemory({ scope, content });
     onMemoryWrite?.(result);
+    if (result.skipped) {
+      return `Memory unchanged (${result.reason || "skipped"}): ${result.relPath || result.path}.`;
+    }
     return `Saved memory to ${result.relPath || result.path} (${result.scope}).`;
   };
 
@@ -1320,7 +1415,7 @@ export function createToolset({
       throw new Error("Missing required parameter: pattern, regex, or query (search pattern)");
     }
 
-    const absPath = resolveInsideRoot(workspaceDir, searchPath);
+    const absPath = await resolveExistingInsideRoot(workspaceDir, searchPath);
     const limit = Math.min(Math.max(Number(maxResults) || 50, 1), 200);
 
     // Try ripgrep first (fastest)

@@ -1,0 +1,111 @@
+<svg width="1600" height="900" viewBox="0 0 1600 900" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="title desc">
+  <title id="title">PieCode Introduction Slide</title>
+  <desc id="desc">A simple presentation slide introducing PieCode, a command line coding agent.</desc>
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#111827"/>
+      <stop offset="55%" stop-color="#1e1b4b"/>
+      <stop offset="100%" stop-color="#312e81"/>
+    </linearGradient>
+    <linearGradient id="accent" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#38bdf8"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="16" stdDeviation="22" flood-color="#000000" flood-opacity="0.28"/>
+    </filter>
+    <style>
+      .title { font: 800 92px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #ffffff; letter-spacing: -2px; }
+      .subtitle { font: 400 34px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #c7d2fe; }
+      .section { font: 750 30px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #ffffff; }
+      .body { font: 500 25px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #dbeafe; }
+      .small { font: 600 19px Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #a5b4fc; }
+      .mono { font: 600 22px "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace; fill: #e0f2fe; }
+    </style>
+  </defs>
+
+  <rect width="1600" height="900" fill="url(#bg)"/>
+  <circle cx="1350" cy="130" r="260" fill="#38bdf8" opacity="0.12"/>
+  <circle cx="180" cy="830" r="320" fill="#a78bfa" opacity="0.13"/>
+  <path d="M1230 735 C1340 650 1445 680 1530 590" fill="none" stroke="#818cf8" stroke-width="5" opacity="0.35"/>
+
+  <!-- Header -->
+  <g transform="translate(110 96)">
+    <g filter="url(#shadow)">
+      <rect x="0" y="0" rx="34" ry="34" width="1380" height="705" fill="#0f172a" opacity="0.72"/>
+      <rect x="1.5" y="1.5" rx="34" ry="34" width="1377" height="702" fill="none" stroke="#6366f1" stroke-opacity="0.45" stroke-width="3"/>
+    </g>
+
+    <!-- Logo mark -->
+    <g transform="translate(66 62)">
+      <circle cx="64" cy="64" r="64" fill="url(#accent)"/>
+      <path d="M63 22 A42 42 0 1 1 33 94 L63 64 Z" fill="#111827" opacity="0.92"/>
+      <path d="M74 25 A40 40 0 0 1 112 63 L74 63 Z" fill="#ffffff" opacity="0.9"/>
+      <circle cx="64" cy="64" r="10" fill="#e0f2fe"/>
+    </g>
+
+    <text x="160" y="112" class="title">PieCode</text>
+    <text x="165" y="160" class="subtitle">A Claude Code-like command line coding agent</text>
+
+    <!-- Terminal card -->
+    <g transform="translate(740 70)" filter="url(#shadow)">
+      <rect x="0" y="0" width="555" height="250" rx="26" fill="#020617"/>
+      <rect x="0" y="0" width="555" height="54" rx="26" fill="#111827"/>
+      <circle cx="34" cy="27" r="8" fill="#f87171"/>
+      <circle cx="62" cy="27" r="8" fill="#fbbf24"/>
+      <circle cx="90" cy="27" r="8" fill="#34d399"/>
+      <text x="34" y="96" class="mono">$ npm run agent</text>
+      <text x="34" y="136" class="mono" opacity="0.85">› inspect, edit, test, ship</text>
+      <text x="34" y="178" class="mono" opacity="0.75">tools: shell · files · MCP</text>
+      <rect x="34" y="204" width="210" height="18" rx="9" fill="#38bdf8" opacity="0.35"/>
+    </g>
+
+    <!-- Feature cards -->
+    <g transform="translate(70 270)">
+      <g>
+        <rect width="380" height="145" rx="24" fill="#1e293b" opacity="0.82"/>
+        <circle cx="48" cy="50" r="22" fill="#38bdf8" opacity="0.22"/>
+        <text x="82" y="56" class="section">Interactive TUI</text>
+        <text x="32" y="103" class="body">Full-screen terminal workflow</text>
+      </g>
+      <g transform="translate(435 0)">
+        <rect width="380" height="145" rx="24" fill="#1e293b" opacity="0.82"/>
+        <circle cx="48" cy="50" r="22" fill="#a78bfa" opacity="0.24"/>
+        <text x="82" y="56" class="section">Model Tools</text>
+        <text x="32" y="103" class="body">Read, edit, run, test code</text>
+      </g>
+      <g transform="translate(870 0)">
+        <rect width="380" height="145" rx="24" fill="#1e293b" opacity="0.82"/>
+        <circle cx="48" cy="50" r="22" fill="#34d399" opacity="0.22"/>
+        <text x="82" y="56" class="section">Safe by Default</text>
+        <text x="32" y="103" class="body">Sandbox + shell approvals</text>
+      </g>
+    </g>
+
+    <g transform="translate(70 455)">
+      <g>
+        <rect width="380" height="145" rx="24" fill="#1e293b" opacity="0.82"/>
+        <circle cx="48" cy="50" r="22" fill="#fbbf24" opacity="0.22"/>
+        <text x="82" y="56" class="section">Multi-Provider</text>
+        <text x="32" y="103" class="body">Anthropic, OpenAI, Seed, Codex</text>
+      </g>
+      <g transform="translate(435 0)">
+        <rect width="380" height="145" rx="24" fill="#1e293b" opacity="0.82"/>
+        <circle cx="48" cy="50" r="22" fill="#fb7185" opacity="0.22"/>
+        <text x="82" y="56" class="section">Skills + MCP</text>
+        <text x="32" y="103" class="body">Extend workflows and integrations</text>
+      </g>
+      <g transform="translate(870 0)">
+        <rect width="380" height="145" rx="24" fill="#1e293b" opacity="0.82"/>
+        <circle cx="48" cy="50" r="22" fill="#60a5fa" opacity="0.22"/>
+        <text x="82" y="56" class="section">CLI + Web UI</text>
+        <text x="32" y="103" class="body">Use locally from terminal/browser</text>
+      </g>
+    </g>
+
+    <!-- Footer -->
+    <text x="70" y="665" class="small">npm run agent  ·  node src/cli.js --prompt "inspect this repo"  ·  npm run web</text>
+    <rect x="1090" y="632" width="205" height="54" rx="27" fill="url(#accent)"/>
+    <text x="1131" y="667" style="font: 800 22px Inter, ui-sans-serif, system-ui, sans-serif; fill: #0f172a;">Build faster</text>
+  </g>
+</svg>

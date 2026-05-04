@@ -606,18 +606,41 @@ describe("tools usability", () => {
     expect(result).toContain("exit_code: 0");
   });
 
-  test("safe command with stderr redirect to /dev/null is auto-approved", async () => {
+  test("higher-risk shell helpers and destructive flags are not classified safe", () => {
+    expect(classifyShellCommand("find . -delete").level).toBe("dangerous");
+    expect(classifyShellCommand("sed -i s/a/b/ file.txt").level).toBe("dangerous");
+    expect(classifyShellCommand("env").level).not.toBe("safe");
+    expect(classifyShellCommand("printenv").level).not.toBe("safe");
+    expect(classifyShellCommand("xargs rm").level).toBe("dangerous");
+    expect(classifyShellCommand("rg foo src").level).toBe("safe");
+  });
+
+  test("read_file rejects symlink escape outside workspace", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-outside-"));
+    await fs.writeFile(path.join(outside, "secret.txt"), "secret", "utf8");
+    await fs.symlink(outside, path.join(dir, "link"), "dir");
     const tools = createToolset({
       workspaceDir: dir,
-      autoApproveRef: { value: false },
-      askApproval: async () => {
-        throw new Error("askApproval should not be called for safe command with /dev/null redirect");
-      },
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
     });
 
-    const result = await tools.shell({ command: 'find . -name "package.json" 2>/dev/null' });
-    expect(result).toContain("exit_code: 0");
+    await expect(tools.read_file({ path: "link/secret.txt" })).rejects.toThrow(/escapes workspace/i);
+  });
+
+  test("write_file rejects writes through symlinked parent outside workspace", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    const outside = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-outside-"));
+    await fs.symlink(outside, path.join(dir, "out"), "dir");
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+    });
+
+    await expect(tools.write_file({ path: "out/new.txt", content: "nope" })).rejects.toThrow(/escapes workspace/i);
+    await expect(fs.readFile(path.join(outside, "new.txt"), "utf8")).rejects.toThrow();
   });
 
   test("git status is treated as safe and auto-approved", async () => {
@@ -634,7 +657,7 @@ describe("tools usability", () => {
     expect(result).toContain("exit_code:");
   });
 
-  test("command with env assignments is classified safe", async () => {
+  test("command with env executable requires approval", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
     const seen = [];
     const tools = createToolset({
@@ -646,13 +669,13 @@ describe("tools usability", () => {
       },
     });
 
-    const command = "FOO=bar env | head -n 1";
-    expect(classifyShellCommand(command).level).toBe("safe");
+    const command = "env | head -n 1";
+    expect(classifyShellCommand(command).level).toBe("unclassified");
     await tools.shell({ command });
-    expect(seen).toEqual([]);
+    expect(seen).toEqual(["unclassified"]);
   });
 
-  test("awk and sed are treated as safe commands", async () => {
+  test("awk and sed pipelines require approval", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
     const seen = [];
     const tools = createToolset({
@@ -665,9 +688,9 @@ describe("tools usability", () => {
     });
 
     const command = "echo hello | sed 's/hello/hi/' | awk '{print $1}'";
-    expect(classifyShellCommand(command).level).toBe("safe");
+    expect(classifyShellCommand(command).level).toBe("unclassified");
     await tools.shell({ command });
-    expect(seen).toEqual([]);
+    expect(seen).toEqual(["unclassified"]);
   });
 
   test("dangerous shell command always requires approval even when auto-approve is on", async () => {

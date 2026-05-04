@@ -98,6 +98,8 @@ node src/cli.js --prompt "use $vercel-react-best-practices to optimize this Reac
 node src/cli.js --tui
 
 # start the Web UI (LAN accessible by default)
+node src/cli.js --web
+# or
 npm run web
 # optional overrides:
 PIECODE_WEB_PORT=3737 PIECODE_WEB_HOST=0.0.0.0 npm run web
@@ -124,7 +126,7 @@ npm run release -- --publish
 
 TUI includes live model status (running/idle/error), last turn duration, and last tool used.
 
-Web UI is available with `npm run web`. It serves a browser-based agent workspace on `0.0.0.0` by default so other devices on the same LAN can open the printed network URL. The Web UI reuses the same Agent, provider, tool, MCP, skills, and approval backend as the CLI/TUI, with chat timeline, live tool status, TODOs, plan mode, abort, and shell approval controls. Web sessions are saved under `.piecode/web-sessions/`; use `/sessions` to list recent sessions and `/resume <short-id|session-id>` to restore one.
+Web UI is available with `node src/cli.js --web` or `npm run web`. It serves a browser-based agent workspace on `0.0.0.0` by default so other devices on the same LAN can open the printed network URL. The Web UI reuses the same Agent, provider, tool, MCP, skills, and approval backend as the CLI/TUI, with chat timeline, compact tool summaries, optional detail mode, session diff, TODOs, plan mode, abort, and shell approval controls. Web sessions are saved under `.piecode/web-sessions/`; use `/sessions` to list recent sessions and `/resume <short-id|session-id>` to restore one.
 
 The agent now performs a lightweight pre-plan before execution (default on) to reduce unnecessary tool calls. If the first plan underestimates the work, it auto-replans and continues.
 

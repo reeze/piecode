@@ -6,6 +6,19 @@ import { shouldPlanTaskMessage } from "./plannedTaskRunner.js";
 import { AgentManager } from "./agentManager.js";
 import { appendMemory, renderMemoryForPrompt } from "./memory.js";
 
+function summarizeToolUseNames(events = [], maxItems = 12) {
+  const counts = new Map();
+  for (const evt of Array.isArray(events) ? events : []) {
+    if (evt?.type !== "tool_use") continue;
+    const name = String(evt.tool || "unknown").trim() || "unknown";
+    counts.set(name, (counts.get(name) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, maxItems)
+    .map(([name, count]) => (count > 1 ? `${name} x${count}` : name));
+}
+
 export class Agent {
   constructor({
     provider,
@@ -14,6 +27,7 @@ export class Agent {
     askApproval,
     onEvent,
     activeSkillsRef,
+    activePluginsRef,
     onTodoWrite,
     projectInstructionsRef,
     memoryRef,
@@ -35,6 +49,7 @@ export class Agent {
     this.onTodoWrite = onTodoWrite;
     this.onMemoryWrite = onMemoryWrite;
     this.activeSkillsRef = activeSkillsRef || { value: [] };
+    this.activePluginsRef = activePluginsRef || { value: [] };
     this.projectInstructionsRef = projectInstructionsRef || { value: null };
     this.memoryRef = memoryRef || { value: null };
     this.mcpHub = mcpHub && typeof mcpHub.hasServers === "function" ? mcpHub : null;
@@ -108,7 +123,7 @@ export class Agent {
       content,
     });
     const memory = this.memoryRef?.value;
-    if (memory && typeof memory === "object" && memory[result.scope]) {
+    if (!result.skipped && memory && typeof memory === "object" && memory[result.scope]) {
       const current = String(memory[result.scope].content || "").trimEnd();
       const note = String(content || "").trim().replace(/\n+/g, "\n  ");
       memory[result.scope] = {
@@ -361,6 +376,10 @@ export class Agent {
     return Array.isArray(this.activeSkillsRef?.value) ? this.activeSkillsRef.value : [];
   }
 
+  getActivePlugins() {
+    return Array.isArray(this.activePluginsRef?.value) ? this.activePluginsRef.value : [];
+  }
+
   getAgentDefinitions() {
     return Array.isArray(this.agentDefinitionsRef?.value) ? this.agentDefinitionsRef.value : [];
   }
@@ -488,6 +507,7 @@ export class Agent {
         this.onEvent?.({ type: "subagent_event", id: subagentId, role: effectiveRole, agentDefinition: definitionMeta, task: normalizedTask, event: evt, state });
       },
       activeSkillsRef: this.activeSkillsRef,
+      activePluginsRef: this.activePluginsRef,
       onTodoWrite: null,
       projectInstructionsRef: this.projectInstructionsRef,
       memoryRef: this.memoryRef,
@@ -502,6 +522,7 @@ export class Agent {
     });
 
     const blockedReadOnlyTool = async () => "Tool error: subagent is read-only and cannot modify files or todos.";
+    const blockedStrictReadOnlyTool = async () => "Tool error: this background task is strict read-only; use read/search/git_status/git_diff tools only.";
     child.tools.write_file = blockedReadOnlyTool;
     child.tools.edit_file = blockedReadOnlyTool;
     child.tools.apply_patch = blockedReadOnlyTool;
@@ -532,6 +553,13 @@ export class Agent {
       child.tools.collaborate = blockedReadOnlyTool;
       if (!canDelegate) child.tools.subagent = async () => "Tool error: nested subagents are disabled.";
     }
+    if (options?.strictReadOnly) {
+      child.tools.shell = blockedStrictReadOnlyTool;
+      child.tools.run_tests = blockedStrictReadOnlyTool;
+      child.tools.mcp_call_tool = blockedStrictReadOnlyTool;
+      child.tools.subagent = async () => "Tool error: nested subagents are disabled for background read-only tasks.";
+      child.tools.collaborate = blockedStrictReadOnlyTool;
+    }
     child.defaultToolBudget = Math.min(Math.max(Number(toolBudget) || 3, 1), 6);
     child.enablePlanner = false;
     child.taskPlanner = null;
@@ -540,10 +568,7 @@ export class Agent {
     const prompt = this.buildSubagentPrompt({ task: normalizedTask, context, mode, definition });
     try {
       const result = await child.runTurn(prompt, { signal: options?.signal || null });
-      const toolSummary = childEvents
-        .filter((evt) => evt?.type === "tool_use")
-        .map((evt) => String(evt.tool || "unknown"))
-        .slice(0, 12);
+      const toolSummary = summarizeToolUseNames(childEvents);
       const toolLine = toolSummary.length > 0 ? `\n\nSubagent tools used: ${toolSummary.join(", ")}` : "";
       this.onEvent?.({
         type: "subagent_end",

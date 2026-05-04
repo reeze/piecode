@@ -301,9 +301,23 @@ export class TurnEngine {
     });
     this.agent.emitLlmResponse("turn_finalize", raw);
     const parsed = parseModelAction(String(raw || ""));
-    if (parsed?.type === "final" && parsed.message) return String(parsed.message);
-    if (parsed?.type === "thought" && parsed.content) return String(parsed.content);
+    if (parsed?.type === "final") return String(parsed.message || "").trim();
+    if (parsed?.type === "thought") return String(parsed.content || "").trim();
+    if (parsed?.type === "tool_use" || parsed?.type === "tool_uses") return "";
     return String(raw || "").trim();
+  }
+
+  async finalizeAfterRepeatedToolResult({ signal = null, reason = "repeated_tool_result" } = {}) {
+    if (this.commitFlowSignalCount <= 0) {
+      const forced = await this.synthesizeFinalFromEvidence({
+        requireCommitMessage: Boolean(this.turnPolicy?.requireCommitMessage),
+        signal,
+      }).catch(() => "");
+      const body = String(forced || "").trim();
+      if (body) return body;
+    }
+    const label = reason === "repeated_tool_call" ? "The model requested a repeated tool call" : "I’m repeating the same verified step result in this turn";
+    return `${label}. I avoided another duplicate call and am finalizing from the evidence already collected. If you want me to try a different direction, tell me what to inspect next.`;
   }
 
   async planTurn(signal = null) {
@@ -478,7 +492,7 @@ export class TurnEngine {
       if (item.signature === this.lastToolSignature && this.repeatedNoProgressCount >= 2) {
         return {
           done: true,
-          message: "I’m repeating the same tool call without progress. Stopping to avoid a loop. Please clarify the next step.",
+          message: await this.finalizeAfterRepeatedToolResult({ signal, reason: "repeated_tool_call" }),
         };
       }
     }
@@ -589,8 +603,7 @@ export class TurnEngine {
       if (seenCount >= 2) {
         return {
           done: true,
-          message:
-            "I’m repeating the same verified step result in this turn. Stopping to avoid a tool loop. Please refine the request or confirm next action.",
+          message: await this.finalizeAfterRepeatedToolResult({ signal, reason: "repeated_tool_result" }),
         };
       }
     }
@@ -643,6 +656,7 @@ export class TurnEngine {
       workspaceDir: this.agent.workspaceDir,
       autoApprove: this.agent.autoApproveRef.value,
       activeSkills: this.agent.getActiveSkills(),
+      activePlugins: this.agent.getActivePlugins(),
       activePlan: this.activePlan,
       projectInstructions: this.agent.projectInstructionsRef?.value?.content || null,
       memory: this.agent.getMemoryPrompt(),
@@ -937,8 +951,7 @@ export class TurnEngine {
 
       const toolSignature = this.buildToolSignature(action);
       if (toolSignature === this.lastToolSignature && this.repeatedNoProgressCount >= 2) {
-        const msg =
-          "I’m repeating the same tool call without progress. Stopping to avoid a loop. Please clarify the next step.";
+        const msg = await this.finalizeAfterRepeatedToolResult({ signal, reason: "repeated_tool_call" });
         this.agent.history.push({ role: "assistant", content: msg });
         return msg;
       }
@@ -1018,8 +1031,7 @@ export class TurnEngine {
       const seenCount = (this.seenOutcomeCounts.get(outcomeKey) || 0) + 1;
       this.seenOutcomeCounts.set(outcomeKey, seenCount);
       if (seenCount >= 2) {
-        const msg =
-          "I’m repeating the same verified step result in this turn. Stopping to avoid a tool loop. Please refine the request or confirm next action.";
+        const msg = await this.finalizeAfterRepeatedToolResult({ signal, reason: "repeated_tool_result" });
         this.agent.history.push({ role: "assistant", content: msg });
         return msg;
       }

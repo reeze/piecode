@@ -121,6 +121,8 @@ describe('Prompt functions', () => {
 
       expect(prompt).toContain('avoid repeated identical read-only calls');
       expect(prompt).toContain('do not re-read them unless exact quotes are needed');
+      expect(prompt).toContain('do not simply stop unless you are truly blocked');
+      expect(prompt).toContain('finalize from the evidence already collected');
     });
 
     test('should include todo tracking conventions in text mode', () => {

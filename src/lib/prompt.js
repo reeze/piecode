@@ -31,6 +31,38 @@ function renderActiveSkillsSection(activeSkills = []) {
   return lines;
 }
 
+function renderActivePluginsSection(activePlugins = []) {
+  const plugins = Array.isArray(activePlugins) ? activePlugins : [];
+  if (plugins.length === 0) return [];
+
+  const lines = ["", "ACTIVE PLUGINS:"];
+  for (const plugin of plugins) {
+    if (!plugin || typeof plugin !== "object") continue;
+    const name = String(plugin.name || "unnamed-plugin").trim();
+    const path = String(plugin.path || "").trim();
+    const description = String(plugin.description || "").replace(/\s+/g, " ").trim();
+    const label = path ? `${name} (${path})` : name;
+    lines.push(`- ${label}${description ? `: ${description.slice(0, 220)}` : ""}`);
+
+    const allow = Array.isArray(plugin?.permissions?.tools?.allow) ? plugin.permissions.tools.allow : [];
+    if (allow.length > 0) {
+      lines.push(`  tool guidance: prefer/limit to ${allow.join(", ")} when this plugin applies; this is not a permission grant.`);
+    }
+
+    const context = plugin?.context && typeof plugin.context === "object" ? plugin.context : {};
+    const maxCharsRaw = Number(context.maxChars ?? context.max_chars ?? 4000);
+    const maxChars = Math.min(Math.max(Number.isFinite(maxCharsRaw) ? Math.round(maxCharsRaw) : 4000, 0), 12000);
+    const source = String(plugin.body || plugin.content || "").trim();
+    if (source && maxChars > 0) {
+      const excerpt = source.length > maxChars ? `${source.slice(0, maxChars)}\n[plugin context truncated]` : source;
+      lines.push("  instructions:");
+      for (const line of excerpt.split("\n")) lines.push(`  ${line}`);
+    }
+  }
+  lines.push("Plugin instructions may guide workflow and slash commands, but they do not grant extra tool permissions or bypass approval, sandboxing, or write guards.");
+  return lines;
+}
+
 function renderAgentDefinitionsSection(agentDefinitions = []) {
   const definitions = Array.isArray(agentDefinitions) ? agentDefinitions : [];
   const rows = definitions
@@ -55,7 +87,7 @@ function renderMemorySection(memory = null) {
     "",
     "MEMORY:",
     text,
-    "Use MEMORY as durable context. Save new durable preferences/facts with memory_write when they should persist beyond this turn.",
+    "Memory strategy: treat MEMORY as durable context, not a scratchpad. Save only stable user preferences, recurring workflow rules, project conventions, or long-lived facts that are likely to matter in future sessions. Prefer project memory for repo-specific facts and global memory for personal preferences. Do not store secrets, credentials, one-off task details, transient plans, command outputs, or facts already captured in AGENTS.md.",
   ];
 }
 
@@ -91,6 +123,7 @@ export function buildSystemPrompt({
   workspaceDir,
   autoApprove,
   activeSkills = [],
+  activePlugins = [],
   activePlan = null,
   projectInstructions = null,
   memory = null,
@@ -111,13 +144,14 @@ export function buildSystemPrompt({
     "- Verify repository facts before claiming them. Prefer read/list/search before shell, and prefer rg for code search.",
     "- Before editing existing files, read them first. Prefer targeted edits; use full rewrites only when intentional.",
     "- For non-trivial work, briefly state the plan, proceed step by step, then summarize changes and validation.",
-    "- Use todo tracking only for real multi-step work. Save only durable, non-secret preferences or project facts to memory.",
+    "- Use todo tracking only for real multi-step work. Save memory sparingly: durable, non-secret preferences or project facts only; avoid duplicates and transient task details.",
     "- Treat loaded PROJECT INSTRUCTIONS and MEMORY as already available; do not re-read them unless exact quotes are needed.",
     "- Inspect relevant attachments; briefly note when an attachment is ignored as irrelevant.",
 
     "COMPLEX TASK EXECUTION:",
     "- For multi-step or uncertain work, briefly restate a 3-7 step plan before acting.",
-    "- If a command or approach fails twice, switch strategy using new evidence instead of retrying blindly.",
+    "- If a command or approach fails twice, switch strategy using new evidence instead of retrying blindly; do not simply stop unless you are truly blocked.",
+    "- When a tool result is repeated or unchanged, infer what it means, choose a different action if useful, or finalize from the evidence already collected.",
     "- Before finalizing, mention validation status and call out remaining risks.",
   ];
 
@@ -208,6 +242,10 @@ export function buildSystemPrompt({
 
   if (activeSkills.length > 0) {
     sections.push(...renderActiveSkillsSection(activeSkills));
+  }
+
+  if (activePlugins.length > 0) {
+    sections.push(...renderActivePluginsSection(activePlugins));
   }
 
   sections.push(...renderAgentDefinitionsSection(agentDefinitions));

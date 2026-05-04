@@ -71,6 +71,23 @@ describe("tui line editor", () => {
     rl.close();
   });
 
+  test("shouldHandleKeypress can reserve ctrl+c for outer TUI handling", async () => {
+    const source = new EventEmitter();
+    const rl = new TuiLineEditor({
+      keypressSource: source,
+      shouldHandleKeypress: (_str, key = {}) => !(key.ctrl && key.name === "c"),
+    });
+    const pending = rl.question("");
+    emitKey(source, "\u0003", { name: "c", ctrl: true });
+
+    const pendingState = await Promise.race([
+      pending.then(() => "resolved", () => "rejected"),
+      new Promise((resolve) => setTimeout(() => resolve("pending"), 20)),
+    ]);
+    expect(pendingState).toBe("pending");
+    rl.close();
+  });
+
   test("submit() resolves pending question with current line", async () => {
     const source = new EventEmitter();
     const rl = new TuiLineEditor({ keypressSource: source });

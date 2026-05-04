@@ -120,6 +120,34 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("read_file(b.txt)");
   });
 
+  test("timeline inserts breathing room between task, tools, results, and response", () => {
+    const out = createOut(100, 32);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.event("[task] improve readability");
+    tui.event("[tool] read_file (src/lib/tui.js)");
+    tui.event("[tool-result] line one\nline two");
+    tui.event("[response] Done");
+
+    expect(tui.timeline).toContain("");
+    const plain = tui.timeline.map((line) => stripAnsi(line));
+    const taskIdx = plain.findIndex((line) => line.includes("Task: improve readability"));
+    const toolIdx = plain.findIndex((line) => line.includes("Read"));
+    const resultIdx = plain.findIndex((line) => line.includes("line one"));
+    const responseIdx = plain.findIndex((line) => line.includes("Done"));
+    expect(plain[toolIdx - 1]).toBe("");
+    expect(plain[resultIdx - 1]).toBe("");
+    expect(plain[responseIdx - 1]).toBe("");
+    expect(taskIdx).toBeLessThan(toolIdx);
+  });
+
   test("formatTimelineLines maps key event types and hides thinking noise", () => {
     const out = createOut();
     const tui = new SimpleTui({
@@ -136,20 +164,20 @@ describe("tui usability", () => {
     expect(stripAnsi(taskLineRaw).length).toBe(out.columns - 1);
     expect(tui.formatTimelineLines("[model] seed-openai-compatible:doubao")).toEqual([]);
     expect(tui.formatTimelineLines("[plan] budget=3 - scoped plan")).toEqual([]);
-    expect(stripAnsi(tui.formatTimelineLines('[run] shell command="echo hi"')[0])).toContain("Bash(echo hi)");
-    expect(stripAnsi(tui.formatTimelineLines("[run] shell echo hi")[0])).toContain("[~]");
+    expect(stripAnsi(tui.formatTimelineLines('[run] shell command="echo hi"')[0])).toContain("Run echo hi");
+    expect(stripAnsi(tui.formatTimelineLines("[run] shell echo hi")[0])).toContain("Run echo hi");
     expect(tui.formatTimelineLines("[tool] shell (echo hi)")).toEqual([]);
     expect(tui.formatTimelineLines("[tool] todo_write (3 todos)")).toEqual([]);
-    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("[tool] Read");
+    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("Read");
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("README.md");
-    expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).toContain("[tool] Search");
+    expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).toContain("Search");
     expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).toContain("targetSymbol");
-    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (path=README.md)")[0])).toContain("[tool] Read path=README.md");
-    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("[tools] read_file x2");
+    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (path=README.md)")[0])).toContain("Read path=README.md");
+    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("Run read_file x2");
     expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("read_file(a.txt)");
-    expect(stripAnsi(tui.formatTimelineLines("[result] done")[0])).toContain("[ok] done");
+    expect(stripAnsi(tui.formatTimelineLines("[result] done")[0])).toContain("✓ done");
     expect(stripAnsi(tui.formatTimelineLines("[result] shell failed | time: 2s")[0])).toContain(
-      "[x] shell failed | time: 2s"
+      "× shell failed | time: 2s"
     );
     expect(stripAnsi(tui.formatTimelineLines("[tool-result] 1 file changed, 1 insertion(+), 1 deletion(-)")[0])).toContain(
       "1 file changed, 1 insertion(+), 1 deletion(-)"
@@ -160,8 +188,8 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines("[banner-hint] keys: CTRL+L | !cmd shell")[0])).toContain("!cmd shell");
     expect(tui.formatTimelineLines("[thinking] internal details")).toEqual([]);
     expect(tui.formatTimelineLines("[thinking] request:turn payload-here")).toEqual([]);
-    expect(stripAnsi(tui.formatTimelineLines("[thought] I should inspect files first")[0])).toContain("Update: I should inspect files first");
-    expect(stripAnsi(tui.formatTimelineLines("[agent] start subagent-1: inspect providers")[0])).toContain("[agent] start subagent-1");
+    expect(stripAnsi(tui.formatTimelineLines("[thought] I should inspect files first")[0])).toContain("Thinking: I should inspect files first");
+    expect(stripAnsi(tui.formatTimelineLines("[agent] start subagent-1: inspect providers")[0])).toContain("Agent start subagent-1");
     const markdownResponse = stripAnsi(
       tui.formatTimelineLines("[response] ## Title\n- **bold** and `code`")[1]
     );
@@ -181,11 +209,34 @@ describe("tui usability", () => {
     expect(codeResponse).toContain("const x = 1;");
     expect(codeResponse).not.toContain("```");
     const plainResponse = stripAnsi(tui.formatTimelineLines("[response] hello world")[0]);
-    expect(plainResponse.trim()).toBe("hello world");
+    expect(plainResponse.trim()).toBe("• hello world");
     expect(plainResponse).not.toContain("Assistant:");
     const boldResponse = stripAnsi(tui.formatTimelineLines("[response] this is **BOLD** text")[0]);
     expect(boldResponse).toContain("this is BOLD text");
     expect(boldResponse).not.toContain("**BOLD**");
+    const richMarkdown = stripAnsi(
+      tui.formatTimelineLines([
+        "[response] ### Details",
+        "- [x] done item",
+        "  - nested item",
+        "1. ordered item",
+        "| Name | Count |",
+        "| --- | ---: |",
+        "| alpha | 12 |",
+        "> quoted *note*",
+        ">> nested quote",
+        "    indented code",
+      ].join("\n")).join("\n")
+    );
+    expect(richMarkdown).toContain("› Details");
+    expect(richMarkdown).toContain("[x] done item");
+    expect(richMarkdown).toContain("◦ nested item");
+    expect(richMarkdown).toContain("1. ordered item");
+    expect(richMarkdown).toContain("│ Name");
+    expect(richMarkdown).toContain("alpha");
+    expect(richMarkdown).toContain("│ quoted note");
+    expect(richMarkdown).toContain("││ nested quote");
+    expect(richMarkdown).toContain("indented code");
     const longResponse = `[response] ${"a".repeat(9000)}`;
     const longLines = tui.formatTimelineLines(longResponse).map((line) => stripAnsi(line));
     expect(longLines.join("\n")).toContain("[trimmed ");
@@ -207,11 +258,12 @@ describe("tui usability", () => {
     );
 
     const lines = tui.formatApprovalLines(220).map((line) => stripAnsi(line));
-    expect(lines.join("\n")).toContain("Question: Approve shell command?");
-    expect(lines.join("\n")).toContain('Command: curl -sL "https://agentskills.io/specification"');
-    expect(lines.join("\n")).toContain("Details: command is neither known safe nor explicitly dangerous");
+    expect(lines.join("\n")).toContain("? approval required");
+    expect(lines.join("\n")).toContain("q: Approve shell command?");
+    expect(lines.join("\n")).toContain('$ curl -sL "https://agentskills.io/specification"');
+    expect(lines.join("\n")).toContain("why: command is neither known safe nor explicitly dangerous");
     expect(lines.join("\n")).toContain("remember");
-    expect(lines.join("\n")).toContain("all session");
+    expect(lines.join("\n")).toContain("session");
     expect(lines.join("\n")).not.toContain(
       'Details: shell: curl -sL "https://agentskills.io/specification" (command is neither known safe nor explicitly dangerous)'
     );
@@ -304,6 +356,30 @@ describe("tui usability", () => {
       const lastWrite = out.writes[out.writes.length - 1] || "";
       expect(lastWrite).toContain(`\x1b[${tui.lastInputRow};4H`);
     }
+  });
+
+  test("contextual input hints render as prompt placeholder", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    let frame = latestFrame(out);
+    expect(frame).toContain("继续描述你想改什么");
+
+    tui.setInputHints(["review 当前改动", "运行相关测试"]);
+    frame = latestFrame(out);
+    expect(frame).toContain("review 当前改动");
+
+    tui.renderInput("typed text");
+    frame = latestFrame(out);
+    expect(frame).toContain("typed text");
+    expect(frame).not.toContain("review 当前改动");
   });
 
   test("input hint renders below prompt without moving cursor off input row", () => {
@@ -562,7 +638,7 @@ describe("tui usability", () => {
     expect(frame).not.toContain("AGENTS.md: loaded");
   });
 
-  test("task context remains visible after task starts", () => {
+  test("task context remains visible after task starts and shows done after success", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
       out,
@@ -575,10 +651,32 @@ describe("tui usability", () => {
     tui.start();
     tui.event("[task] create a small CLI calculator");
     tui.onToolUse("write_file");
-    const frame = latestFrame(out);
+    let frame = latestFrame(out);
     expect(frame).toContain("Task");
     expect(frame).toContain("create a small CLI calculator");
     expect(frame).toContain("Using tool: write_file");
+    expect(frame).not.toContain("Done");
+
+    tui.onTurnSuccess(1234);
+    frame = latestFrame(out);
+    expect(frame).toContain("Task · Done · create a small CLI calculator");
+  });
+
+  test("task context shows failed after task error", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.event("[task] inspect repo");
+    tui.onTurnError("boom", 1200);
+    const frame = latestFrame(out);
+    expect(frame).toContain("Task · Failed · inspect repo");
   });
 
   test("running indicator is rendered in workspace while thinking", () => {
@@ -596,7 +694,7 @@ describe("tui usability", () => {
     tui.onThinking("turn");
     const frame = latestFrame(out);
     expect(frame).toContain("Task: inspect repo");
-    expect(frame).toContain("running");
+    expect(frame).toContain("thinking");
     expect(frame).toContain("tok");
     tui.onThinkingDone();
     tui.stop();
@@ -713,7 +811,7 @@ describe("tui usability", () => {
     tui.start();
     tui.setLiveThought("inspect files first");
     let frame = latestFrame(out);
-    expect(frame).toContain("Update:");
+    expect(frame).toContain("Thinking:");
     expect(frame).toContain("inspect files first");
     expect(tui.thoughtStreamVisible).toBe(false);
     tui.clearLiveThought();
@@ -802,13 +900,15 @@ describe("tui usability", () => {
     tui.render("");
     const latest = latestFrame(out);
     expect(latest).toContain("line-30");
-    expect(latest).toContain("PgUp/↑:his");
+    expect(latest).not.toContain("PgUp");
+    expect(latest).not.toContain("Shift");
     expect(tui.lastScrollMax).toBeGreaterThan(0);
 
     tui.scrollPage(1);
     const scrolled = latestFrame(out);
     expect(scrolled).toContain("timeline:");
-    expect(scrolled).toContain("PgDn/End:bottom");
+    expect(scrolled).not.toContain("PgDn");
+    expect(scrolled).not.toContain("End:bottom");
     expect(tui.scrollOffset).toBeGreaterThan(0);
 
     tui.scrollToTop();
