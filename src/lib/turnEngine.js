@@ -513,6 +513,7 @@ export class TurnEngine {
         type: "tool_use",
         tool: item.action.tool,
         reason: item.action.reason || "",
+        thought: item.action.thought || "",
         input: item.action.input,
         parallel: true,
         batchSize: prepared.length,
@@ -524,6 +525,7 @@ export class TurnEngine {
       tool: item.action.tool,
       input: item.action.input,
       reason: item.action.reason || "",
+      thought: item.action.thought || "",
       _callId: item.callId,
     }));
     this.agent.history.push({
@@ -963,6 +965,7 @@ export class TurnEngine {
         tool: action.tool,
         input: action.input,
         reason: action.reason || "",
+        thought: action.thought || "",
         _callId: callId,
       };
 
@@ -971,6 +974,7 @@ export class TurnEngine {
         type: "tool_use",
         tool: action.tool,
         reason: action.reason || "",
+        thought: action.thought || "",
         input: action.input,
       });
 

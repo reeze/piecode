@@ -1258,7 +1258,7 @@ function formatToolResultLinesForTimeline(tool, result, error) {
   if (name === "git_status" || name === "git_diff" || name === "rg" || name === "grep" || name === "search_files") {
     const lines = raw.split("\n").map((line) => line.trimEnd()).filter(Boolean).slice(0, 8);
     if (lines.length === 0) return [];
-    return [`[tool-result] ${name === "git_status" ? "status:" : "result:"}`, ...lines.map((line) => `[tool-result]   ${summarizeForLog(line, 220)}`)];
+    return lines.map((line) => `[tool-result] ${summarizeForLog(line, 220)}`);
   }
 
   if (name !== "edit_file") return [];
@@ -1501,7 +1501,18 @@ function extractReadableThinkingPreview(raw) {
   const toolMatch = compact.match(/"tool"\s*:\s*"([^"\\]+)"/i);
   if (toolMatch?.[1]) return `Preparing tool: ${toolMatch[1]}`;
 
-  // Do not expose raw chain-of-thought or partial JSON/tool streams in the user UI.
+  const readableSentences = compact
+    .split(/(?<=[.!?。！？])\s+/)
+    .map((part) => formatStageUpdate(sanitizeThinkingChunk(part), 180))
+    .filter((part) => {
+      if (!part) return false;
+      if (/^[{\["',:}\]\s]+$/.test(part)) return false;
+      if (/^(type|tool|input|arguments|function|tool_calls)\b/i.test(part)) return false;
+      if (/[{}\[\]]/.test(part) && /"[a-z_][a-z0-9_]*"\s*:/i.test(part)) return false;
+      return /[A-Za-z\u4e00-\u9fff]/.test(part);
+    });
+  if (readableSentences.length > 0) return readableSentences[readableSentences.length - 1];
+
   return "";
 }
 
@@ -5304,6 +5315,7 @@ async function main() {
       summarizeThinkingResponseForLog,
       appendThinkingToLlmDebugEvent,
       extractThinkingFromFinalModelPayload,
+      extractReadableThinkingPreview,
       formatStageUpdate,
       normalizeTokenUsage,
       consumePendingRequestTokens,

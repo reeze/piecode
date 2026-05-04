@@ -371,10 +371,10 @@ function normalizeTimelineSpacing(lines) {
   const classify = (line) => {
     const plain = stripAnsi(String(line || "")).trimStart();
     if (!plain) return "blank";
-    if (/^◆\s+Task:/i.test(plain)) return "task";
-    if (/^↳\s+/.test(plain)) return "tool-result";
-    if (/^›\s+/.test(plain)) return "tool";
-    if (/^[•✓×]\s+/.test(plain)) return "response";
+    if (/^(?:◆|\*)\s+Task:/i.test(plain)) return "task";
+    if (/^(?:↳|->)\s+/.test(plain)) return "tool-result";
+    if (/^(?:›|>)\s+/.test(plain)) return "tool";
+    if (/^(?:•|\*|✓|×|\[ok\]|\[x\])\s+/.test(plain)) return "response";
     if (/^\s{2,}\S/.test(String(line || ""))) return previousGroup || "continuation";
     return "content";
   };
@@ -554,6 +554,62 @@ function separatorLine(width) {
   return `\x1b[90m${"-".repeat(Math.max(1, Number(width) || 1))}\x1b[0m`;
 }
 
+function shouldUseUnicodeSymbols(env = process.env) {
+  const explicit = String(env.PIECODE_TUI_UNICODE || "").trim().toLowerCase();
+  if (["1", "true", "yes", "on"].includes(explicit)) return true;
+  if (["0", "false", "no", "off"].includes(explicit)) return false;
+  if (String(env.PIECODE_TUI_ASCII || "").trim()) return false;
+  const term = String(env.TERM || "").toLowerCase();
+  const termProgram = String(env.TERM_PROGRAM || "").toLowerCase();
+  const lang = String(env.LC_ALL || env.LC_CTYPE || env.LANG || "").toLowerCase();
+  if (term === "linux" || term === "dumb" || term.includes("vt100")) return false;
+  if (termProgram.includes("linux")) return false;
+  if (lang && !/(utf-?8|utf8)/i.test(lang)) return false;
+  return true;
+}
+
+function makeTuiSymbols(useUnicode = true) {
+  return useUnicode
+    ? {
+        prompt: "❯",
+        task: "◆",
+        tool: "›",
+        result: "",
+        response: "•",
+        ok: "✓",
+        fail: "×",
+        dot: "·",
+        agent: "◦",
+        bullet: "•",
+        nestedBullet: "◦",
+        deepBullet: "▪",
+        quoteBar: "│",
+        subheading: "›",
+        up: "↑",
+        down: "↓",
+        todoDoneNotice: "所有 TODO 已完成，可以结束了",
+      }
+    : {
+        prompt: ">",
+        task: "*",
+        tool: ">",
+        result: "->",
+        response: "*",
+        ok: "[ok]",
+        fail: "[x]",
+        dot: "-",
+        agent: "-",
+        bullet: "*",
+        nestedBullet: "-",
+        deepBullet: "-",
+        quoteBar: "|",
+        subheading: ">",
+        up: "up:",
+        down: "down:",
+        todoDoneNotice: "All TODO completed.",
+      };
+}
+
 function padDisplayLine(line, width) {
   const text = String(line ?? "");
   const maxWidth = Math.max(0, Number(width) || 0);
@@ -565,6 +621,20 @@ function padDisplayLine(line, width) {
 
 function colorFullLine(line, code, width) {
   return color(padDisplayLine(line, width), code);
+}
+
+function hasBackgroundColor(line) {
+  return /\x1b\[[0-9;]*4\d(?:;[0-9]*)*m|\x1b\[[0-9;]*48;[0-9;]*m/.test(String(line || ""));
+}
+
+function wrapTimelineLine(line, width) {
+  // Full-line background blocks (notably Task rows) must not be word-wrapped:
+  // wrapText splits on whitespace and drops padded trailing spaces, which makes
+  // the background color cover only the text instead of the whole row.
+  if (hasBackgroundColor(line) && stringDisplayWidth(stripAnsi(line)) <= Math.max(0, Number(width) || 0)) {
+    return [line];
+  }
+  return wrapText(line, width);
 }
 
 export class SimpleTui {
@@ -649,6 +719,8 @@ export class SimpleTui {
     this.overlaySearchActive = false;
     this.overlaySearchQuery = "";
     this.mouseCaptureEnabled = String(process.env.PIECODE_MOUSE_CAPTURE || "").trim() === "1";
+    this.unicodeSymbols = shouldUseUnicodeSymbols(process.env);
+    this.symbols = makeTuiSymbols(this.unicodeSymbols);
   }
 
   isMouseCaptureEnabled() {
@@ -815,19 +887,15 @@ export class SimpleTui {
     const task = String(this.currentTaskText || "").replace(/\s+/g, " ").trim();
     if (!task) return "";
     const elapsed = this.formatElapsedSinceTurnStart();
-    const status = this.taskCompletedAt
-      ? this.modelState === "error"
-        ? color("Failed", "1;31")
-        : color("Done", "1;32")
-      : "";
+    const status = this.taskCompletedAt ? (this.modelState === "error" ? "Failed" : "Done") : "";
     const fixedBudget = status ? 37 : 28;
     const parts = [
-      color("Task", "1;36"),
+      "Task",
       ...(status ? [status] : []),
       truncateLine(task, Math.max(16, width - fixedBudget)),
-      color(elapsed, "2;37"),
+      elapsed,
     ];
-    return truncateLine(` ${parts.join(" · ")}`, width);
+    return colorFullLine(` ${parts.join(" · ")} `, "1;37;48;5;236", width);
   }
 
   setLlmDebugEnabled(enabled) {
@@ -865,7 +933,7 @@ export class SimpleTui {
     const text = String(content || "").replace(/\s+/g, " ").trim();
     this.thoughtStreamVisible = false;
     this.thoughtStreamText = text ? `Thinking: ${text}` : "";
-    if (text) this.lastStatus = truncateLine(`Thinking: ${text}`, 120);
+    if (text) this.lastStatus = "thinking...";
     this.render();
   }
 
@@ -959,9 +1027,8 @@ export class SimpleTui {
       nextDone === nextTotal &&
       !(previousTotal > 0 && previousDone === previousTotal);
     if (becameAllCompleted) {
-      this.transientStatusNotice = "✅ 所有 TODO 已完成，可以结束了";
+      this.transientStatusNotice = this.symbols.todoDoneNotice;
       this.lastStatus = "Task completed";
-      this.event("[result] Task completed");
     }
     this.render();
   }
@@ -1358,12 +1425,19 @@ export class SimpleTui {
     const timelineItem = (marker, text, markerColor = "2;37") => {
       const body = String(text || "").trim();
       if (!body) return [];
-      return [` ${color(marker, markerColor)} ${body}`];
+      const prefix = marker ? `${color(marker, markerColor)} ` : "";
+      return [`${prefix}${body}`];
     };
     const timelineBlock = (marker, lines, markerColor = "2;37") => {
       const items = (Array.isArray(lines) ? lines : [lines]).map((item) => String(item || "")).filter(Boolean);
       if (items.length === 0) return [];
-      return items.map((item, index) => (index === 0 ? ` ${color(marker, markerColor)} ${item}` : `   ${item}`));
+      const prefix = marker ? `${color(marker, markerColor)} ` : "";
+      return items.map((item, index) => (index === 0 ? `${prefix}${item}` : `  ${item}`));
+    };
+    const responseBlock = (marker, lines, markerColor = "1;32") => {
+      const items = (Array.isArray(lines) ? lines : [lines]).map((item) => String(item || "")).filter(Boolean);
+      if (items.length === 0) return [];
+      return items.map((item, index) => (index === 0 ? `  ${color(marker, markerColor)} ${item}` : `    ${item}`));
     };
     const toolLabel = (tool, details = "") => {
       const name = String(tool || "tool");
@@ -1422,7 +1496,7 @@ export class SimpleTui {
       });
     if (!line) return [];
     if (line.startsWith("[task] ")) {
-      return [colorFullLine(` ◆ Task: ${line.slice(7).trim()} `, "1;37;48;5;236", Math.max(20, (this.out?.columns || 100) - 1))];
+      return [colorFullLine(` ${this.symbols.task} Task: ${line.slice(7).trim()} `, "1;37;48;5;236", Math.max(20, (this.out?.columns || 100) - 1))];
     }
     if (line.startsWith("[model] ")) {
       return [];
@@ -1431,12 +1505,13 @@ export class SimpleTui {
       return [];
     }
     if (line.startsWith("[thinking] ")) {
-      // Keep thinking state transient (spinner/status line), do not persist into timeline.
+      // Raw request/response payload traces are noisy; the visible thinking row
+      // is driven by [thought] entries and the transient spinner/status line.
       return [];
     }
     if (line.startsWith("[thought] ")) {
       const details = trimWorkspaceText(line.slice(9).replace(/\s+/g, " ").trim(), 600).text;
-      return timelineItem("·", color(`Thinking: ${details || "<empty>"}`, "35"), "35");
+      return timelineItem(this.symbols.result, color(`Thinking: ${details || "<empty>"}`, "35"), "35");
     }
     if (line.startsWith("[run] ")) {
       const rawRun = line.slice(6).trim();
@@ -1470,7 +1545,7 @@ export class SimpleTui {
           : approval === "auto"
           ? color("[AUTO]", "2;32")
           : "";
-      return timelineItem("›", `${color("Run", "1;36")} ${color(safeDisplay, "36")}${tag ? ` ${tag}` : ""}`, "1;36");
+      return timelineItem(this.symbols.tool, `${color("Run", "1;36")} ${color(safeDisplay, "36")}${tag ? ` ${tag}` : ""}`, "1;36");
     }
     if (line.startsWith("[tool] ")) {
       const body = line.slice(7).trim();
@@ -1483,21 +1558,21 @@ export class SimpleTui {
         return [];
       }
       const match = body.match(/^([a-zA-Z0-9_.-]+)\s*(.*)$/);
-      return timelineItem("›", toolLabel(match?.[1] || body, match?.[2] || ""), "1;36");
+      return timelineItem(this.symbols.tool, toolLabel(match?.[1] || body, match?.[2] || ""), "1;36");
     }
     if (line.startsWith("[tools] ")) {
       const body = line.slice(8).trim();
-      return timelineItem("›", `${color("Run", "1;36")} ${body}`, "1;36");
+      return timelineItem(this.symbols.tool, `${color("Run", "1;36")} ${body}`, "1;36");
     }
     if (line.startsWith("[agent] ")) {
-      return timelineItem("◦", `${color("Agent", "1;35")} ${trimWorkspaceText(line.slice(8).trim(), 600).text}`, "1;35");
+      return timelineItem(this.symbols.agent, `${color("Agent", "1;35")} ${trimWorkspaceText(line.slice(8).trim(), 600).text}`, "1;35");
     }
     if (line.startsWith("[response] ")) {
       const text = trimWorkspaceText(line.slice(11).trim(), 8000).text;
-      if (!text) return timelineItem("•", "<empty>");
+      if (!text) return responseBlock(this.symbols.response, "<empty>");
       const chunks = renderMarkdownLines(text).filter((chunk) => chunk !== undefined);
-      if (chunks.length === 0) return timelineItem("•", "<empty>");
-      return timelineBlock("•", chunks, "1;32");
+      if (chunks.length === 0) return responseBlock(this.symbols.response, "<empty>");
+      return responseBlock(this.symbols.response, chunks, "1;32");
     }
     if (line.startsWith("[result] ")) {
       const body = line.slice(9).trim();
@@ -1506,7 +1581,7 @@ export class SimpleTui {
       const ok = !failed && /\b(done|ok|success|succeeded|completed)\b/.test(lower);
       const icon = failed ? "[x]" : ok ? "[ok]" : "[i]";
       const iconColor = failed ? "1;31" : ok ? "1;32" : "2;37";
-      return timelineItem(failed ? "×" : ok ? "✓" : "•", color(body, "2;37"), iconColor);
+      return timelineItem(failed ? this.symbols.fail : ok ? this.symbols.ok : this.symbols.response, color(body, "2;37"), iconColor);
     }
     if (line.startsWith("[tool-result] ")) {
       const body = trimWorkspaceText(line.slice(14).trim(), 2000).text;
@@ -1518,7 +1593,7 @@ export class SimpleTui {
         .filter(Boolean)
         .slice(0, 6);
       const rendered = compact.length > 0 ? compact : [body];
-      return timelineBlock("↳", rendered.map((part) => color(part, "2;37")), "2;37");
+      return timelineBlock(this.symbols.result, rendered.map((part) => color(part, "2;37")), "2;37");
     }
     if (line.startsWith("[banner-1] ")) {
       return [color(line.slice(11), "1;82")];
@@ -1587,7 +1662,7 @@ export class SimpleTui {
       // Hide internal event noise in workspace timeline.
       return [];
     }
-    return timelineItem("•", trimWorkspaceText(line, 1200).text);
+    return timelineItem(this.symbols.response, trimWorkspaceText(line, 1200).text);
   }
 
   buildInputState(input, width, cursorIndex = null) {
@@ -1599,7 +1674,7 @@ export class SimpleTui {
         : normalizedSource.length;
     const beforeCursor = normalizedSource.slice(0, safeCursorIndex);
 
-    const promptGlyph = "❯";
+    const promptGlyph = this.symbols.prompt;
     const firstPrefix = ` ${promptGlyph} `;
     const contPrefix = "   ";
     const placeholder = this.getCurrentInputHint() || 'Try "fix lint errors"';
@@ -1712,11 +1787,7 @@ export class SimpleTui {
       this.todos.length > 0
         ? ` | TODO(${this.todos.filter((t) => t.status === "completed").length}/${this.todos.length})`
         : "";
-    const tokenSummary =
-      this.sessionTokensSent > 0 || this.sessionTokensReceived > 0
-        ? ` | session tok: ↑${formatCompactNumber(this.sessionTokensSent)} ↓${formatCompactNumber(this.sessionTokensReceived)}`
-        : "";
-    const text = ` model: ${this.modelName || this.providerLabel()} | state: ${state} | last: ${time} | tool: ${tool}${ctx}${tokenSummary}${todoSummary}${phase}`;
+    const text = ` model: ${this.modelName || this.providerLabel()} | state: ${state} | last: ${time} | tool: ${tool}${ctx}${todoSummary}${phase}`;
     return truncateLine(text, width);
   }
 
@@ -1792,6 +1863,10 @@ export class SimpleTui {
     }
 
     const sep = separatorLine(width);
+    // Leave one spare cell for interactive bottom chrome. Several mobile
+    // terminals and tmux combinations auto-wrap when wide text reaches the
+    // last column, which makes the input/status rows drift by one line.
+    const bottomWidth = Math.max(20, width - 1);
     const errorLine = this.lastError ? truncateLine(` error: ${this.lastError}`, width) : "";
 
     const headerLines = errorLine ? 1 : 0;
@@ -1818,7 +1893,7 @@ export class SimpleTui {
     const thinkingLines = this.thinking ? 1 : 0;
     const thoughtWrapped = [];
     const thoughtStreamLines = 0;
-    const inputState = this.buildInputState(this.currentInput, width, cursorIndex);
+    const inputState = this.buildInputState(this.currentInput, bottomWidth, cursorIndex);
     const inputLineCount = Math.max(1, inputState.lines.length);
     const bottomLines = inputLineCount + 3 + commandSuggestionLines + modelSuggestionLines + hintLines; // input + pickers + status/hint
     const reservedLines =
@@ -1830,7 +1905,7 @@ export class SimpleTui {
       thoughtStreamLines +
       bottomLines;
     const wrappedLogs = this.logs.flatMap((line) => wrapText(line, width));
-    const wrappedTimeline = this.timeline.flatMap((line) => wrapText(line, width));
+    const wrappedTimeline = this.timeline.flatMap((line) => wrapTimelineLine(line, width));
     const sourceLines = this.showRawLogs ? wrappedLogs : wrappedTimeline;
     // Keep layout in natural flow (not sticky), but adapt visible workspace lines
     // to the actual terminal space left after input/status blocks.
@@ -1854,40 +1929,36 @@ export class SimpleTui {
       this.contextLimit > 0
         ? ` | ctx:${formatCompactNumber(this.contextUsed)}/${formatCompactNumber(this.contextLimit)}(${Math.min(999, Math.round((this.contextUsed / this.contextLimit) * 100))}%)`
         : "";
-    const tokStatus =
-      this.sessionTokensSent > 0 || this.sessionTokensReceived > 0
-        ? ` | tok:↑${formatCompactNumber(this.sessionTokensSent)} ↓${formatCompactNumber(this.sessionTokensReceived)}`
-        : "";
     const todoDone = this.todos.filter((t) => String(t?.status || "").toLowerCase() === "completed").length;
     const todoStatus = this.todos.length > 0 ? ` | TODO(${todoDone}/${this.todos.length})` : "";
     const planStatus = this.planModeEnabled ? " | plan:on" : "";
-    const promptStatusRaw = `status: ${this.lastStatus || "idle"}${planStatus}${ctxStatus}${tokStatus}${todoStatus}${scrollLabel}`;
+    const promptStatusRaw = `${this.lastStatus || "idle"}${planStatus}${ctxStatus}${todoStatus}${scrollLabel}`;
     const bashMode = /^\s*!/.test(this.currentInput) ? " | mode:bash" : "";
     const leftStatusLabel = this.formatTransientStatusLabel() || this.formatProjectInstructionsLabel();
     let promptStatus = "";
     if (leftStatusLabel) {
       const left = truncateLine(` ${leftStatusLabel}`, width);
       const fixedLeft = stringDisplayWidth(left);
-      const rightBudget = Math.max(0, width - fixedLeft - 1);
+      const rightBudget = Math.max(0, bottomWidth - fixedLeft - 1);
       const right = truncateLine(`${promptStatusRaw}${bashMode}`, rightBudget);
-      const pad = Math.max(1, width - fixedLeft - stringDisplayWidth(right));
+      const pad = Math.max(1, bottomWidth - fixedLeft - stringDisplayWidth(right));
       promptStatus = `${left}${" ".repeat(pad)}${right}`;
     } else {
       const raw = `${promptStatusRaw}${bashMode}`;
       promptStatus =
-        raw.length >= width
-          ? truncateLine(raw, width)
-          : `${" ".repeat(Math.max(0, width - raw.length))}${raw}`;
+        stringDisplayWidth(raw) >= bottomWidth
+          ? truncateLine(raw, bottomWidth)
+          : `${" ".repeat(Math.max(0, bottomWidth - stringDisplayWidth(raw)))}${raw}`;
     }
     const approvalBlock = this.approvalPrompt ? [sep, ...approvalContentLines] : [];
     const taskContextBlock = taskContextLine ? ["", taskContextLine] : [];
     const thinkingColors = ["82", "118", "154", "190", "201"];
     const thinkingColor = thinkingColors[this.thinkingTick % thinkingColors.length];
-    const spinFrames = ["|", "/", "-", "\\"];
+    const spinFrames = this.unicodeSymbols ? ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] : ["-", "\\", "|", "/"];
     const spin = spinFrames[this.thinkingTick % spinFrames.length];
     const thought = String(this.thoughtStreamText || "").trim();
-    const thoughtSuffix = thought ? ` | ${truncateLine(thought, Math.max(20, width - 54))}` : "";
-    const runningLine = `↳ | ${spin} thinking${this.thinkingStage ? `:${this.thinkingStage}` : ""} | ${this.formatElapsedSinceTurnStart()} | tok ↑${formatCompactNumber(this.turnTokensSent)} ↓${formatCompactNumber(this.turnTokensReceived)}${thoughtSuffix}`;
+    const thoughtSuffix = thought ? ` · ${truncateLine(thought.replace(/^Thinking:\s*/i, ""), Math.max(20, width - 46))}` : "";
+    const runningLine = `${spin} thinking${this.thinkingStage ? `:${this.thinkingStage}` : ""} · ${this.formatElapsedSinceTurnStart()}${thoughtSuffix}`;
     const thinkingBlock = this.thinking ? [color(runningLine, `1;${thinkingColor}`)] : [];
     const thoughtStreamBlock = [];
 
@@ -1913,7 +1984,7 @@ export class SimpleTui {
           ...this.commandSuggestions.map((command, idx) => {
             const selected = idx === this.commandSuggestionIndex;
             const text = selected ? color(`> ${command}`, "1;32") : color(`  ${command}`, "2;37");
-            return truncateLine(` ${text}`, width);
+            return truncateLine(` ${text}`, bottomWidth);
           }),
         ]
       : [];
@@ -1926,16 +1997,16 @@ export class SimpleTui {
             return color(label, "2;37");
           })(),
           ...(modelSuggestionViewport && modelSuggestionViewport.hiddenAbove > 0
-            ? [truncateLine(` ${color(`... ${modelSuggestionViewport.hiddenAbove} above`, "2;37")}`, width)]
+            ? [truncateLine(` ${color(`... ${modelSuggestionViewport.hiddenAbove} above`, "2;37")}`, bottomWidth)]
             : []),
           ...((modelSuggestionViewport?.items || []).map((modelId, offset) => {
             const absoluteIndex = (modelSuggestionViewport?.start || 0) + offset;
             const selected = absoluteIndex === this.modelSuggestionIndex;
             const text = selected ? color(`> ${modelId}`, "1;32") : color(`  ${modelId}`, "2;37");
-            return truncateLine(` ${text}`, width);
+            return truncateLine(` ${text}`, bottomWidth);
           })),
           ...(modelSuggestionViewport && modelSuggestionViewport.hiddenBelow > 0
-            ? [truncateLine(` ${color(`... ${modelSuggestionViewport.hiddenBelow} below`, "2;37")}`, width)]
+            ? [truncateLine(` ${color(`... ${modelSuggestionViewport.hiddenBelow} below`, "2;37")}`, bottomWidth)]
             : []),
         ]
       : [];
@@ -1956,7 +2027,7 @@ export class SimpleTui {
       ...commandSuggestionBlock,
       ...modelSuggestionBlock,
       `\x1b[2m${promptStatus}\x1b[0m`,
-      ...(this.inputHint ? [`\x1b[2m${truncateLine(` ${this.inputHint}`, width)}\x1b[0m`] : []),
+      ...(this.inputHint ? [`\x1b[2m${truncateLine(` ${this.inputHint}`, bottomWidth)}\x1b[0m`] : []),
     ];
 
     const frame = frameLines.join("\n");
@@ -1974,7 +2045,7 @@ export class SimpleTui {
         workspaceLines: beforeInputLines.slice(0, -1),
         inputLines: inputComposite,
         statusLine: promptStatus,
-        hintLine: this.inputHint ? ` ${this.inputHint}` : "",
+        hintLine: this.inputHint ? truncateLine(` ${this.inputHint}`, bottomWidth) : "",
         cursorRowOffset: Math.max(0, inputState.cursorRowOffset),
         cursorCol: inputState.cursorCol,
       });

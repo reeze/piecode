@@ -34,6 +34,7 @@ export function createAgentEventHandler(deps = {}) {
     summarizeThinkingResponseForLog,
     appendThinkingToLlmDebugEvent,
     extractThinkingFromFinalModelPayload,
+    extractReadableThinkingPreview,
     formatStageUpdate,
     normalizeTokenUsage,
     consumePendingRequestTokens,
@@ -191,6 +192,11 @@ export function createAgentEventHandler(deps = {}) {
       if (llmStreamRef.value && Object.prototype.hasOwnProperty.call(llmStreamRef.value, evt.stage)) {
         llmStreamRef.value[evt.stage] += String(evt.delta || "");
       }
+      if (tui && evt.stage === "turn" && typeof extractReadableThinkingPreview === "function") {
+        const source = llmStreamRef.value?.turn || evt.delta || "";
+        const preview = extractReadableThinkingPreview(source);
+        if (preview) tui.setLiveThought(preview);
+      }
     }
     if (evt.type === "llm_response") {
       recordTaskEvent?.(taskTraceRef, evt);
@@ -288,12 +294,10 @@ export function createAgentEventHandler(deps = {}) {
     if (evt.type === "tool_use") {
       recordTaskEvent?.(taskTraceRef, evt);
       const isTodoTool = evt.tool === "todo_write" || evt.tool === "todowrite";
+      const visibleThought = formatStageUpdate(evt.thought || evt.reason || "");
       if (tui) tui.onToolUse(evt.tool);
-      if (tui && evt.reason) {
-        const update = formatStageUpdate(evt.reason);
-        if (update) tui.setLiveThought(update);
-      }
-      if (display && !evt.parallel) display.onToolUse(evt.tool, evt.input, evt.reason);
+      if (tui && visibleThought) tui.setLiveThought(visibleThought);
+      if (display && !evt.parallel) display.onToolUse(evt.tool, evt.input, evt.reason || evt.thought);
       const summary = formatToolInputSummary(evt.tool, evt.input, 100);
       if (isTodoTool) {
         // keep todo activity in status bar only
@@ -309,6 +313,7 @@ export function createAgentEventHandler(deps = {}) {
       } else {
         logLine?.(`[tool] ${evt.tool}${summary ? ` (${summary})` : ""}`);
       }
+      if (visibleThought) logLine?.(`[thought] ${visibleThought}`);
     }
     if (evt.type === "tool_start") {
       recordTaskEvent?.(taskTraceRef, evt);

@@ -1,7 +1,7 @@
 import { SimpleTui } from "../src/lib/tui.js";
 
 function stripAnsi(text) {
-  return String(text || "").replace(/\x1b\[[0-9;]*m/g, "");
+  return String(text || "").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
 }
 
 function createOut(columns = 100, rows = 28) {
@@ -120,6 +120,27 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("read_file(b.txt)");
   });
 
+  test("task timeline row keeps full-width background padding after render wrapping", () => {
+    const out = createOut(80, 24);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.event("[task] short task");
+    tui.render();
+
+    const rawFrame = out.writes[out.writes.length - 1] || "";
+    const taskLine = rawFrame.split("\n").find((line) => stripAnsi(line).includes("Task: short task"));
+    expect(taskLine).toBeTruthy();
+    expect(taskLine).toMatch(/Task: short task\s+\x1b\[0m/);
+    expect(stripAnsi(taskLine).length).toBe(out.columns - 1);
+  });
+
   test("timeline inserts breathing room between task, tools, results, and response", () => {
     const out = createOut(100, 32);
     const tui = new SimpleTui({
@@ -162,6 +183,8 @@ describe("tui usability", () => {
     expect(stripAnsi(taskLineRaw)).toContain("Task: simplify repo");
     expect(taskLineRaw).toContain("\x1b[1;37;48;5;236m");
     expect(stripAnsi(taskLineRaw).length).toBe(out.columns - 1);
+    const okIcon = tui.symbols.ok;
+    const failIcon = tui.symbols.fail;
     expect(tui.formatTimelineLines("[model] seed-openai-compatible:doubao")).toEqual([]);
     expect(tui.formatTimelineLines("[plan] budget=3 - scoped plan")).toEqual([]);
     expect(stripAnsi(tui.formatTimelineLines('[run] shell command="echo hi"')[0])).toContain("Run echo hi");
@@ -175,9 +198,9 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (path=README.md)")[0])).toContain("Read path=README.md");
     expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("Run read_file x2");
     expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("read_file(a.txt)");
-    expect(stripAnsi(tui.formatTimelineLines("[result] done")[0])).toContain("✓ done");
+    expect(stripAnsi(tui.formatTimelineLines("[result] done")[0])).toContain(`${okIcon} done`);
     expect(stripAnsi(tui.formatTimelineLines("[result] shell failed | time: 2s")[0])).toContain(
-      "× shell failed | time: 2s"
+      `${failIcon} shell failed | time: 2s`
     );
     expect(stripAnsi(tui.formatTimelineLines("[tool-result] 1 file changed, 1 insertion(+), 1 deletion(-)")[0])).toContain(
       "1 file changed, 1 insertion(+), 1 deletion(-)"
@@ -209,7 +232,7 @@ describe("tui usability", () => {
     expect(codeResponse).toContain("const x = 1;");
     expect(codeResponse).not.toContain("```");
     const plainResponse = stripAnsi(tui.formatTimelineLines("[response] hello world")[0]);
-    expect(plainResponse.trim()).toBe("• hello world");
+    expect(plainResponse.trim()).toBe(`${tui.symbols.response} hello world`);
     expect(plainResponse).not.toContain("Assistant:");
     const boldResponse = stripAnsi(tui.formatTimelineLines("[response] this is **BOLD** text")[0]);
     expect(boldResponse).toContain("this is BOLD text");
@@ -411,7 +434,8 @@ describe("tui usability", () => {
 
     tui.start();
     const frame = latestFrame(out);
-    expect(frame).toContain("status:");
+    expect(frame).toContain("Ready. Type /help for commands.");
+    expect(frame).not.toContain("status:");
     expect(frame).not.toContain("llm:");
     expect(frame).not.toContain("view:");
     expect(frame).not.toContain("todos:");
@@ -506,7 +530,7 @@ describe("tui usability", () => {
     expect(frame).not.toContain("TODO(");
   });
 
-  test("all completed todos show a transient left notice that clears next turn", () => {
+  test("all completed todos show status-bar notice without timeline completion event", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
       out,
@@ -519,12 +543,14 @@ describe("tui usability", () => {
     tui.start();
     tui.setTodos([{ id: "todo-1", content: "finish", status: "completed" }]);
     let frame = latestFrame(out);
-    expect(frame).toContain("✅ 所有 TODO 已完成，可以结束了");
+    expect(frame).toContain(tui.symbols.todoDoneNotice);
     expect(frame).toContain("Task completed");
+    expect(frame).toContain("TODO(1/1)");
+    expect(tui.timeline.map(stripAnsi).join("\n")).not.toContain("Task completed");
 
     tui.beginTurn();
     frame = latestFrame(out);
-    expect(frame).not.toContain("✅ 所有 TODO 已完成，可以结束了");
+    expect(frame).not.toContain(tui.symbols.todoDoneNotice);
     expect(frame).toContain("TODO(1/1)");
   });
 
@@ -638,7 +664,7 @@ describe("tui usability", () => {
     expect(frame).not.toContain("AGENTS.md: loaded");
   });
 
-  test("task context remains visible after task starts and shows done after success", () => {
+  test("task context remains visible as full-width block after task starts and shows done after success", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
       out,
@@ -656,10 +682,21 @@ describe("tui usability", () => {
     expect(frame).toContain("create a small CLI calculator");
     expect(frame).toContain("Using tool: write_file");
     expect(frame).not.toContain("Done");
+    let rawTaskContextLine = (out.writes[out.writes.length - 1] || "")
+      .split("\n")
+      .find((line) => stripAnsi(line).includes("Task · create a small CLI calculator"));
+    expect(rawTaskContextLine).toContain("\x1b[1;37;48;5;236m");
+    expect(rawTaskContextLine).toMatch(/create a small CLI calculator.*\s+\x1b\[0m/);
+    expect(stripAnsi(rawTaskContextLine).length).toBe(out.columns - 1);
 
     tui.onTurnSuccess(1234);
     frame = latestFrame(out);
     expect(frame).toContain("Task · Done · create a small CLI calculator");
+    rawTaskContextLine = (out.writes[out.writes.length - 1] || "")
+      .split("\n")
+      .find((line) => stripAnsi(line).includes("Task · Done · create a small CLI calculator"));
+    expect(rawTaskContextLine).toContain("\x1b[1;37;48;5;236m");
+    expect(stripAnsi(rawTaskContextLine).length).toBe(out.columns - 1);
   });
 
   test("task context shows failed after task error", () => {
@@ -695,7 +732,8 @@ describe("tui usability", () => {
     const frame = latestFrame(out);
     expect(frame).toContain("Task: inspect repo");
     expect(frame).toContain("thinking");
-    expect(frame).toContain("tok");
+    expect(frame).not.toContain("↳ | ");
+    expect(frame).not.toContain(" | tok ↑0 ↓0");
     tui.onThinkingDone();
     tui.stop();
   });
@@ -811,8 +849,8 @@ describe("tui usability", () => {
     tui.start();
     tui.setLiveThought("inspect files first");
     let frame = latestFrame(out);
-    expect(frame).toContain("Thinking:");
-    expect(frame).toContain("inspect files first");
+    expect(frame).toContain("thinking...");
+    expect(frame).not.toContain("inspect files first");
     expect(tui.thoughtStreamVisible).toBe(false);
     tui.clearLiveThought();
     frame = latestFrame(out);
@@ -882,6 +920,29 @@ describe("tui usability", () => {
     expect(frame).toContain("commands");
     expect(frame).toContain("> /model");
     expect(frame).toContain("/model list");
+  });
+
+  test("wide character input leaves a safety column when wrapping", () => {
+    const out = createOut(42, 16);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.renderInput("请实现在退出的时候，显示当前的会话id并且不要让输入区错位", 33);
+    const inputLines = tui.lastInputLine.split("\n").map(stripAnsi);
+    expect(inputLines.length).toBeGreaterThan(1);
+    for (const line of inputLines) {
+      expect(line.length).toBeLessThan(out.columns);
+    }
+
+    const frame = latestFrame(out);
+    expect(frame).toContain("Ready. Type /help for commands.");
+    expect(frame).toContain("请实现在退出的时候");
   });
 
   test("scrolling shows older content when overflowed", () => {

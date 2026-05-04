@@ -79,7 +79,11 @@ function shortPath(path) {
 function renderMarkdownLite(text) {
   const safe = escapeHtml(text);
   return safe
-    .replace(/```([\s\S]*?)```/g, (_m, code) => `<pre><code>${code}</code></pre>`)
+    .replace(/```([^\n`]*)\n?([\s\S]*?)```/g, (_m, language, code) => {
+      const lang = String(language || "").trim();
+      const classAttr = lang ? ` class="language-${escapeHtml(lang)}"` : "";
+      return `<pre><code${classAttr}>${code.replace(/^\n|\n$/g, "")}</code></pre>`;
+    })
     .replace(/`([^`]+)`/g, "<code>$1</code>")
     .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>");
 }
