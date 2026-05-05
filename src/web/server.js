@@ -33,6 +33,11 @@ import { getSessionDiff, parseToolResultDetails } from "./core.js";
 
 const DEFAULT_PORT = 3737;
 const MAX_BODY_BYTES = 1024 * 1024;
+const MAX_MESSAGE_BODY_BYTES = 24 * 1024 * 1024;
+const MAX_WEB_ATTACHMENTS = 6;
+const MAX_WEB_IMAGE_BYTES = 8 * 1024 * 1024;
+const MAX_WEB_ATTACHMENTS_BYTES = 20 * 1024 * 1024;
+const WEB_IMAGE_MIME_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 const SSE_KEEPALIVE_MS = 15000;
 const WEB_SLASH_COMMANDS = [
   { name: "/help", description: "Show web slash commands" },
@@ -213,8 +218,24 @@ export function validateWebOrigin(req, host = "127.0.0.1", port = DEFAULT_PORT) 
   try {
     const parsed = new URL(origin);
     const hostname = parsed.hostname.toLowerCase();
-    const allowedHosts = new Set(["localhost", "127.0.0.1", "::1", String(host || "").toLowerCase()]);
     const originPort = parsed.port || (parsed.protocol === "https:" ? "443" : "80");
+    const allowedHosts = new Set(["localhost", "127.0.0.1", "::1", String(host || "").toLowerCase()]);
+    const requestHost = String(req?.headers?.host || "").trim();
+    if (requestHost) {
+      try {
+        allowedHosts.add(new URL(`http://${requestHost}`).hostname.toLowerCase());
+      } catch {}
+    }
+    const configuredOrigins = String(process.env.PIECODE_WEB_ALLOWED_ORIGINS || "")
+      .split(",")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    for (const item of configuredOrigins) {
+      try {
+        const allowed = new URL(item);
+        if (allowed.origin === parsed.origin) return { ok: true, reason: "" };
+      } catch {}
+    }
     if (allowedHosts.has(hostname) && String(originPort) === String(port)) return { ok: true, reason: "" };
   } catch {
     return { ok: false, reason: "invalid origin" };
@@ -236,17 +257,85 @@ function textResponse(res, status, text, type = "text/plain; charset=utf-8") {
   res.end(text);
 }
 
-async function readJsonBody(req) {
+async function readJsonBody(req, maxBytes = MAX_BODY_BYTES) {
   const chunks = [];
   let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > MAX_BODY_BYTES) throw new Error("Request body too large");
+    if (size > maxBytes) throw new Error("Request body too large");
     chunks.push(chunk);
   }
   if (chunks.length === 0) return {};
   const raw = Buffer.concat(chunks).toString("utf8");
   return JSON.parse(raw || "{}");
+}
+
+function detectWebImageType(buffer) {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) return null;
+  if (buffer.length >= 8 && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    return "image/png";
+  }
+  if (buffer.length >= 3 && buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return "image/jpeg";
+  if (buffer.length >= 3 && buffer.subarray(0, 3).toString("ascii") === "GIF") return "image/gif";
+  if (buffer.length >= 12 && buffer.subarray(0, 4).toString("ascii") === "RIFF" && buffer.subarray(8, 12).toString("ascii") === "WEBP") {
+    return "image/webp";
+  }
+  return null;
+}
+
+function sanitizeAttachmentName(name) {
+  return String(name || "image")
+    .replace(/[\\/\0\r\n\t]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 120) || "image";
+}
+
+export function normalizeWebAttachments(raw) {
+  if (raw == null) return [];
+  if (!Array.isArray(raw)) throw new Error("attachments must be an array");
+  if (raw.length > MAX_WEB_ATTACHMENTS) throw new Error(`Too many attachments (max ${MAX_WEB_ATTACHMENTS})`);
+
+  let totalBytes = 0;
+  return raw.map((item, index) => {
+    if (!item || typeof item !== "object") throw new Error(`Attachment ${index + 1} is invalid`);
+    if (String(item.type || "image") !== "image") throw new Error(`Attachment ${index + 1} has unsupported type`);
+    const mimeType = String(item.mimeType || item.mime || "").toLowerCase();
+    if (!WEB_IMAGE_MIME_TYPES.has(mimeType)) throw new Error(`Attachment ${index + 1} has unsupported image type`);
+    let data = String(item.data || "").trim();
+    const dataUrlMatch = data.match(/^data:([^;,]+);base64,(.*)$/i);
+    if (dataUrlMatch) data = dataUrlMatch[2] || "";
+    data = data.replace(/\s+/g, "");
+    if (!data || !/^[A-Za-z0-9+/]+={0,2}$/.test(data) || data.length % 4 !== 0) {
+      throw new Error(`Attachment ${index + 1} is not valid base64`);
+    }
+    const buffer = Buffer.from(data, "base64");
+    if (buffer.length === 0) throw new Error(`Attachment ${index + 1} is empty`);
+    if (buffer.length > MAX_WEB_IMAGE_BYTES) throw new Error(`Attachment ${index + 1} is too large (max ${MAX_WEB_IMAGE_BYTES} bytes)`);
+    totalBytes += buffer.length;
+    if (totalBytes > MAX_WEB_ATTACHMENTS_BYTES) throw new Error(`Attachments are too large (max ${MAX_WEB_ATTACHMENTS_BYTES} bytes total)`);
+    const detected = detectWebImageType(buffer);
+    if (detected !== mimeType) throw new Error(`Attachment ${index + 1} content does not match ${mimeType}`);
+    return {
+      type: "image",
+      source: "web",
+      name: sanitizeAttachmentName(item.name),
+      mimeType,
+      data,
+      bytes: buffer.length,
+    };
+  });
+}
+
+function publicAttachments(attachments = []) {
+  return (Array.isArray(attachments) ? attachments : []).map((item) => ({
+    type: "image",
+    source: item.source || "web",
+    name: item.name || "image",
+    mimeType: item.mimeType,
+    data: item.data,
+    bytes: item.bytes,
+  }));
 }
 
 function sendSse(res, event) {
@@ -695,6 +784,39 @@ class WebAgentSession {
       });
       return;
     }
+    if (type === "plan" || type === "replan") {
+      const plan = evt.plan && typeof evt.plan === "object" ? evt.plan : {};
+      this.addTimelineItem({
+        type: "progress",
+        kind: type,
+        title: type === "replan" ? "Plan updated" : "Plan",
+        content: String(plan.summary || "Execution plan"),
+        steps: Array.isArray(plan.steps) ? plan.steps.slice(0, 8).map((step) => String(step || "")).filter(Boolean) : [],
+      });
+      this.publish(type, evt);
+      return;
+    }
+    if (type === "thought") {
+      this.addTimelineItem({ type: "progress", kind: "thought", title: "Thinking", content: String(evt.content || "") });
+      this.publish(type, evt);
+      return;
+    }
+    if (type === "log") {
+      const line = String(evt.line || evt.message || "").trim();
+      if (line) this.addTimelineItem({ type: "progress", kind: "log", title: "Log", content: line });
+      this.publish(type, evt);
+      return;
+    }
+    if (type === "model_call" || type === "planning_call" || type === "replanning_call") {
+      this.addTimelineItem({
+        type: "progress",
+        kind: "model",
+        title: type === "model_call" ? "Model call" : "Planning",
+        content: [evt.provider, evt.model].filter(Boolean).join(" · ") || "Calling model",
+      });
+      this.publish(type, evt);
+      return;
+    }
     if (type === "llm_request") {
       this.publish(type, { stage: evt.stage, preview: String(evt.payload || "").slice(0, 600) });
       return;
@@ -854,8 +976,11 @@ class WebAgentSession {
   }
 
   async sendMessage(content, options = {}) {
-    const text = String(content || "").trim();
+    let text = String(content || "").trim();
+    const attachments = Array.isArray(options.attachments) ? options.attachments : [];
+    if (!text && attachments.length > 0) text = "Please inspect the attached image.";
     if (!text) throw new Error("Message is required");
+    if (attachments.length > 0 && text.startsWith("/")) throw new Error("Attachments cannot be used with slash commands.");
     const isBtw = /^\/btw(?:\s+|$)/i.test(text);
     if (this.running && !isBtw) throw new Error("A task is already running");
 
@@ -878,14 +1003,14 @@ class WebAgentSession {
     this.running = true;
     this.activeTask = text;
     this.lastError = "";
-    const userMessage = { id: makeId("msg"), role: "user", content: text, at: new Date().toISOString() };
+    const userMessage = { id: makeId("msg"), role: "user", content: text, attachments: publicAttachments(attachments), at: new Date().toISOString() };
     this.messages.push(userMessage);
     this.addTimelineItem({ ...userMessage, type: "message" });
     this.publish("message", userMessage);
     this.publish("task.start", { input: text });
 
     try {
-      const result = await this.agent.runTurn(modelContent, { planOnly: Boolean(options.planOnly) });
+      const result = await this.agent.runTurn(modelContent, { planOnly: Boolean(options.planOnly), attachments });
       const contentOut = typeof result === "string" ? result : JSON.stringify(result, null, 2);
       const assistantMessage = { id: makeId("msg"), role: "assistant", content: contentOut, at: new Date().toISOString() };
       this.messages.push(assistantMessage);
@@ -984,14 +1109,15 @@ export async function main() {
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/messages") {
-        const body = await readJsonBody(req);
+        const body = await readJsonBody(req, MAX_MESSAGE_BODY_BYTES);
         const message = String(body.message || "").trim();
+        const attachments = normalizeWebAttachments(body.attachments);
         if (session.running && !/^\/btw(?:\s+|$)/i.test(message)) {
           jsonResponse(res, 409, { error: "A task is already running" });
           return;
         }
         if (typeof body.planOnly === "boolean") session.planOnly = body.planOnly;
-        session.sendMessage(message, { planOnly: session.planOnly }).catch((err) => {
+        session.sendMessage(message, { planOnly: session.planOnly, attachments }).catch((err) => {
           const error = String(err?.message || err || "message failed");
           session.lastError = error;
           session.publish("task.error", { error });

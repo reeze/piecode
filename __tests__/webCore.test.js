@@ -1,5 +1,5 @@
 import { clipDiffText, getSessionDiff, parseToolResultDetails } from "../src/web/core.js";
-import { isAuthorizedWebRequest, resolveWebBindOptions, validateWebOrigin } from "../src/web/server.js";
+import { isAuthorizedWebRequest, normalizeWebAttachments, resolveWebBindOptions, validateWebOrigin } from "../src/web/server.js";
 
 describe("web server security helpers", () => {
   test("binds to loopback by default", () => {
@@ -20,6 +20,19 @@ describe("web server security helpers", () => {
     expect(validateWebOrigin({ headers: {} }, "127.0.0.1", 3737).ok).toBe(true);
     expect(validateWebOrigin({ headers: { origin: "http://localhost:3737" } }, "127.0.0.1", 3737).ok).toBe(true);
     expect(validateWebOrigin({ headers: { origin: "https://evil.example" } }, "127.0.0.1", 3737).ok).toBe(false);
+  });
+
+  test("normalizes valid web image attachments", () => {
+    const png = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0, 0, 0, 0]);
+    const result = normalizeWebAttachments([{ type: "image", name: "shot.png", mimeType: "image/png", data: png.toString("base64") }]);
+    expect(result).toEqual([
+      expect.objectContaining({ type: "image", source: "web", name: "shot.png", mimeType: "image/png", bytes: png.length }),
+    ]);
+  });
+
+  test("rejects web image attachment mime mismatches", () => {
+    const gif = Buffer.from("GIF89a", "ascii");
+    expect(() => normalizeWebAttachments([{ type: "image", mimeType: "image/png", data: gif.toString("base64") }])).toThrow(/does not match/);
   });
 });
 

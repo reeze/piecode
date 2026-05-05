@@ -1233,6 +1233,7 @@ function formatToolResultLinesForTimeline(tool, result, error) {
   if (name === "shell" || name === "run_tests") {
     const lines = raw.split("\n");
     const exit = lines.find((line) => /^exit_code:\s*/i.test(line))?.replace(/^exit_code:\s*/i, "").trim();
+    const success = !exit || exit === "0";
     const tooLong = raw.match(/^Result too long[^\n]*/i)?.[0] || "";
     const previewIdx = lines.findIndex((line) => /^Preview:\s*$/i.test(line));
     const stdoutIdx = lines.findIndex((line) => /^stdout:\s*$/i.test(line));
@@ -1245,12 +1246,13 @@ function formatToolResultLinesForTimeline(tool, result, error) {
       bodyLines = lines.slice(stdoutIdx + 1, stdoutEnd);
       if (bodyLines.join("").trim().length === 0 && stderrIdx >= 0) bodyLines = lines.slice(stderrIdx + 1);
     } else {
-      bodyLines = lines;
+      bodyLines = lines.filter((line) => !/^exit_code:\s*/i.test(line));
     }
     const preview = bodyLines.map((line) => line.trimEnd()).filter(Boolean).slice(0, 4);
     const out = [];
-    const status = exit ? `exit ${exit}` : name === "run_tests" ? "test result" : "command result";
-    out.push(`[tool-result] ${tooLong || status}`);
+    if (tooLong) out.push(`[tool-result] ${success ? "✓" : "✗"} ${tooLong}${exit ? ` (${success ? "success" : `exit ${exit}`})` : ""}`);
+    else if (!success) out.push(`[tool-result] ✗ ${exit ? `exit ${exit}` : name === "run_tests" ? "tests failed" : "command failed"}`);
+    else if (preview.length === 0) out.push(`[tool-result] ✓ ${name === "run_tests" ? "tests passed" : "command succeeded"}`);
     for (const line of preview) out.push(`[tool-result]   ${summarizeForLog(line, 220)}`);
     if (bodyLines.filter(Boolean).length > preview.length) {
       out.push(`[tool-result]   ... (${bodyLines.filter(Boolean).length - preview.length} more lines)`);

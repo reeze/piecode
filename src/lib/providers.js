@@ -787,7 +787,7 @@ function normalizeResponsesInputContent(role, content) {
         }
         if (part?.type === 'image_url' && role !== 'assistant') {
           const url = String(part?.image_url?.url || '');
-          if (url) return { type: 'input_image', image_url: url };
+          if (url) return { type: 'input_image', image_url: url, detail: 'auto' };
         }
         if (part?.type === 'input_text' || part?.type === 'output_text' || part?.type === 'input_image') return part;
         return null;

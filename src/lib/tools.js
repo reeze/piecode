@@ -386,9 +386,10 @@ async function formatShellResult({
   maxInlineChars = SHELL_INLINE_MAX_CHARS,
   previewChars = SHELL_PREVIEW_CHARS,
 }) {
+  const statusLines = Number(exitCode) === 0 ? [] : [`exit_code: ${Number(exitCode) || 1}`];
   const rendered = [
     `command: ${command}`,
-    `exit_code: ${Number.isFinite(exitCode) ? exitCode : 1}`,
+    ...statusLines,
     "stdout:",
     String(stdout || ""),
     "stderr:",
@@ -404,9 +405,7 @@ async function formatShellResult({
   await fs.writeFile(absPath, rendered, "utf8");
   const relPath = path.relative(workspaceDir, absPath).split(path.sep).join("/");
   const preview = truncatePreview([stdout, stderr].filter(Boolean).join("\n"), previewChars);
-  return `Result too long (chars: ${rendered.length}), saved to ${relPath}\nexit_code: ${
-    Number.isFinite(exitCode) ? exitCode : 1
-  }\nPreview:\n${preview}`;
+  return `Result too long (chars: ${rendered.length}), saved to ${relPath}\nPreview:\n${preview}`;
 }
 
 function normalizeRelPathForMatch(relPath) {
@@ -1802,7 +1801,7 @@ async function searchWithRipgrep({
           .map((line) => line.trim())
           .filter(Boolean)
           .map((file) => file.replace(workspaceDir + "/", "").replace(workspaceDir, "."));
-        if (files.length === 0) return `No matches found for pattern: ${regex}`;
+        if (files.length === 0) return "";
         const shown = files.slice(0, limit);
         const suffix = files.length > shown.length ? `\n... (${files.length - shown.length} more files)` : "";
         return `Found matches in ${files.length} files for "${regex}" (condensed due large output):\n${shown
@@ -1810,14 +1809,14 @@ async function searchWithRipgrep({
           .join("\n")}${suffix}`;
       } catch (compactError) {
         if (compactError.code === 1 && !compactError.stdout) {
-          return `No matches found for pattern: ${regex}`;
+          return "";
         }
         throw new Error(`Search failed: ${compactError.message}`);
       }
     }
     if (error.code === 1 && !error.stdout) {
       // ripgrep returns 1 when no matches found
-      return `No matches found for pattern: ${regex}`;
+      return "";
     }
     throw new Error(`Search failed: ${error.message}`);
   }
@@ -1912,7 +1911,7 @@ async function searchWithGrep({
           .map((line) => line.trim())
           .filter(Boolean)
           .map((file) => file.replace(workspaceDir + "/", "").replace(workspaceDir, "."));
-        if (files.length === 0) return `No matches found for pattern: ${regex}`;
+        if (files.length === 0) return "";
         const shown = files.slice(0, limit);
         const suffix = files.length > shown.length ? `\n... (${files.length - shown.length} more files)` : "";
         return `Found matches in ${files.length} files for "${regex}" (condensed due large output):\n${shown
@@ -1920,14 +1919,14 @@ async function searchWithGrep({
           .join("\n")}${suffix}`;
       } catch (compactError) {
         if (compactError.code === 1 && !compactError.stdout) {
-          return `No matches found for pattern: ${regex}`;
+          return "";
         }
         throw new Error(`Search failed: ${compactError.message}`);
       }
     }
     if (error.code === 1 && !error.stdout) {
       // grep returns 1 when no matches found
-      return `No matches found for pattern: ${regex}`;
+      return "";
     }
     throw new Error(`Search failed: ${error.message}`);
   }
@@ -2059,7 +2058,7 @@ function parseSearchResults(stdout, workspaceDir) {
 
 function formatSearchResults(results, limit, regex) {
   if (results.length === 0) {
-    return `No matches found for pattern: ${regex}`;
+    return "";
   }
 
   let output = `Found ${results.length} match${results.length === 1 ? "" : "es"} for "${regex}"`;

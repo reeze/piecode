@@ -436,6 +436,19 @@ describe("tools usability", () => {
     expect(result).toContain("sample.js");
   });
 
+  test("search_files returns empty output when there are no matches", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    await fs.writeFile(path.join(dir, "sample.js"), "const present = true;\n", "utf8");
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+    });
+
+    const result = await tools.search_files({ query: "definitely_absent", path: "." });
+    expect(result).toBe("");
+  });
+
   test("rg searches code with ripgrep-style aliases without shell approval", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
     await fs.mkdir(path.join(dir, "src"), { recursive: true });
@@ -603,7 +616,21 @@ describe("tools usability", () => {
     });
 
     const result = await tools.shell({ command: "pwd" });
-    expect(result).toContain("exit_code: 0");
+    expect(result).toContain("command: pwd");
+    expect(result).not.toContain("exit_code:");
+  });
+
+  test("failed shell command includes exit_code for timeline status", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: false },
+      askApproval: async () => true,
+    });
+
+    const result = await tools.shell({ command: "false" });
+    expect(result).toContain("command: false");
+    expect(result).toContain("exit_code: 1");
   });
 
   test("higher-risk shell helpers and destructive flags are not classified safe", () => {
@@ -654,6 +681,7 @@ describe("tools usability", () => {
     });
 
     const result = await tools.shell({ command: "git status --short" });
+    expect(result).toContain("command: git status --short");
     expect(result).toContain("exit_code:");
   });
 
@@ -727,8 +755,10 @@ describe("tools usability", () => {
     const first = await tools.shell({ command: "python3 -V" });
     const second = await tools.shell({ command: "python3   -V" });
 
-    expect(first).toContain("exit_code:");
-    expect(second).toContain("exit_code:");
+    expect(first).toContain("command: python3 -V");
+    expect(second).toContain("command: python3   -V");
+    expect(first).not.toContain("exit_code:");
+    expect(second).not.toContain("exit_code:");
     expect(asked).toBe(1);
     expect(shellPermissionRef.value.rememberedCommands.has("python3 -V")).toBe(true);
   });
@@ -750,8 +780,10 @@ describe("tools usability", () => {
     const first = await tools.shell({ command: "python3 -V" });
     const second = await tools.shell({ command: "node -v" });
 
-    expect(first).toContain("exit_code:");
-    expect(second).toContain("exit_code:");
+    expect(first).toContain("command: python3 -V");
+    expect(second).toContain("command: node -v");
+    expect(first).not.toContain("exit_code:");
+    expect(second).not.toContain("exit_code:");
     expect(asked).toBe(1);
     expect(shellPermissionRef.value.allowAllSession).toBe(true);
   });
@@ -792,7 +824,8 @@ describe("tools usability", () => {
     const relPath = match[1];
     const abs = path.join(dir, relPath);
     const saved = await fs.readFile(abs, "utf8");
-    expect(saved).toContain("exit_code: 0");
+    expect(saved).toContain("command: node -e");
+    expect(saved).not.toContain("exit_code:");
     expect(saved.length).toBeGreaterThan(12000);
   });
 });

@@ -478,6 +478,7 @@ describe("tui usability", () => {
     tui.start();
     const frame = latestFrame(out);
     expect(frame).toContain("Ready. Type /help for commands.");
+    expect((frame.match(/─{10,}/g) || []).length).toBeGreaterThanOrEqual(2);
     expect(frame).not.toContain("status:");
     expect(frame).not.toContain("llm:");
     expect(frame).not.toContain("view:");
@@ -485,7 +486,7 @@ describe("tui usability", () => {
     expect(frame).not.toContain("TODO(");
   });
 
-  test("frame separators use ascii for mobile terminal compatibility", () => {
+  test("frame separators use unicode when supported", () => {
     const out = createOut(80, 18);
     const tui = new SimpleTui({
       out,
@@ -499,8 +500,7 @@ describe("tui usability", () => {
     tui.event("[thought] Preparing tool: run_tests");
     tui.renderInput("");
     const raw = out.writes.join("");
-    expect(raw).toContain("----------");
-    expect(raw).not.toContain("─");
+    expect(raw).toContain("──────────");
   });
 
   test("wide characters do not overflow truncated status lines", () => {
@@ -707,8 +707,8 @@ describe("tui usability", () => {
     expect(frame).not.toContain("AGENTS.md: loaded");
   });
 
-  test("task context remains visible as full-width block after task starts and shows done after success", () => {
-    const out = createOut(100, 28);
+  test("task context hides while the matching timeline task is visible and reappears when scrolled out", () => {
+    const out = createOut(100, 16);
     const tui = new SimpleTui({
       out,
       workspaceDir: "/tmp/work",
@@ -727,17 +727,27 @@ describe("tui usability", () => {
     expect(frame).not.toContain("Done");
     let rawTaskContextLine = (out.writes[out.writes.length - 1] || "")
       .split("\n")
-      .find((line) => stripAnsi(line).includes("Task · create a small CLI calculator"));
+      .find((line) => stripAnsi(line).includes("Task: create a small CLI calculator ·"));
+    expect(rawTaskContextLine).toBeUndefined();
+
+    for (let i = 0; i < 30; i += 1) {
+      tui.event(`[progress] step ${i}`);
+    }
+    tui.renderInput("");
+    frame = latestFrame(out);
+    rawTaskContextLine = (out.writes[out.writes.length - 1] || "")
+      .split("\n")
+      .find((line) => stripAnsi(line).includes("Task: create a small CLI calculator ·"));
     expect(rawTaskContextLine).toContain("\x1b[1;37;48;5;236m");
-    expect(rawTaskContextLine).toMatch(/create a small CLI calculator.*\s+\x1b\[0m/);
+    expect(rawTaskContextLine).toMatch(/Task: create a small CLI calculator.*\s+\x1b\[0m/);
     expect(stripAnsi(rawTaskContextLine).length).toBe(out.columns - 1);
 
     tui.onTurnSuccess(1234);
     frame = latestFrame(out);
-    expect(frame).toContain("Task · Done · create a small CLI calculator");
+    expect(frame).toContain("Task: Done · create a small CLI calculator");
     rawTaskContextLine = (out.writes[out.writes.length - 1] || "")
       .split("\n")
-      .find((line) => stripAnsi(line).includes("Task · Done · create a small CLI calculator"));
+      .find((line) => stripAnsi(line).includes("Task: Done · create a small CLI calculator"));
     expect(rawTaskContextLine).toContain("\x1b[1;37;48;5;236m");
     expect(stripAnsi(rawTaskContextLine).length).toBe(out.columns - 1);
   });
@@ -754,9 +764,12 @@ describe("tui usability", () => {
 
     tui.start();
     tui.event("[task] inspect repo");
+    for (let i = 0; i < 30; i += 1) {
+      tui.event(`[progress] step ${i}`);
+    }
     tui.onTurnError("boom", 1200);
     const frame = latestFrame(out);
-    expect(frame).toContain("Task · Failed · inspect repo");
+    expect(frame).toContain("Task: Failed · inspect repo");
   });
 
   test("running indicator is rendered in workspace while thinking", () => {

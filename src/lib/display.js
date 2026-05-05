@@ -535,10 +535,16 @@ export class Display {
 
     switch (tool) {
       case "shell": {
-        const lines = text.split("\n").filter(Boolean);
-        const preview = lines.slice(0, 5).map((l) => `    ${dim(truncateLine(l))}`);
-        if (lines.length > 5) {
-          preview.push(`    ${dim(`... (${lines.length - 5} more lines)`)}`);
+        const lines = text.split("\n");
+        const stdoutIdx = lines.findIndex((line) => /^stdout:\s*$/i.test(line));
+        const stderrIdx = lines.findIndex((line) => /^stderr:\s*$/i.test(line));
+        const outputLines = stdoutIdx >= 0
+          ? lines.slice(stdoutIdx + 1, stderrIdx > stdoutIdx ? stderrIdx : lines.length)
+          : lines.filter((line) => !/^command:\s*/i.test(line) && !/^exit_code:\s*/i.test(line));
+        const compact = outputLines.map((line) => line.trimEnd()).filter(Boolean);
+        const preview = compact.slice(0, 5).map((l) => `    ${dim(truncateLine(l))}`);
+        if (compact.length > 5) {
+          preview.push(`    ${dim(`... (${compact.length - 5} more lines)`)}`);
         }
         return preview.join("\n");
       }

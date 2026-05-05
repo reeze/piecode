@@ -553,10 +553,9 @@ function formatCompactNumber(n) {
   return String(Math.round(value));
 }
 
-function separatorLine(width) {
-  // Use ASCII here because several mobile terminals render box-drawing glyphs
-  // with unstable width/fallback characters during frequent full-frame redraws.
-  return `\x1b[90m${"-".repeat(Math.max(1, Number(width) || 1))}\x1b[0m`;
+function separatorLine(width, useUnicode = true) {
+  const glyph = useUnicode ? "─" : "-";
+  return `\x1b[90m${glyph.repeat(Math.max(1, Number(width) || 1))}\x1b[0m`;
 }
 
 function shouldUseUnicodeSymbols(env = process.env) {
@@ -920,14 +919,19 @@ export class SimpleTui {
     if (!task) return "";
     const elapsed = this.formatElapsedSinceTurnStart();
     const status = this.taskCompletedAt ? (this.modelState === "error" ? "Failed" : "Done") : "";
-    const fixedBudget = status ? 37 : 28;
-    const parts = [
-      "Task",
-      ...(status ? [status] : []),
-      truncateLine(task, Math.max(16, width - fixedBudget)),
-      elapsed,
-    ];
-    return colorFullLine(` ${parts.join(" · ")} `, "1;37;48;5;236", width);
+    const prefix = `${this.symbols.task} Task: ${status ? `${status} · ` : ""}`;
+    const fixedBudget = stringDisplayWidth(prefix) + stringDisplayWidth(elapsed) + 6;
+    const body = truncateLine(task, Math.max(16, width - fixedBudget));
+    return colorFullLine(` ${prefix}${body} · ${elapsed} `, "1;37;48;5;236", width);
+  }
+
+  visibleTimelineHasCurrentTask(lines = []) {
+    const task = String(this.currentTaskText || "").replace(/\s+/g, " ").trim();
+    if (!task || this.showRawLogs) return false;
+    return (Array.isArray(lines) ? lines : []).some((line) => {
+      const plain = stripAnsi(String(line || "")).replace(/\s+/g, " ").trim();
+      return /(?:Task:|Task ·)/i.test(plain) && plain.includes(task);
+    });
   }
 
   setLlmDebugEnabled(enabled) {
@@ -1907,7 +1911,7 @@ export class SimpleTui {
     const height = Math.max(16, this.out.rows || 30);
 
     if (this.overlayVisible) {
-      const sep = separatorLine(width);
+      const sep = separatorLine(width, this.unicodeSymbols);
       const title = truncateLine(` ${this.overlayTitle}`, width);
       const fallbackHint = " /:search  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close ";
       const hintText = this.overlaySearchActive
@@ -1943,7 +1947,7 @@ export class SimpleTui {
       return;
     }
 
-    const sep = separatorLine(width);
+    const sep = separatorLine(width, this.unicodeSymbols);
     // Leave one spare cell for interactive bottom chrome. Several mobile
     // terminals and tmux combinations auto-wrap when wide text reaches the
     // last column, which makes the input/status rows drift by one line.
@@ -1969,14 +1973,14 @@ export class SimpleTui {
         (modelSuggestionViewport.hiddenBelow > 0 ? 1 : 0)
       : 0;
     const hintLines = this.inputHint ? 1 : 0;
-    const taskContextLine = this.formatTaskContextLine(width);
-    const taskContextLines = taskContextLine ? 2 : 0;
+    const rawTaskContextLine = this.formatTaskContextLine(width);
+    const taskContextLines = rawTaskContextLine ? 2 : 0;
     const thinkingLines = this.thinking ? 1 : 0;
     const thoughtWrapped = [];
     const thoughtStreamLines = 0;
     const inputState = this.buildInputState(this.currentInput, bottomWidth, cursorIndex);
     const inputLineCount = Math.max(1, inputState.lines.length);
-    const bottomLines = inputLineCount + 3 + commandSuggestionLines + modelSuggestionLines + hintLines; // input + pickers + status/hint
+    const bottomLines = inputLineCount + 4 + commandSuggestionLines + modelSuggestionLines + hintLines; // input + pickers + separators + status/hint
     const reservedLines =
       headerLines +
       todoBlockLines +
@@ -1998,6 +2002,7 @@ export class SimpleTui {
     this.scrollOffset = Math.min(Math.max(0, this.scrollOffset), maxScroll);
     const start = Math.max(0, sourceLines.length - maxLogLines - this.scrollOffset);
     const visibleLogs = sourceLines.slice(start, start + maxLogLines);
+    const taskContextLine = this.visibleTimelineHasCurrentTask(visibleLogs) ? "" : rawTaskContextLine;
     const visibleStart = sourceLines.length === 0 ? 0 : start + 1;
     const visibleEnd = Math.min(sourceLines.length, start + visibleLogs.length);
     const viewName = this.showRawLogs ? "raw" : "timeline";
@@ -2039,7 +2044,7 @@ export class SimpleTui {
     const spin = spinFrames[this.thinkingTick % spinFrames.length];
     const thought = String(this.thoughtStreamText || "").trim();
     const thoughtSuffix = thought ? ` · ${truncateLine(thought.replace(/^Thinking:\s*/i, ""), Math.max(20, width - 46))}` : "";
-    const runningLine = `${spin} thinking${this.thinkingStage ? `:${this.thinkingStage}` : ""} · ${this.formatElapsedSinceTurnStart()}${thoughtSuffix}`;
+    const runningLine = ` ${spin} thinking${this.thinkingStage ? `:${this.thinkingStage}` : ""} · ${this.formatElapsedSinceTurnStart()}${thoughtSuffix}`;
     const thinkingBlock = this.thinking ? [color(runningLine, `1;${thinkingColor}`)] : [];
     const thoughtStreamBlock = [];
 
@@ -2107,6 +2112,7 @@ export class SimpleTui {
       ...inputState.lines.map((line) => `\x1b[1m${line}\x1b[0m`),
       ...commandSuggestionBlock,
       ...modelSuggestionBlock,
+      sep,
       `\x1b[2m${promptStatus}\x1b[0m`,
       ...(this.inputHint ? [`\x1b[2m${truncateLine(` ${this.inputHint}`, bottomWidth)}\x1b[0m`] : []),
     ];
@@ -2126,6 +2132,7 @@ export class SimpleTui {
         workspaceLines: beforeInputLines.slice(0, -1),
         inputLines: inputComposite,
         statusLine: promptStatus,
+        separatorGlyph: this.unicodeSymbols ? "─" : "-",
         hintLine: this.inputHint ? truncateLine(` ${this.inputHint}`, bottomWidth) : "",
         cursorRowOffset: Math.max(0, inputState.cursorRowOffset),
         cursorCol: inputState.cursorCol,

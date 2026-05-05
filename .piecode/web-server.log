@@ -1,0 +1,18 @@
+
+> piecode@0.1.0 web
+> node src/web/server.js
+
+PieCode Web is running:
+  http://localhost:3737?token=dev
+  http://192.168.5.5:3737?token=dev
+  http://192.168.139.3:3737?token=dev
+  http://192.168.194.0:3737?token=dev
+  http://100.108.149.10:3737?token=dev
+  http://192.168.97.0:3737?token=dev
+warning: web UI is bound to all interfaces; keep the token private.
+Current Session ID: session-20260505-144556-ka3y (short: ka3y)
+Recent resumable sessions:
+  rw63  请用一句话描述这张图片
+  btbk  看一下现在的ui设计请优化一下wrb版本
+  kxdt  Empty web session
+Resume with: /resume <short-id> or /resume <full-session-id>

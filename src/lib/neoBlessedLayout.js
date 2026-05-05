@@ -26,13 +26,21 @@ export class NeoBlessedLayout {
     });
     this.inputBox = blessed.box({
       parent: this.screen,
+      bottom: 3,
+      left: 0,
+      width: "100%",
+      height: 1,
+      tags: false,
+    });
+    this.topSepBox = blessed.box({
+      parent: this.screen,
       bottom: 2,
       left: 0,
       width: "100%",
       height: 1,
       tags: false,
     });
-    this.sepBox = blessed.box({
+    this.bottomSepBox = blessed.box({
       parent: this.screen,
       bottom: 1,
       left: 0,
@@ -40,6 +48,7 @@ export class NeoBlessedLayout {
       height: 1,
       tags: false,
     });
+    this.sepBox = this.topSepBox;
     this.statusBox = blessed.box({
       parent: this.screen,
       bottom: 0,
@@ -65,6 +74,7 @@ export class NeoBlessedLayout {
     inputLines = [],
     statusLine = "",
     hintLine = "",
+    separatorGlyph = "─",
     cursorRowOffset = 0,
     cursorCol = 1,
   } = {}) {
@@ -75,20 +85,23 @@ export class NeoBlessedLayout {
     const hasHint = Boolean(String(hintLine || "").trim());
 
     this.statusBox.bottom = 0;
-    this.sepBox.bottom = hasHint ? 2 : 1;
+    this.bottomSepBox.bottom = hasHint ? 2 : 1;
+    this.topSepBox.bottom = inputHeight + (hasHint ? 3 : 2);
     this.inputBox.bottom = hasHint ? 3 : 2;
     this.inputBox.height = inputHeight;
     this.hintBox.hidden = !hasHint;
     if (hasHint) this.hintBox.bottom = 1;
 
-    const reservedBottom = inputHeight + (hasHint ? 3 : 2);
+    const reservedBottom = inputHeight + (hasHint ? 4 : 3);
     const mainHeight = Math.max(1, rows - reservedBottom);
     this.mainBox.height = mainHeight;
 
-    const sep = "─".repeat(Math.max(1, cols - 1));
+    const glyph = String(separatorGlyph || "─").slice(0, 1) || "─";
+    const sep = glyph.repeat(Math.max(1, cols - 1));
     this.mainBox.setContent(String(workspaceLines.join("\n")));
     this.inputBox.setContent(String(safeInputLines.join("\n")));
-    this.sepBox.setContent(String(sep));
+    this.topSepBox.setContent(String(sep));
+    this.bottomSepBox.setContent(String(sep));
     this.statusBox.setContent(String(statusLine || ""));
     if (hasHint) this.hintBox.setContent(String(hintLine || ""));
 

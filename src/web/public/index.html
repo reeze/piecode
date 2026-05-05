@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>PieCode Web</title>
+    <title>PieCode · Web Agent</title>
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -14,7 +14,7 @@
           <div class="logo">π</div>
           <div>
             <h1>PieCode</h1>
-            <p>Workspace agent</p>
+            <p>AI coding workspace</p>
           </div>
           <button id="mobileCloseMenuBtn" class="icon-btn mobile-only sidebar-close" type="button" aria-label="Close workspace panel">×</button>
         </div>
@@ -98,12 +98,18 @@
           <div id="eventStrip" class="event-strip"></div>
           <form id="composer" class="composer">
             <div class="input-shell">
-              <textarea id="messageInput" rows="3" placeholder="Ask PieCode to inspect, edit, test, or explain..."></textarea>
+              <textarea id="messageInput" rows="3" placeholder="Ask PieCode to inspect, edit, test, explain, or attach an image..."></textarea>
+              <button id="attachBtn" class="attach-btn" type="button" aria-label="Attach image">＋</button>
               <button id="sendBtn" type="submit" aria-label="Send message">↑</button>
+              <input id="imageInput" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden />
+              <div id="attachmentTray" class="attachment-tray" hidden></div>
               <div id="slashSuggestions" class="slash-suggestions" hidden></div>
             </div>
           </form>
-          <div id="contextUsage" class="context-usage">ctx: -</div>
+          <div class="composer-meta">
+            <div id="modelInlineLabel" class="model-inline">Model: -</div>
+            <div id="contextUsage" class="context-usage">ctx: -</div>
+          </div>
           <div class="hint">Shift+Enter for newline · type / for commands</div>
         </section>
       </main>

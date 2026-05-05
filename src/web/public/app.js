@@ -1,6 +1,11 @@
 const authToken = new URLSearchParams(window.location.search).get("token") || "";
 const apiUrl = (path) => authToken ? `${path}${path.includes("?") ? "&" : "?"}token=${encodeURIComponent(authToken)}` : path;
 
+const ALLOWED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
+const MAX_ATTACHMENTS = 6;
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024;
+const MAX_ATTACHMENTS_BYTES = 20 * 1024 * 1024;
+
 const state = {
   connected: false,
   running: false,
@@ -14,6 +19,7 @@ const state = {
   recentEvents: [],
   recentSessions: [],
   sessionId: "",
+  attachments: [],
 };
 
 const el = {
@@ -21,6 +27,7 @@ const el = {
   statusText: document.getElementById("statusText"),
   activeTask: document.getElementById("activeTask"),
   modelLabel: document.getElementById("modelLabel"),
+  modelInlineLabel: document.getElementById("modelInlineLabel"),
   workspaceLabel: document.getElementById("workspaceLabel"),
   mcpLabel: document.getElementById("mcpLabel"),
   connection: document.getElementById("connection"),
@@ -28,6 +35,9 @@ const el = {
   composer: document.getElementById("composer"),
   messageInput: document.getElementById("messageInput"),
   sendBtn: document.getElementById("sendBtn"),
+  attachBtn: document.getElementById("attachBtn"),
+  imageInput: document.getElementById("imageInput"),
+  attachmentTray: document.getElementById("attachmentTray"),
   slashSuggestions: document.getElementById("slashSuggestions"),
   slashHelpBtn: document.getElementById("slashHelpBtn"),
   abortBtn: document.getElementById("abortBtn"),
@@ -97,6 +107,7 @@ function compactNumber(value) {
 }
 
 function renderContextUsage(usage = {}) {
+  if (!el.contextUsage) return;
   const ctx = usage && typeof usage === "object" ? usage : {};
   const used = Number(ctx.used || 0);
   const limit = Number(ctx.limit || 0);
@@ -116,15 +127,17 @@ function renderStatus(snapshot = {}) {
   el.statusDot.className = `dot ${snapshot.lastError ? "error" : state.running ? "running" : "idle"}`;
   el.statusText.textContent = snapshot.lastError ? "Error" : state.running ? "Running" : "Idle";
   el.activeTask.textContent = snapshot.activeTask || (state.connected ? "Ready" : "Connecting...");
-  el.modelLabel.textContent = snapshot.providerLabel || snapshot.model || "-";
-  el.workspaceLabel.textContent = shortPath(snapshot.workspaceDir);
-  el.mcpLabel.textContent = Array.isArray(snapshot.mcpServers) && snapshot.mcpServers.length ? snapshot.mcpServers.join(", ") : "none";
-  el.autoApprove.checked = Boolean(snapshot.autoApprove);
-  el.planOnly.checked = Boolean(snapshot.planOnly);
-  el.detailMode.checked = Boolean(snapshot.detailMode);
-  el.abortBtn.disabled = !state.running;
-  el.mobileAbortBtn.hidden = !state.running;
-  el.sendBtn.disabled = state.running;
+  const modelText = snapshot.providerLabel || snapshot.model || "-";
+  if (el.modelLabel) el.modelLabel.textContent = modelText;
+  if (el.modelInlineLabel) el.modelInlineLabel.textContent = `Model: ${modelText}`;
+  if (el.workspaceLabel) el.workspaceLabel.textContent = shortPath(snapshot.workspaceDir);
+  if (el.mcpLabel) el.mcpLabel.textContent = Array.isArray(snapshot.mcpServers) && snapshot.mcpServers.length ? snapshot.mcpServers.join(", ") : "none";
+  if (el.autoApprove) el.autoApprove.checked = Boolean(snapshot.autoApprove);
+  if (el.planOnly) el.planOnly.checked = Boolean(snapshot.planOnly);
+  if (el.detailMode) el.detailMode.checked = Boolean(snapshot.detailMode);
+  if (el.abortBtn) el.abortBtn.disabled = !state.running;
+  if (el.mobileAbortBtn) el.mobileAbortBtn.hidden = !state.running;
+  if (el.sendBtn) el.sendBtn.disabled = state.running;
   renderContextUsage(snapshot.contextUsage);
 }
 
@@ -162,6 +175,25 @@ function renderJsonBlock(label, value) {
   return `<div class="tool-section"><div class="tool-section-title">${escapeHtml(label)}</div><pre><code>${escapeHtml(text)}</code></pre></div>`;
 }
 
+function attachmentSrc(item) {
+  return item?.data && item?.mimeType ? `data:${item.mimeType};base64,${item.data}` : "";
+}
+
+function renderAttachments(attachments = []) {
+  const images = (Array.isArray(attachments) ? attachments : []).filter((item) => item?.type === "image");
+  if (!images.length) return "";
+  return `<div class="message-attachments">${images.map((item) => {
+    const name = escapeHtml(item.name || "image");
+    const kb = Math.max(1, Math.round(Number(item.bytes || 0) / 1024));
+    const src = attachmentSrc(item);
+    if (!src) return `<div class="attachment-meta">${name} · ${escapeHtml(item.mimeType || "image")} · ${kb}KB</div>`;
+    return `<a class="message-attachment" href="${escapeHtml(src)}" target="_blank" rel="noreferrer" title="${name}">
+      <img src="${escapeHtml(src)}" alt="${name}" loading="lazy" />
+      <span>${name} · ${kb}KB</span>
+    </a>`;
+  }).join("")}</div>`;
+}
+
 function renderToolResult(result = {}) {
   if (!result || !result.expandable) {
     return result?.preview ? `<div class="tool-preview">${escapeHtml(result.preview)}</div>` : "";
@@ -190,7 +222,19 @@ function renderTimelineItem(item) {
     return `<article class="message ${escapeHtml(role)}" data-id="${escapeHtml(item.id)}">
       <div class="msg-head"><strong>${escapeHtml(label)}</strong><span>${timeLabel(item.at)}</span></div>
       <div class="msg-content">${renderMarkdownLite(item.content || "")}</div>
+      ${renderAttachments(item.attachments)}
     </article>`;
+  }
+  if (item.type === "progress") {
+    const title = item.title || (item.kind === "model" ? "Model" : "Progress");
+    const steps = Array.isArray(item.steps) && item.steps.length
+      ? `<ol>${item.steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>`
+      : "";
+    return `<div class="progress-card ${escapeHtml(item.kind || "info")}" data-id="${escapeHtml(item.id)}">
+      <div class="progress-head"><span>${escapeHtml(title)}</span><time>${timeLabel(item.at)}</time></div>
+      ${item.content ? `<div class="progress-content">${escapeHtml(item.content)}</div>` : ""}
+      ${steps}
+    </div>`;
   }
   if (item.type === "tool") {
     const status = String(item.status || "queued");
@@ -242,31 +286,39 @@ function patchTimeline(id, patch) {
   renderMessages();
 }
 
+function approvalTitle(item) {
+  const kind = String(item.kind || "approval");
+  if (kind === "shell") return "Shell command requires approval";
+  if (kind === "mcp" || kind.startsWith("mcp")) return "MCP tool requires approval";
+  return "Action requires approval";
+}
+
 function approvalCommand(item) {
   const details = item.details || {};
-  return details.command || details.normalizedCommand || details.input?.command || "approval request";
+  return details.command || details.normalizedCommand || details.input?.command || details.tool || details.question || item.kind || "approval request";
 }
 
 function approvalReason(item) {
   const details = item.details || {};
-  return details.classification?.reason || details.reason || details.question || "Manual approval required";
+  return details.classification?.reason || details.reason || details.question || "Review this action before PieCode continues.";
 }
 
 function renderApprovals() {
   const approvalHtml = state.approvals
     .map((item) => `<div class="approval-item">
-      <strong>${escapeHtml(item.kind === "shell" ? "Shell command" : item.kind)}</strong>
+      <strong>${escapeHtml(approvalTitle(item))}</strong>
       <code>${escapeHtml(approvalCommand(item))}</code>
       <div class="muted">${escapeHtml(approvalReason(item))}</div>
       <div class="approval-actions">
-        <button class="good" data-approval="${escapeHtml(item.id)}" data-decision="allow_once">Once</button>
-        <button class="secondary" data-approval="${escapeHtml(item.id)}" data-decision="remember_command">Remember</button>
-        <button class="secondary" data-approval="${escapeHtml(item.id)}" data-decision="allow_all_session">All session</button>
+        <button class="good" data-approval="${escapeHtml(item.id)}" data-decision="allow_once">Allow once</button>
+        <button class="secondary" data-approval="${escapeHtml(item.id)}" data-decision="remember_command">Remember command</button>
+        <button class="secondary" data-approval="${escapeHtml(item.id)}" data-decision="allow_all_session">Allow all session</button>
         <button class="danger" data-approval="${escapeHtml(item.id)}" data-decision="deny">Deny</button>
       </div>
     </div>`)
     .join("");
 
+  document.body.classList.toggle("has-approvals", state.approvals.length > 0);
   if (!state.approvals.length) {
     el.approvalList.className = "muted";
     el.approvalList.innerHTML = "No pending approvals";
@@ -387,6 +439,84 @@ function renderDiffHtml(diffText) {
     else if (line.startsWith("diff --git") || line.startsWith("# ")) cls += " file";
     return `<span class="${cls}">${escapeHtml(line || " ")}</span>`;
   }).join("\n");
+}
+
+function attachmentTotalBytes(next = []) {
+  return next.reduce((total, item) => total + Number(item.bytes || 0), 0);
+}
+
+function fileToAttachment(file) {
+  return new Promise((resolve, reject) => {
+    if (!ALLOWED_IMAGE_TYPES.has(file.type)) {
+      reject(new Error(`Unsupported image type: ${file.type || file.name}`));
+      return;
+    }
+    if (file.size > MAX_IMAGE_BYTES) {
+      reject(new Error(`${file.name} is too large (max ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)}MB)`));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error(`Unable to read ${file.name}`));
+    reader.onload = () => {
+      const raw = String(reader.result || "");
+      const data = raw.includes(",") ? raw.slice(raw.indexOf(",") + 1) : raw;
+      resolve({
+        id: `att-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+        type: "image",
+        name: file.name || "image",
+        mimeType: file.type,
+        data,
+        bytes: file.size,
+      });
+    };
+    reader.readAsDataURL(file);
+  });
+}
+
+function renderAttachmentTray() {
+  if (!el.attachmentTray) return;
+  if (!state.attachments.length) {
+    el.attachmentTray.hidden = true;
+    el.attachmentTray.innerHTML = "";
+    return;
+  }
+  el.attachmentTray.hidden = false;
+  el.attachmentTray.innerHTML = state.attachments.map((item) => {
+    const src = attachmentSrc(item);
+    const kb = Math.max(1, Math.round(Number(item.bytes || 0) / 1024));
+    return `<div class="attachment-chip" data-attachment="${escapeHtml(item.id)}">
+      ${src ? `<img src="${escapeHtml(src)}" alt="${escapeHtml(item.name || "image")}" />` : ""}
+      <span>${escapeHtml(item.name || "image")} · ${kb}KB</span>
+      <button type="button" data-remove-attachment="${escapeHtml(item.id)}" aria-label="Remove attachment">×</button>
+    </div>`;
+  }).join("");
+}
+
+async function addAttachmentFiles(files) {
+  const list = [...(files || [])].filter((file) => ALLOWED_IMAGE_TYPES.has(file.type));
+  if (!list.length) return;
+  try {
+    const next = [...state.attachments];
+    for (const file of list) {
+      if (next.length >= MAX_ATTACHMENTS) throw new Error(`Too many images (max ${MAX_ATTACHMENTS})`);
+      const attachment = await fileToAttachment(file);
+      if (attachmentTotalBytes([...next, attachment]) > MAX_ATTACHMENTS_BYTES) {
+        throw new Error(`Images are too large (max ${Math.round(MAX_ATTACHMENTS_BYTES / 1024 / 1024)}MB total)`);
+      }
+      next.push(attachment);
+    }
+    state.attachments = next;
+    renderAttachmentTray();
+    pushEvent(`${list.length} image${list.length === 1 ? "" : "s"} attached`);
+  } catch (err) {
+    pushEvent(err.message);
+  }
+}
+
+function clearAttachments() {
+  state.attachments = [];
+  if (el.imageInput) el.imageInput.value = "";
+  renderAttachmentTray();
 }
 
 function closeDiffOverlay() {
@@ -510,12 +640,20 @@ function handleEvent(event) {
     pushEvent(`Tool: ${payload.tool || "tool"}`);
     return;
   }
-  if (type === "plan") {
+  if (type === "plan" || type === "replan") {
     pushEvent(`Plan: ${payload.plan?.summary || "created"}`);
     return;
   }
   if (type === "thought") {
     pushEvent(payload.content || "Thinking update");
+    return;
+  }
+  if (type === "log") {
+    pushEvent(payload.line || payload.message || "Log update");
+    return;
+  }
+  if (type === "model_call" || type === "planning_call" || type === "replanning_call") {
+    pushEvent("Model call started");
   }
 }
 
@@ -552,7 +690,7 @@ function connectEvents() {
   const eventTypes = [
     "snapshot", "ready", "message", "timeline", "timeline.update", "approval.request", "approval.resolved", "todos", "sessions",
     "task.start", "task.done", "task.error", "tool_use", "tool_start", "tool_end",
-    "plan", "replan", "thought", "log", "llm_response", "context.update",
+    "plan", "replan", "thought", "log", "model_call", "planning_call", "replanning_call", "llm_response", "context.update",
   ];
   for (const type of eventTypes) {
     source.addEventListener(type, (raw) => {
@@ -563,12 +701,16 @@ function connectEvents() {
 
 el.composer.addEventListener("submit", async (evt) => {
   evt.preventDefault();
-  const message = el.messageInput.value.trim();
-  if (!message || state.running) return;
+  let message = el.messageInput.value.trim();
+  if ((!message && !state.attachments.length) || state.running) return;
+  if (!message && state.attachments.length) message = "Please inspect the attached image.";
+  const attachments = state.attachments.map(({ type, name, mimeType, data, bytes }) => ({ type, name, mimeType, data, bytes }));
   el.messageInput.value = "";
   try {
-    await postJson("/api/messages", { message, planOnly: el.planOnly.checked });
+    await postJson("/api/messages", { message, planOnly: el.planOnly.checked, attachments });
+    clearAttachments();
   } catch (err) {
+    el.messageInput.value = message;
     upsertTimeline({ id: `local-error-${Date.now()}`, type: "message", role: "error", content: err.message, at: new Date().toISOString() });
   }
 });
@@ -608,6 +750,33 @@ el.slashSuggestions.addEventListener("click", (evt) => {
   const button = evt.target.closest("button[data-command]");
   if (!button) return;
   applySuggestion(button.dataset.command);
+});
+
+el.attachBtn?.addEventListener("click", () => el.imageInput?.click());
+el.imageInput?.addEventListener("change", () => addAttachmentFiles(el.imageInput.files));
+el.attachmentTray?.addEventListener("click", (evt) => {
+  const button = evt.target.closest("button[data-remove-attachment]");
+  if (!button) return;
+  state.attachments = state.attachments.filter((item) => item.id !== button.dataset.removeAttachment);
+  renderAttachmentTray();
+});
+el.messageInput.addEventListener("paste", (evt) => {
+  const files = [...(evt.clipboardData?.files || [])].filter((file) => ALLOWED_IMAGE_TYPES.has(file.type));
+  if (files.length) addAttachmentFiles(files);
+});
+el.composer.addEventListener("dragover", (evt) => {
+  if ([...(evt.dataTransfer?.items || [])].some((item) => String(item.type || "").startsWith("image/"))) {
+    evt.preventDefault();
+    el.composer.classList.add("drag-over");
+  }
+});
+el.composer.addEventListener("dragleave", () => el.composer.classList.remove("drag-over"));
+el.composer.addEventListener("drop", (evt) => {
+  const files = [...(evt.dataTransfer?.files || [])].filter((file) => ALLOWED_IMAGE_TYPES.has(file.type));
+  if (!files.length) return;
+  evt.preventDefault();
+  el.composer.classList.remove("drag-over");
+  addAttachmentFiles(files);
 });
 
 el.slashHelpBtn.addEventListener("click", () => {
