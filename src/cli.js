@@ -2093,6 +2093,19 @@ function formatProviderWarning(provider) {
   return "warning: using Codex CLI fallback; native tools are disabled and startup/turns may be slower. Use Codex auth token/key or set PIECODE_DISABLE_CODEX_CLI=1 to fail fast.";
 }
 
+function abbreviateHomePath(targetPath, homeDir = os.homedir()) {
+  const raw = String(targetPath || "");
+  const home = String(homeDir || "");
+  if (!raw || !home) return raw;
+  const normalizedHome = path.resolve(home);
+  const normalizedRaw = path.resolve(raw);
+  if (normalizedRaw === normalizedHome) return "~";
+  if (normalizedRaw.startsWith(`${normalizedHome}${path.sep}`)) {
+    return `~${path.sep}${normalizedRaw.slice(normalizedHome.length + 1)}`;
+  }
+  return raw;
+}
+
 function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
   const width = Math.max(40, Number(terminalWidth) || 100);
   const center = (text) => {
@@ -2101,15 +2114,19 @@ function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
     const left = Math.max(0, Math.floor((width - clipped.length) / 2));
     return `${" ".repeat(left)}${clipped}`;
   };
-  const shortWorkspace = workspaceDir.length > 64 ? `...${workspaceDir.slice(-61)}` : workspaceDir;
+  const displayWorkspace = abbreviateHomePath(workspaceDir);
+  const shortWorkspace = displayWorkspace.length > 64 ? `...${displayWorkspace.slice(-61)}` : displayWorkspace;
+  const shortcutHint = "keys: CTRL+L logs | CTRL+T todos | CTRL+O llm debug | /attach image";
   const logoLines = [
     `[banner-title-inline] ${center(" Pie Code  let's cook")}`,
     `[banner-meta] ${center(`model: ${formatProviderModel(provider)}`)}`,
     `[banner-meta] ${center(`workspace: ${shortWorkspace}`)}`,
-    `[banner-hint] ${center("keys: CTRL+L logs | CTRL+T todos | CTRL+O llm debug | /attach image")}`,
   ];
   for (const line of logoLines) {
     tui.event(line);
+  }
+  if (typeof tui.setStartupShortcutHint === "function") {
+    tui.setStartupShortcutHint(shortcutHint);
   }
   const warning = formatProviderWarning(provider);
   if (warning) tui.event(warning);

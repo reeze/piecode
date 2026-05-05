@@ -241,6 +241,11 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines("[banner-meta] model: seed:model")[0])).toContain("model: seed:model");
     expect(stripAnsi(tui.formatTimelineLines("[banner-hint] keys: CTRL+L | !cmd shell")[0])).toContain("keys: CTRL+L");
     expect(stripAnsi(tui.formatTimelineLines("[banner-hint] keys: CTRL+L | !cmd shell")[0])).toContain("!cmd shell");
+    tui.start();
+    tui.setStartupShortcutHint("keys: CTRL+L logs | CTRL+T todos");
+    expect(latestFrame(out)).toContain("keys: CTRL+L logs | CTRL+T todos");
+    tui.beginTurn();
+    expect(latestFrame(out)).not.toContain("keys: CTRL+L logs | CTRL+T todos");
     expect(tui.formatTimelineLines("[thinking] internal details")).toEqual([]);
     expect(tui.formatTimelineLines("[thinking] request:turn payload-here")).toEqual([]);
     expect(tui.formatTimelineLines("[thought] I should inspect files first")).toEqual([]);

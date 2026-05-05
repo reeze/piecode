@@ -714,6 +714,7 @@ export class SimpleTui {
     this.approvalMeta = null;
     this.approvalDefaultYes = false;
     this.inputHint = "";
+    this.startupShortcutHint = "";
     this.inputHints = sanitizeInputHints(DEFAULT_INPUT_HINTS);
     this.inputHintIndex = 0;
     this.currentInput = "";
@@ -874,6 +875,7 @@ export class SimpleTui {
 
   beginTurn() {
     this.showProjectInstructionsStatus = false;
+    this.startupShortcutHint = "";
     this.transientStatusNotice = "";
     this.turnTokensSent = 0;
     this.turnTokensReceived = 0;
@@ -1125,6 +1127,17 @@ export class SimpleTui {
   clearInputHint() {
     if (!this.inputHint) return;
     this.inputHint = "";
+    this.render();
+  }
+
+  setStartupShortcutHint(hint) {
+    this.startupShortcutHint = String(hint || "").trim();
+    this.render();
+  }
+
+  clearStartupShortcutHint() {
+    if (!this.startupShortcutHint) return;
+    this.startupShortcutHint = "";
     this.render();
   }
 
@@ -1973,6 +1986,7 @@ export class SimpleTui {
         (modelSuggestionViewport.hiddenBelow > 0 ? 1 : 0)
       : 0;
     const hintLines = this.inputHint ? 1 : 0;
+    const shortcutHintLines = this.startupShortcutHint ? 1 : 0;
     const rawTaskContextLine = this.formatTaskContextLine(width);
     const taskContextLines = rawTaskContextLine ? 2 : 0;
     const thinkingLines = this.thinking ? 1 : 0;
@@ -1980,7 +1994,7 @@ export class SimpleTui {
     const thoughtStreamLines = 0;
     const inputState = this.buildInputState(this.currentInput, bottomWidth, cursorIndex);
     const inputLineCount = Math.max(1, inputState.lines.length);
-    const bottomLines = inputLineCount + 4 + commandSuggestionLines + modelSuggestionLines + hintLines; // input + pickers + separators + status/hint
+    const bottomLines = inputLineCount + 4 + commandSuggestionLines + modelSuggestionLines + hintLines + shortcutHintLines; // input + pickers + separators + status/hints
     const reservedLines =
       headerLines +
       todoBlockLines +
@@ -2114,6 +2128,7 @@ export class SimpleTui {
       ...modelSuggestionBlock,
       sep,
       `\x1b[2m${promptStatus}\x1b[0m`,
+      ...(this.startupShortcutHint ? [`\x1b[2m${truncateLine(` ${this.startupShortcutHint}`, bottomWidth)}\x1b[0m`] : []),
       ...(this.inputHint ? [`\x1b[2m${truncateLine(` ${this.inputHint}`, bottomWidth)}\x1b[0m`] : []),
     ];
 
@@ -2133,7 +2148,10 @@ export class SimpleTui {
         inputLines: inputComposite,
         statusLine: promptStatus,
         separatorGlyph: this.unicodeSymbols ? "─" : "-",
-        hintLine: this.inputHint ? truncateLine(` ${this.inputHint}`, bottomWidth) : "",
+        hintLine: [
+          this.startupShortcutHint ? truncateLine(` ${this.startupShortcutHint}`, bottomWidth) : "",
+          this.inputHint ? truncateLine(` ${this.inputHint}`, bottomWidth) : "",
+        ].filter(Boolean).join("\n"),
         cursorRowOffset: Math.max(0, inputState.cursorRowOffset),
         cursorCol: inputState.cursorCol,
       });

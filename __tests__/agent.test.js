@@ -82,6 +82,29 @@ describe("agent context controls", () => {
     expect(agent.history).toHaveLength(2);
   });
 
+  test("compactHistory emits thinking_done after its planning LLM request", async () => {
+    const events = [];
+    const agent = createAgentWithProvider({
+      async complete() {
+        return "- compact summary";
+      },
+    });
+    agent.onEvent = (evt) => events.push(evt);
+    agent.history = [
+      { role: "user", content: "u1" },
+      { role: "assistant", content: "a1" },
+      { role: "user", content: "u2" },
+      { role: "assistant", content: "a2" },
+    ];
+
+    await agent.compactHistory({ preserveRecent: 2 });
+
+    const requestIndex = events.findIndex((evt) => evt?.type === "llm_request" && evt?.stage === "planning");
+    const doneIndex = events.findIndex((evt) => evt?.type === "thinking_done");
+    expect(requestIndex).toBeGreaterThanOrEqual(0);
+    expect(doneIndex).toBeGreaterThan(requestIndex);
+  });
+
   test("maybeAutoCompact compacts before a turn when estimated history exceeds threshold", async () => {
     const contextWindowRef = { value: 120 };
     const events = [];

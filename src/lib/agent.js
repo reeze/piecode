@@ -332,6 +332,8 @@ export class Agent {
       this.emitLlmResponse("planning", raw);
     } catch {
       // fall back to deterministic summary without failing user command
+    } finally {
+      this.onEvent?.({ type: "thinking_done" });
     }
 
     const summaryMessage = [
