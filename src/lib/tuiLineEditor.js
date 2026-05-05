@@ -1,3 +1,47 @@
+const graphemeSegmenter =
+  typeof Intl !== "undefined" && typeof Intl.Segmenter === "function"
+    ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+    : null;
+
+function graphemeBoundaries(text) {
+  const source = String(text || "");
+  const out = [0];
+  if (graphemeSegmenter) {
+    for (const part of graphemeSegmenter.segment(source)) {
+      const next = Number(part.index) + String(part.segment || "").length;
+      if (next > out[out.length - 1]) out.push(next);
+    }
+  } else {
+    let idx = 0;
+    for (const ch of source) {
+      idx += ch.length;
+      out.push(idx);
+    }
+  }
+  if (out[out.length - 1] !== source.length) out.push(source.length);
+  return out;
+}
+
+function previousGraphemeIndex(text, cursor) {
+  const safeCursor = Math.max(0, Math.min(String(text || "").length, Number(cursor) || 0));
+  const boundaries = graphemeBoundaries(text);
+  let previous = 0;
+  for (const boundary of boundaries) {
+    if (boundary >= safeCursor) return previous;
+    previous = boundary;
+  }
+  return previous;
+}
+
+function nextGraphemeIndex(text, cursor) {
+  const source = String(text || "");
+  const safeCursor = Math.max(0, Math.min(source.length, Number(cursor) || 0));
+  for (const boundary of graphemeBoundaries(source)) {
+    if (boundary > safeCursor) return boundary;
+  }
+  return source.length;
+}
+
 export class TuiLineEditor {
   constructor({
     keypressSource,
@@ -178,11 +222,11 @@ export class TuiLineEditor {
     }
 
     if (name === "left") {
-      this.cursor = Math.max(0, this.cursor - 1);
+      this.cursor = previousGraphemeIndex(this.line, this.cursor);
       return;
     }
     if (name === "right") {
-      this.cursor = Math.min(this.line.length, this.cursor + 1);
+      this.cursor = nextGraphemeIndex(this.line, this.cursor);
       return;
     }
     if (name === "home") {
@@ -196,13 +240,15 @@ export class TuiLineEditor {
 
     if (name === "backspace") {
       if (this.cursor <= 0) return;
-      this.line = `${this.line.slice(0, this.cursor - 1)}${this.line.slice(this.cursor)}`;
-      this.cursor -= 1;
+      const previous = previousGraphemeIndex(this.line, this.cursor);
+      this.line = `${this.line.slice(0, previous)}${this.line.slice(this.cursor)}`;
+      this.cursor = previous;
       return;
     }
     if (name === "delete") {
       if (this.cursor >= this.line.length) return;
-      this.line = `${this.line.slice(0, this.cursor)}${this.line.slice(this.cursor + 1)}`;
+      const next = nextGraphemeIndex(this.line, this.cursor);
+      this.line = `${this.line.slice(0, this.cursor)}${this.line.slice(next)}`;
       return;
     }
 

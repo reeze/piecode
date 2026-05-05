@@ -125,6 +125,24 @@ describe('Prompt functions', () => {
       expect(prompt).toContain('finalize from the evidence already collected');
     });
 
+    test('should include long-running task discipline', () => {
+      const prompt = buildSystemPrompt({
+        workspaceDir: '/test/workspace',
+        autoApprove: false,
+        nativeTools: true,
+      });
+
+      expect(prompt).toContain('LONG TASK LOOP');
+      expect(prompt).toContain('EXPLORATION DISCIPLINE');
+      expect(prompt).toContain('VALIDATION LADDER');
+      expect(prompt).toContain('WORKTREE SAFETY');
+      expect(prompt).toContain('DONE CRITERIA');
+      expect(prompt).toContain('changed files, validation, blockers, and next step');
+      expect(prompt).toContain('brief progress syncs');
+      expect(prompt).toContain('Do not expand file diffs by default');
+      expect(prompt).toContain('Treat uncommitted changes as user-owned');
+    });
+
     test('should include todo tracking conventions in text mode', () => {
       const prompt = buildSystemPrompt({
         workspaceDir: '/test/workspace',
@@ -137,6 +155,8 @@ describe('Prompt functions', () => {
       expect(prompt).toContain('Before editing existing files, read them first');
       expect(prompt).toContain('Prefer targeted edits');
       expect(prompt).toContain('write_file is for new files or explicit rewrites');
+      expect(prompt).toContain('before tool calls, briefly say what context you are gathering');
+      expect(prompt).toContain('show diffs only when the user asks for review');
     });
   });
 

@@ -8,6 +8,19 @@ const GIT_RELATED_BASENAMES = new Set([
   ".gitkeep",
 ]);
 
+const RESERVED_CONTEXT_MENTIONS = [
+  "diff",
+  "diff:staged",
+  "git:status",
+  "memory",
+  "memory:project",
+  "memory:global",
+  "last-run",
+  "workspace",
+  "dir:",
+  "glob:",
+];
+
 function clampCursor(text, cursor) {
   const value = Number.isFinite(cursor) ? Math.floor(cursor) : text.length;
   return Math.max(0, Math.min(text.length, value));
@@ -85,6 +98,10 @@ export function scoreFilePath(candidatePath, query) {
 export function getFileMentionSuggestions(line, cursor, filePaths, max = 8) {
   const mention = parseActiveFileMention(line, cursor);
   if (!mention) return { mention: null, suggestions: [] };
+  const q = String(mention.query || "").toLowerCase().trim();
+  const reserved = RESERVED_CONTEXT_MENTIONS
+    .filter((item) => !q || item.startsWith(q) || item.includes(q))
+    .map((item) => ({ filePath: item, score: item.startsWith(q) ? 1200 - item.length : 700 - item.length }));
   const candidates = Array.isArray(filePaths) ? filePaths : [];
   const scored = candidates
     .map((filePath) => {
@@ -100,9 +117,16 @@ export function getFileMentionSuggestions(line, cursor, filePaths, max = 8) {
     });
 
   const limit = Math.max(1, Math.min(50, Number(max) || 8));
+  const merged = [...reserved, ...scored]
+    .filter((item, index, arr) => arr.findIndex((candidate) => candidate.filePath === item.filePath) === index)
+    .sort((a, b) => {
+      if (b.score !== a.score) return b.score - a.score;
+      if (a.filePath.length !== b.filePath.length) return a.filePath.length - b.filePath.length;
+      return a.filePath.localeCompare(b.filePath);
+    });
   return {
     mention,
-    suggestions: scored.slice(0, limit).map((item) => item.filePath),
+    suggestions: merged.slice(0, limit).map((item) => item.filePath),
   };
 }
 

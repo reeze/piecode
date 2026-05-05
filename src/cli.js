@@ -53,6 +53,7 @@ import {
 } from "./lib/tmuxSubagentWindows.js";
 import { classifyShellCommand } from "./lib/tools.js";
 import { applyFileMentionSelection, getFileMentionSuggestions, isGitRelatedPath } from "./lib/fileMentions.js";
+import { buildFileMentionContext } from "./lib/fileMentionContext.js";
 import { formatAttachmentSummary, readClipboardImage } from "./lib/attachments.js";
 import { loadMemory } from "./lib/memory.js";
 import { loadAgentDefinitions } from "./lib/agentDefinitions.js";
@@ -81,6 +82,7 @@ const SLASH_COMMANDS = [
   "/status",
   "/agents",
   "/plan",
+  "/goal",
   "/approve",
   "/trace",
   "/debug",
@@ -641,6 +643,7 @@ Slash commands in interactive mode:
   /agents              Show active and recent subagents
   /plan on|off         Toggle plan mode (safe read-only tools allowed; no file changes)
   /plan                Show current plan mode
+  /goal <task>         Run a goal-driven loop: clarify, plan, execute, and verify acceptance
   /approve on|off      Toggle shell auto-approval
   /trace on|off        Toggle runtime trace logs (timings/stages)
   /debug               Show debug status, trace/session paths, and recent error/LLM info
@@ -2483,13 +2486,69 @@ async function maybeAutoEnablePlugins(input, activePluginsRef, pluginIndex, logL
   }
 }
 
+function buildGoalPrompt(goal) {
+  const task = String(goal || "").trim();
+  return [
+    "You are running in PieCode goal mode for the following long-running user goal:",
+    task,
+    "",
+    "Goal-mode requirements:",
+    "1. Treat this as a durable, multi-turn goal loop, not a short single response.",
+    "2. Understand the goal before acting. Restate the goal, identify constraints, and infer explicit acceptance criteria.",
+    "3. If the request is blocked, unsafe, or critically ambiguous, ask exactly one clarifying question and mark the goal blocked; otherwise proceed.",
+    "4. Create and maintain a concise TODO plan for multi-step work.",
+    "5. Inspect the repository/context before editing; do not guess file contents or APIs.",
+    "6. Implement focused changes in coherent slices, then reassess global progress toward the acceptance criteria.",
+    "7. Verify acceptance with the most relevant practical tests/lint/typecheck/build or focused commands.",
+    "8. Keep driving the task until acceptance is satisfied, blocked by the user/environment, or the controller asks you to stop.",
+    "",
+    "At the end of every goal-mode response, include exactly one status line:",
+    "GOAL_STATUS: continue  # more work remains and you can keep driving it",
+    "GOAL_STATUS: complete  # acceptance criteria are satisfied and validation was attempted",
+    "GOAL_STATUS: blocked   # cannot safely continue without user input or external unblocker",
+    "",
+    "If GOAL_STATUS is complete or blocked, include a concise final summary with validation and remaining risks.",
+  ].join("\n");
+}
+
+function buildGoalContinuationPrompt(goal, iteration, previousOutput) {
+  const task = String(goal || "").trim();
+  const last = summarizeForLog(previousOutput, 1200);
+  return [
+    `Goal supervisor loop iteration ${iteration}: continue driving the long-running goal until accepted.`,
+    `Goal: ${task}`,
+    "",
+    "Use the conversation history, current TODO state, and repository state as the source of truth.",
+    "Reassess global progress, pick the next highest-value action, execute it, and verify when appropriate.",
+    "Do not repeat completed work. If acceptance is now satisfied, finish with GOAL_STATUS: complete.",
+    "If you cannot safely continue without user input or an external blocker, finish with GOAL_STATUS: blocked.",
+    "Otherwise finish with GOAL_STATUS: continue.",
+    "",
+    `Previous goal-mode response summary: ${last}`,
+  ].join("\n");
+}
+
+function parseGoalStatus(output) {
+  const text = String(output || "");
+  const matches = [...text.matchAll(/^\s*GOAL_STATUS\s*:\s*(complete|continue|blocked)\b/gim)];
+  if (matches.length === 0) return "continue";
+  return String(matches[matches.length - 1][1] || "continue").toLowerCase();
+}
+
 async function runAgentTurn(agent, input, tui, logLine, display, workspaceDir, options = {}) {
   const startedAt = Date.now();
   const planOnly = Boolean(options?.planOnly);
   const attachments = Array.isArray(options?.attachments) ? options.attachments : [];
+  const mentionContext = await buildFileMentionContext(input, { cwd: workspaceDir, memoryRef: agent.memoryRef });
+  const modelInput = mentionContext.prompt;
+  if (mentionContext.mentions.some((item) => item.status === "inline" || item.status === "preview")) {
+    const inlineCount = mentionContext.mentions.filter((item) => item.status === "inline").length;
+    const previewCount = mentionContext.mentions.filter((item) => item.status === "preview").length;
+    logLine(`[context] attached ${inlineCount} referenced file(s), ${previewCount} preview(s)`);
+  }
   if (tui) tui.beginTurn();
   try {
-    const result = await agent.runTurn(input, { planOnly, attachments });
+    const result = await agent.runTurn(modelInput, { planOnly, attachments });
     const durationMs = Date.now() - startedAt;
     if (tui) tui.onTurnSuccess(durationMs);
     const output = typeof result === "string" ? result : JSON.stringify(result, null, 2);
@@ -2507,7 +2566,7 @@ async function runAgentTurn(agent, input, tui, logLine, display, workspaceDir, o
     } else {
       console.log(`\n${output}`);
     }
-    return { ok: true, aborted: false, error: "" };
+    return { ok: true, aborted: false, error: "", output, durationMs };
   } catch (err) {
     const aborted = isTaskAbortError(err);
     if (tui) {
@@ -2864,6 +2923,7 @@ async function handleSlashCommand(input, ctx) {
         "/btw <question>",
         "/agents",
         "/plan",
+        "/goal <task>",
         "/approve on|off",
         "/trace on|off",
         "/debug",
@@ -3006,6 +3066,21 @@ async function handleSlashCommand(input, ctx) {
       logLine("usage: /plan on|off");
     }
     return { done: false, handled: true };
+  }
+  if (lower === "/goal" || lower.startsWith("/goal ")) {
+    const goal = raw.replace(/^\/goal(?:\s+|$)/i, "").trim();
+    if (!goal) {
+      logLine("usage: /goal <task>");
+      logLine("goal mode loops until the agent reports acceptance complete, blocked, or the max turn limit is reached");
+      return { done: false, handled: true };
+    }
+    ctx.commandRunRef = ctx.commandRunRef || { value: null };
+    ctx.commandRunRef.value = {
+      input: buildGoalPrompt(goal),
+      displayName: "/goal",
+      goal,
+    };
+    return { done: false, handled: false, commandRun: ctx.commandRunRef.value };
   }
   if (lower.startsWith("/approve")) {
     const mode = normalized.split(/\s+/)[1]?.toLowerCase();
@@ -5423,7 +5498,13 @@ async function main() {
 
       try {
         clearPendingRequestTokens();
-        const result = await agent.runTurn(args.prompt, { planOnly: planModeRef.value });
+        const mentionContext = await buildFileMentionContext(args.prompt, { cwd: workspaceDir, memoryRef });
+        if (mentionContext.mentions.some((item) => item.status === "inline" || item.status === "preview")) {
+          const inlineCount = mentionContext.mentions.filter((item) => item.status === "inline").length;
+          const previewCount = mentionContext.mentions.filter((item) => item.status === "preview").length;
+          console.log(`attached referenced files: ${inlineCount} inline, ${previewCount} preview`);
+        }
+        const result = await agent.runTurn(mentionContext.prompt, { planOnly: planModeRef.value });
         const output = typeof result === "string" ? result : JSON.stringify(result, null, 2);
         if (display) {
           display.onResponse(output);
@@ -5702,11 +5783,22 @@ async function main() {
 
     const commandRun = commandRunRef.value;
     commandRunRef.value = null;
-    const agentInput = commandRun?.input || finalInput;
+    let agentInput = commandRun?.input || finalInput;
+    const goalRun = commandRun?.goal
+      ? {
+          goal: commandRun.goal,
+          iteration: 1,
+          maxIterations: Math.max(1, Number.parseInt(process.env.PIECODE_GOAL_MAX_TURNS || "12", 10) || 12),
+          lastOutput: "",
+          status: "continue",
+        }
+      : null;
     if (commandRun) {
       startTaskTrace(taskTraceRef, { sessionBus, input: finalInput, kind: "agent" });
       const owner = commandRun.skillName || commandRun.pluginName || "";
-      logLine(`[task] ${commandRun.displayName} ${owner ? `(${owner})` : ""}`.trim());
+      const goalSummary = commandRun.goal ? ` ${summarizeForLog(commandRun.goal, 180)}` : "";
+      logLine(`[task] ${commandRun.displayName}${goalSummary} ${owner ? `(${owner})` : ""}`.trim());
+      if (goalRun) logLine(`[goal] loop started (max ${goalRun.maxIterations} turns)`);
       if (tui) tui.setProjectInstructionsVisible(false);
     }
 
@@ -5727,17 +5819,36 @@ async function main() {
       logLine(`[attachments] ${turnAttachments.map((item) => formatAttachmentSummary(item)).join(", ")}`);
     }
     taskRunningRef.value = true;
+    let turnResult = null;
     try {
-      clearPendingRequestTokens();
-      const turnResult = await runAgentTurn(
-        agent,
-        agentInput,
-        tui,
-        logLine,
-        display,
-        workspaceDir,
-        { planOnly: planModeRef.value, attachments: turnAttachments }
-      );
+      while (true) {
+        clearPendingRequestTokens();
+        turnResult = await runAgentTurn(
+          agent,
+          agentInput,
+          tui,
+          logLine,
+          display,
+          workspaceDir,
+          {
+            planOnly: planModeRef.value,
+            attachments: goalRun && goalRun.iteration > 1 ? [] : turnAttachments,
+          }
+        );
+        if (!turnResult?.ok || !goalRun) break;
+
+        goalRun.lastOutput = turnResult.output || "";
+        goalRun.status = parseGoalStatus(goalRun.lastOutput);
+        logLine(`[goal] status=${goalRun.status} turn=${goalRun.iteration}/${goalRun.maxIterations}`);
+        if (goalRun.status === "complete" || goalRun.status === "blocked") break;
+        if (goalRun.iteration >= goalRun.maxIterations) {
+          logLine("[goal] max goal turns reached; stopping for user review");
+          break;
+        }
+        goalRun.iteration += 1;
+        agentInput = buildGoalContinuationPrompt(goalRun.goal, goalRun.iteration, goalRun.lastOutput);
+      }
+
       const saved = await finishTaskTrace(taskTraceRef, workspaceDir, {
         status: turnResult?.ok ? "done" : turnResult?.aborted ? "aborted" : "error",
         error: turnResult?.ok ? "" : String(turnResult?.error || ""),

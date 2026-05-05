@@ -145,6 +145,24 @@ describe("tui line editor", () => {
     rl.close();
   });
 
+  test("cursor movement and deletion are grapheme-aware for CJK and emoji", () => {
+    const source = new EventEmitter();
+    const rl = new TuiLineEditor({ keypressSource: source });
+
+    rl.write("中文🙂a");
+    expect(rl.cursor).toBe("中文🙂a".length);
+    rl.handleKeypress("", { name: "left" }, { allowWithoutPending: true });
+    expect(rl.cursor).toBe("中文🙂".length);
+    rl.handleKeypress("", { name: "left" }, { allowWithoutPending: true });
+    expect(rl.cursor).toBe("中文".length);
+    rl.handleKeypress("", { name: "backspace" }, { allowWithoutPending: true });
+    expect(rl.line).toBe("中🙂a");
+    expect(rl.cursor).toBe("中".length);
+    rl.handleKeypress("", { name: "delete" }, { allowWithoutPending: true });
+    expect(rl.line).toBe("中a");
+    rl.close();
+  });
+
   test("ignores keypresses when shouldHandleKeypress blocks input", async () => {
     const source = new EventEmitter();
     let blocked = true;

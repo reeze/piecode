@@ -41,6 +41,13 @@ describe("file mentions", () => {
     expect(out.suggestions).not.toContain(".gitignore");
   });
 
+  test("suggests reserved context mentions", () => {
+    const out = getFileMentionSuggestions("look at @mem", 12, ["src/memory.js"], 5);
+    expect(out.mention?.query).toBe("mem");
+    expect(out.suggestions).toContain("memory");
+    expect(out.suggestions).toContain("memory:project");
+  });
+
   test("replaces active token with selected file path", () => {
     const out = applyFileMentionSelection("check @src/li first", 13, "src/lib/tui.js");
     expect(out).toMatchObject({

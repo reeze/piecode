@@ -166,7 +166,30 @@ describe("tui usability", () => {
     expect(plain[toolIdx - 1]).toBe("");
     expect(plain[resultIdx - 1]).toBe("");
     expect(plain[responseIdx - 1]).toBe("");
+    expect(plain[resultIdx]).toMatch(/^\S/);
+    expect(plain[resultIdx + 1]).toMatch(/^  \S/);
     expect(taskIdx).toBeLessThan(toolIdx);
+  });
+
+  test("timeline wraps long entries with readable continuation indentation", () => {
+    const out = createOut(42, 18);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.event("[response] " + "alpha beta gamma delta epsilon zeta eta theta iota kappa lambda");
+    tui.render();
+
+    const frameLines = latestFrame(out).split("\n");
+    const responseLines = frameLines.filter((line) => line.includes("alpha") || /^\s{4,}\S/.test(line));
+    expect(responseLines.length).toBeGreaterThan(1);
+    expect(responseLines[0]).toMatch(/^\s*(?:•|\*)\s/);
+    expect(responseLines.slice(1).some((line) => /^\s{4}\S/.test(line))).toBe(true);
   });
 
   test("formatTimelineLines maps key event types and hides thinking noise", () => {
@@ -187,8 +210,17 @@ describe("tui usability", () => {
     const failIcon = tui.symbols.fail;
     expect(tui.formatTimelineLines("[model] seed-openai-compatible:doubao")).toEqual([]);
     expect(tui.formatTimelineLines("[plan] budget=3 - scoped plan")).toEqual([]);
-    expect(stripAnsi(tui.formatTimelineLines('[run] shell command="echo hi"')[0])).toContain("Run echo hi");
-    expect(stripAnsi(tui.formatTimelineLines("[run] shell echo hi")[0])).toContain("Run echo hi");
+    expect(stripAnsi(tui.formatTimelineLines('[run] shell command="echo hi"')[0])).toContain("Shell echo hi");
+    expect(stripAnsi(tui.formatTimelineLines("[run] shell echo hi")[0])).toContain("Shell echo hi");
+    expect(stripAnsi(tui.formatTimelineLines("[run] test npm test -- --runInBand __tests__")[0])).toContain(
+      "Test npm test -- --runInBand __tests__"
+    );
+    expect(stripAnsi(tui.formatTimelineLines('[run] collaborate {"task":"Review the UI state"}')[0])).toContain(
+      "Agents Review the UI state"
+    );
+    expect(stripAnsi(tui.formatTimelineLines("[progress] Checking the UI path before editing")[0])).toContain(
+      "Checking the UI path before editing"
+    );
     expect(tui.formatTimelineLines("[tool] shell (echo hi)")).toEqual([]);
     expect(tui.formatTimelineLines("[tool] todo_write (3 todos)")).toEqual([]);
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("Read");
@@ -202,16 +234,16 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines("[result] shell failed | time: 2s")[0])).toContain(
       `${failIcon} shell failed | time: 2s`
     );
-    expect(stripAnsi(tui.formatTimelineLines("[tool-result] 1 file changed, 1 insertion(+), 1 deletion(-)")[0])).toContain(
-      "1 file changed, 1 insertion(+), 1 deletion(-)"
-    );
+    const toolResultLine = stripAnsi(tui.formatTimelineLines("[tool-result] 1 file changed, 1 insertion(+), 1 deletion(-)")[0]);
+    expect(toolResultLine).toContain("1 file changed, 1 insertion(+), 1 deletion(-)");
+    expect(toolResultLine).toMatch(/^\S/);
     expect(stripAnsi(tui.formatTimelineLines("[banner-1] ██████")[0])).toContain("██████");
     expect(stripAnsi(tui.formatTimelineLines("[banner-meta] model: seed:model")[0])).toContain("model: seed:model");
     expect(stripAnsi(tui.formatTimelineLines("[banner-hint] keys: CTRL+L | !cmd shell")[0])).toContain("keys: CTRL+L");
     expect(stripAnsi(tui.formatTimelineLines("[banner-hint] keys: CTRL+L | !cmd shell")[0])).toContain("!cmd shell");
     expect(tui.formatTimelineLines("[thinking] internal details")).toEqual([]);
     expect(tui.formatTimelineLines("[thinking] request:turn payload-here")).toEqual([]);
-    expect(stripAnsi(tui.formatTimelineLines("[thought] I should inspect files first")[0])).toContain("Thinking: I should inspect files first");
+    expect(tui.formatTimelineLines("[thought] I should inspect files first")).toEqual([]);
     expect(stripAnsi(tui.formatTimelineLines("[agent] start subagent-1: inspect providers")[0])).toContain("Agent start subagent-1");
     const markdownResponse = stripAnsi(
       tui.formatTimelineLines("[response] ## Title\n- **bold** and `code`")[1]
@@ -228,9 +260,20 @@ describe("tui usability", () => {
     const codeResponse = stripAnsi(
       tui.formatTimelineLines("[response] ```js\nconst x = 1;\n```").join("\n")
     );
-    expect(codeResponse).toContain("js ----");
     expect(codeResponse).toContain("const x = 1;");
+    expect(codeResponse).not.toContain("JavaScript");
+    expect(codeResponse).not.toContain("js");
+    expect(codeResponse).not.toContain("----");
     expect(codeResponse).not.toContain("```");
+    const markdownCodeResponse = stripAnsi(
+      tui.formatTimelineLines("[response] ```markdown\n# Title\n``` ".trim()).join("\n")
+    );
+    expect(markdownCodeResponse).toContain("# Title");
+    expect(markdownCodeResponse).not.toContain("Markdown");
+    const hrResponse = stripAnsi(tui.formatTimelineLines("[response] before\n------\nafter").join("\n"));
+    expect(hrResponse).toContain("before");
+    expect(hrResponse).toContain("after");
+    expect(hrResponse).not.toContain("------");
     const plainResponse = stripAnsi(tui.formatTimelineLines("[response] hello world")[0]);
     expect(plainResponse.trim()).toBe(`${tui.symbols.response} hello world`);
     expect(plainResponse).not.toContain("Assistant:");
@@ -836,7 +879,7 @@ describe("tui usability", () => {
     expect(lastWrite).toContain(`\x1b[${tui.lastInputRow};10H`);
   });
 
-  test("live thought content is rendered in status bar, not workspace", () => {
+  test("live thought content is rendered only in transient status, not workspace timeline", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
       out,
@@ -847,11 +890,17 @@ describe("tui usability", () => {
     });
 
     tui.start();
+    tui.onThinking("turn");
     tui.setLiveThought("inspect files first");
     let frame = latestFrame(out);
-    expect(frame).toContain("thinking...");
-    expect(frame).not.toContain("inspect files first");
+    expect(frame).toContain("thinking");
+    expect(frame).toContain("inspect files first");
+    expect(tui.timeline.map(stripAnsi).join("\n")).not.toContain("inspect files first");
     expect(tui.thoughtStreamVisible).toBe(false);
+    tui.event("[thought] inspect files first");
+    frame = latestFrame(out);
+    expect(tui.timeline.map(stripAnsi).join("\n")).not.toContain("inspect files first");
+    expect((frame.match(/inspect files first/g) || []).length).toBe(1);
     tui.clearLiveThought();
     frame = latestFrame(out);
     expect(tui.thoughtStreamVisible).toBe(false);
@@ -943,6 +992,44 @@ describe("tui usability", () => {
     const frame = latestFrame(out);
     expect(frame).toContain("Ready. Type /help for commands.");
     expect(frame).toContain("请实现在退出的时候");
+  });
+
+  test("wide character input positions cursor by display columns", () => {
+    const out = createOut(80, 18);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.renderInput("中文", "中文".length);
+    const raw = out.writes[out.writes.length - 1] || "";
+    expect(tui.lastInputLine).toContain("中文");
+    expect(raw).toContain(`\x1b[${tui.lastInputRow};8H`);
+  });
+
+  test("renderInput repaints padded rows for CJK input", () => {
+    const out = createOut(42, 16);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.renderInput("这是一段中文", "这是一段中文".length);
+    const raw = out.writes[out.writes.length - 1] || "";
+    const plainLines = stripAnsi(raw).split("\n");
+    const inputLine = plainLines.find((line) => line.includes("这是一段中文"));
+    expect(raw.startsWith("\x1b[?25l\x1b[H\x1b[2J")).toBe(true);
+    expect(inputLine).toBeTruthy();
+    expect(inputLine.endsWith(" ")).toBe(true);
+    expect(inputLine.length).toBeGreaterThan("❯ 这是一段中文".length);
   });
 
   test("scrolling shows older content when overflowed", () => {

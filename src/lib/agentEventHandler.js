@@ -170,7 +170,7 @@ export function createAgentEventHandler(deps = {}) {
         llmStreamRef.value[evt.stage] = "";
       }
       if (tui && evt.stage === "turn") {
-        tui.setLiveThought("Analyzing request...");
+        tui.setLiveThought("Working...");
       }
       const sentTokens = estimateTokenCount(evt.payload);
       addPendingRequestTokens(evt.stage, sentTokens);
@@ -282,7 +282,7 @@ export function createAgentEventHandler(deps = {}) {
       const update = formatStageUpdate(evt.content);
       if (tui && update) tui.setLiveThought(update);
       if (display && update) display.onThought(update);
-      if (update) logLine?.(`[thought] ${update}`);
+      if (update) logLine?.(`[progress] ${update}`);
     }
     if (evt.type === "tool_batch_start") {
       recordTaskEvent?.(taskTraceRef, evt);
@@ -298,7 +298,7 @@ export function createAgentEventHandler(deps = {}) {
       if (tui) tui.onToolUse(evt.tool);
       if (tui && visibleThought) tui.setLiveThought(visibleThought);
       if (display && !evt.parallel) display.onToolUse(evt.tool, evt.input, evt.reason || evt.thought);
-      const summary = formatToolInputSummary(evt.tool, evt.input, 100);
+      if (visibleThought && !evt.parallel && !isTodoTool) logLine?.(`[progress] ${visibleThought}`);
       if (isTodoTool) {
         // keep todo activity in status bar only
       } else if (evt.parallel) {
@@ -310,10 +310,8 @@ export function createAgentEventHandler(deps = {}) {
         logLine?.(
           `[tool] ${evt.tool}${evt.reason ? ` - ${summarizeForLog(evt.reason, 120)}` : ""}${details ? ` (${details})` : ""}`
         );
-      } else {
-        logLine?.(`[tool] ${evt.tool}${summary ? ` (${summary})` : ""}`);
       }
-      if (visibleThought) logLine?.(`[thought] ${visibleThought}`);
+      if (visibleThought && (traceRef.value || verboseToolLogs)) logLine?.(`[thought] ${visibleThought}`);
     }
     if (evt.type === "tool_start") {
       recordTaskEvent?.(taskTraceRef, evt);

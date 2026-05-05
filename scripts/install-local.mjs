@@ -64,7 +64,7 @@ async function main() {
     env: npmEnv,
   });
 
-  const binDir = path.join(prefix, "bin");
+  const binDir = path.join(prefix, "node_modules", ".bin");
   console.log(`Installed to: ${prefix}`);
   console.log(`Binary path: ${path.join(binDir, "piecode")}`);
   console.log(`Add to PATH if needed: export PATH="${binDir}:$PATH"`);

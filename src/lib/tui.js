@@ -293,7 +293,7 @@ function parseMarkdownBlocks(text) {
       continue;
     }
 
-    if (/^\s*([-*_])\s*\1\s*\1[\s\1]*$/.test(line)) {
+    if (/^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) {
       flushParagraph();
       blocks.push({ type: "hr" });
       continue;
@@ -400,14 +400,8 @@ function renderMarkdownBlock(block) {
   switch (block.type) {
     case "blank":
       return [""];
-    case "code": {
-      const label = block.lang ? ` ${block.lang} ` : " code ";
-      return [
-        color(`${label}${"-".repeat(Math.max(8, 56 - label.length))}`, "2;37"),
-        ...block.lines.map((line) => color(line || " ", "36")),
-        color("-".repeat(56), "2;37"),
-      ];
-    }
+    case "code":
+      return block.lines.map((line) => color(line || " ", "36"));
     case "table":
       return Array.isArray(block.rendered) ? block.rendered : [];
     case "heading": {
@@ -417,7 +411,7 @@ function renderMarkdownBlock(block) {
       return [level <= 2 ? color(`${prefix} ${rendered}`, "1;36") : color(`${prefix} ${rendered}`, "1")];
     }
     case "hr":
-      return [color("-".repeat(56), "2;37")];
+      return [];
     case "quote":
       return (Array.isArray(block.lines) ? block.lines : []).map((item) => {
         const depth = Math.max(1, Number(item.depth) || 1);
@@ -514,10 +508,12 @@ function charDisplayWidth(ch) {
     (cp >= 0x2e80 && cp <= 0xa4cf) ||
     (cp >= 0xac00 && cp <= 0xd7a3) ||
     (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0x1f200 && cp <= 0x1f2ff) ||
     (cp >= 0xfe10 && cp <= 0xfe19) ||
     (cp >= 0xfe30 && cp <= 0xfe6f) ||
     (cp >= 0xff00 && cp <= 0xff60) ||
     (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x20000 && cp <= 0x3fffd) ||
     (cp >= 0x1f300 && cp <= 0x1faff)
   ) {
     return 2;
@@ -526,9 +522,18 @@ function charDisplayWidth(ch) {
 }
 
 function stringDisplayWidth(value) {
+  const text = String(value || "");
   let width = 0;
-  for (const ch of String(value || "")) {
-    width += charDisplayWidth(ch);
+  for (let i = 0; i < text.length;) {
+    const ansiMatch = text.slice(i).match(/^\x1b\[[0-9;?]*[ -/]*[@-~]/);
+    if (ansiMatch) {
+      i += ansiMatch[0].length;
+      continue;
+    }
+    const cp = text.codePointAt(i);
+    const char = cp != null && cp > 0xffff ? text.slice(i, i + 2) : text[i];
+    width += charDisplayWidth(char);
+    i += char.length;
   }
   return width;
 }
@@ -619,12 +624,29 @@ function padDisplayLine(line, width) {
   return `${truncated}${" ".repeat(pad)}`;
 }
 
+function renderFrameLines(lines, width) {
+  return (Array.isArray(lines) ? lines : []).map((line) => padDisplayLine(line, width)).join("\n");
+}
+
 function colorFullLine(line, code, width) {
   return color(padDisplayLine(line, width), code);
 }
 
 function hasBackgroundColor(line) {
   return /\x1b\[[0-9;]*4\d(?:;[0-9]*)*m|\x1b\[[0-9;]*48;[0-9;]*m/.test(String(line || ""));
+}
+
+function timelineContinuationIndent(line) {
+  const plain = stripAnsi(String(line || ""));
+  if (!plain.trim()) return "";
+  const leading = plain.match(/^\s*/)?.[0] || "";
+  const trimmed = plain.slice(leading.length);
+  if (/^(?:◆|\*)\s+Task:/i.test(trimmed)) return leading;
+  if (/^(?:↳|->)\s+/.test(trimmed)) return `${leading}  `;
+  if (/^(?:›|>)\s+/.test(trimmed)) return `${leading}  `;
+  if (/^(?:•|\*|✓|×|\[ok\]|\[x\]|\[i\])\s+/.test(trimmed)) return `${leading}  `;
+  if (leading.length > 0) return leading;
+  return "  ";
 }
 
 function wrapTimelineLine(line, width) {
@@ -634,7 +656,17 @@ function wrapTimelineLine(line, width) {
   if (hasBackgroundColor(line) && stringDisplayWidth(stripAnsi(line)) <= Math.max(0, Number(width) || 0)) {
     return [line];
   }
-  return wrapText(line, width);
+  const chunks = wrapText(line, width);
+  if (chunks.length <= 1) return chunks;
+  const indent = timelineContinuationIndent(line);
+  if (!indent) return chunks;
+  const continuationWidth = Math.max(8, Math.max(1, Number(width) || 1) - stringDisplayWidth(indent));
+  const out = [chunks[0]];
+  for (const chunk of chunks.slice(1)) {
+    const nested = wrapText(chunk, continuationWidth);
+    out.push(...nested.map((part) => (part ? `${indent}${part}` : "")));
+  }
+  return out;
 }
 
 export class SimpleTui {
@@ -1223,18 +1255,9 @@ export class SimpleTui {
     const renderedLines = renderMarkdownLines(rawText);
     const wrapped = [];
     const rawStartOffsets = [];
-    let inCode = false;
     for (const line of renderedLines) {
-      const plain = stripAnsi(line);
-      const codeBoundary = /^\s*(?:[\w.+-]+\s+)?-{8,}\s*$/.test(plain);
-      if (codeBoundary) {
-        inCode = !inCode;
-        rawStartOffsets.push(wrapped.length);
-        wrapped.push(truncateLine(line, width));
-        continue;
-      }
       rawStartOffsets.push(wrapped.length);
-      const chunks = inCode ? [truncateLine(line, width)] : wrapText(line, width);
+      const chunks = wrapText(line, width);
       if (chunks.length === 0) wrapped.push("");
       else wrapped.push(...chunks);
     }
@@ -1465,6 +1488,8 @@ export class SimpleTui {
           return `${color("Web search", "36")}${suffix}`;
         case "subagent":
           return `${color("Subagent", "36")}${suffix}`;
+        case "collaborate":
+          return `${color("Agents", "36")}${suffix}`;
         case "git_status":
           return color("Git status", "36");
         case "git_diff":
@@ -1482,6 +1507,63 @@ export class SimpleTui {
         default:
           return `${color(name, "36")}${suffix}`;
       }
+    };
+    const compactJsonDetail = (text, keys = ["task", "path", "query", "pattern", "command"]) => {
+      const source = String(text || "").trim();
+      if (!source.startsWith("{")) return "";
+      try {
+        const parsed = JSON.parse(source);
+        for (const key of keys) {
+          const value = parsed?.[key];
+          if (typeof value === "string" && value.trim()) return trimWorkspaceText(value.replace(/\s+/g, " "), 120).text;
+        }
+      } catch {
+        // keep empty
+      }
+      return "";
+    };
+    const runLabel = (raw) => {
+      const body = String(raw || "").trim();
+      const shellCommandMatch = body.match(/^shell\s+command=("[^"]*"|\S+)/);
+      if (shellCommandMatch?.[1]) {
+        let command = shellCommandMatch[1];
+        try {
+          command = JSON.parse(shellCommandMatch[1]);
+        } catch {
+          // use raw token
+        }
+        return { label: "Shell", detail: String(command || "").trim() };
+      }
+      const shellMatch = body.match(/^shell\s+(.+)$/);
+      if (shellMatch?.[1]) return { label: "Shell", detail: shellMatch[1].trim() };
+      if (/^(?:npm|pnpm|yarn|bun|deno|node|python3?|git|make|cargo|go|pytest|jest)\b/.test(body)) {
+        return { label: "Shell", detail: body };
+      }
+      const patterns = [
+        [/^read files?\s+(.+)$/i, "Read"],
+        [/^list\s+(.+)$/i, "List"],
+        [/^glob\s+(.+)$/i, "Glob"],
+        [/^find\s+(.+)$/i, "Find"],
+        [/^search\s+(.+)$/i, "Search"],
+        [/^git status$/i, "Git status"],
+        [/^git diff(?:\s+(.+))?$/i, "Git diff"],
+        [/^test\s+(.+)$/i, "Test"],
+        [/^edit\s+(.+)$/i, "Edit"],
+        [/^write\s+(.+)$/i, "Write"],
+        [/^apply patch(?:\s+(.+))?$/i, "Patch"],
+        [/^replace\s+(.+)$/i, "Replace"],
+        [/^web search\s*(.*)$/i, "Web search"],
+      ];
+      for (const [regex, label] of patterns) {
+        const match = body.match(regex);
+        if (match) return { label, detail: String(match[1] || "").trim() };
+      }
+      const agentMatch = body.match(/^(?:subagent|collaborate)\s*(.*)$/i);
+      if (agentMatch) {
+        const rawDetail = String(agentMatch[1] || "").trim();
+        return { label: "Agents", detail: compactJsonDetail(rawDetail) || "" };
+      }
+      return { label: "Tool", detail: body };
     };
     const padLeft = (text) => {
       const s = String(text || "");
@@ -1510,23 +1592,20 @@ export class SimpleTui {
       return [];
     }
     if (line.startsWith("[thought] ")) {
-      const details = trimWorkspaceText(line.slice(9).replace(/\s+/g, " ").trim(), 600).text;
-      return timelineItem(this.symbols.result, color(`Thinking: ${details || "<empty>"}`, "35"), "35");
+      // Thought updates are already surfaced through the transient thinking
+      // status/running line. Do not append them to the persistent timeline,
+      // otherwise streaming/tool thoughts can appear repeatedly in workspace.
+      return [];
+    }
+    if (line.startsWith("[progress] ")) {
+      const body = trimWorkspaceText(line.slice(11).trim(), 800).text;
+      if (!body) return [];
+      return timelineItem(this.symbols.response, color(body, "35"), "1;35");
     }
     if (line.startsWith("[run] ")) {
       const rawRun = line.slice(6).trim();
-      const m = rawRun.match(/^shell\s+command=("[^"]*"|\\S+)/);
       const approvalMatch = line.match(/approval=("[^"]*"|\\S+)/);
-      const shortMatch = line.match(/^\[run\]\s+(?:shell\s+)?(.+)$/);
-      let command = "";
       let approval = "";
-      if (m?.[1]) {
-        try {
-          command = JSON.parse(m[1]);
-        } catch {
-          command = m[1];
-        }
-      }
       if (approvalMatch?.[1]) {
         try {
           approval = JSON.parse(approvalMatch[1]);
@@ -1534,18 +1613,16 @@ export class SimpleTui {
           approval = approvalMatch[1];
         }
       }
-      if (!command && shortMatch?.[1]) {
-        command = shortMatch[1].trim();
-      }
-      const display = command || rawRun || "tool";
-      const safeDisplay = trimWorkspaceText(display, 320).text.replace(/\n/g, " ");
+      const run = runLabel(rawRun);
+      const safeDisplay = trimWorkspaceText(run.detail || "", 320).text.replace(/\n/g, " ");
       const tag =
         approval === "approved"
           ? color("[APPROVED]", "1;33")
           : approval === "auto"
           ? color("[AUTO]", "2;32")
           : "";
-      return timelineItem(this.symbols.tool, `${color("Run", "1;36")} ${color(safeDisplay, "36")}${tag ? ` ${tag}` : ""}`, "1;36");
+      const detail = safeDisplay ? ` ${color(safeDisplay, "36")}` : "";
+      return timelineItem(this.symbols.tool, `${color(run.label || "Tool", "1;36")}${detail}${tag ? ` ${tag}` : ""}`, "1;36");
     }
     if (line.startsWith("[tool] ")) {
       const body = line.slice(7).trim();
@@ -1584,16 +1661,20 @@ export class SimpleTui {
       return timelineItem(failed ? this.symbols.fail : ok ? this.symbols.ok : this.symbols.response, color(body, "2;37"), iconColor);
     }
     if (line.startsWith("[tool-result] ")) {
-      const body = trimWorkspaceText(line.slice(14).trim(), 2000).text;
-      if (!body) return [];
+      const body = trimWorkspaceText(line.slice(14).trimEnd(), 2000).text;
+      if (!body.trim()) return [];
       const compact = body
         .replace(/\r/g, "")
         .split("\n")
-        .map((part) => part.trim())
-        .filter(Boolean)
+        .map((part) => part.trimEnd())
+        .filter((part) => part.trim())
         .slice(0, 6);
       const rendered = compact.length > 0 ? compact : [body];
-      return timelineBlock(this.symbols.result, rendered.map((part) => color(part, "2;37")), "2;37");
+      return timelineBlock(
+        this.symbols.result,
+        rendered.map((part) => color(part.trimStart(), "2;37")),
+        "2;37"
+      );
     }
     if (line.startsWith("[banner-1] ")) {
       return [color(line.slice(11), "1;82")];
@@ -1843,7 +1924,7 @@ export class SimpleTui {
       const scrollLabel = ` lines ${Math.min(wrapped.length, this.overlayScroll + 1)}-${Math.min(wrapped.length, this.overlayScroll + visible.length)} / ${wrapped.length}`;
       const statusLine = truncateLine(scrollLabel, width);
       const frameLines = [sep, `\x1b[1m${title}\x1b[0m`, sep, ...visible, sep, `\x1b[2m${statusLine}\x1b[0m`, `\x1b[2m${hint}\x1b[0m`];
-      const frame = frameLines.join("\n");
+      const frame = renderFrameLines(frameLines, width);
       this.lastFrameLineCount = frameLines.length;
       this.lastInputRow = 1;
       this.lastInputLine = "";
@@ -1858,7 +1939,7 @@ export class SimpleTui {
         });
         return;
       }
-      this.out.write("\x1b[H\x1b[J" + frame + `\x1b[?25h\x1b[1;1H`);
+      this.out.write("\x1b[?25l\x1b[H\x1b[2J" + frame + `\x1b[?25h\x1b[1;1H`);
       return;
     }
 
@@ -2030,7 +2111,7 @@ export class SimpleTui {
       ...(this.inputHint ? [`\x1b[2m${truncateLine(` ${this.inputHint}`, bottomWidth)}\x1b[0m`] : []),
     ];
 
-    const frame = frameLines.join("\n");
+    const frame = renderFrameLines(frameLines, width);
     this.lastFrameLineCount = frameLines.length;
     this.lastInputRow = Math.max(1, beforeInputLines.length + 1);
     this.lastInputLine = inputState.lines.join("\n");
@@ -2051,6 +2132,6 @@ export class SimpleTui {
       });
       return;
     }
-    this.out.write("\x1b[H\x1b[J" + frame + `\x1b[?25h\x1b[${cursorRow};${inputState.cursorCol}H`);
+    this.out.write("\x1b[?25l\x1b[H\x1b[2J" + frame + `\x1b[?25h\x1b[${cursorRow};${inputState.cursorCol}H`);
   }
 }

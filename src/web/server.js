@@ -20,6 +20,7 @@ import {
   resolveSkillRoots,
 } from "../lib/skills.js";
 import { McpHub, mergeCommonMcpServers } from "../lib/mcp.js";
+import { buildFileMentionContext } from "../lib/fileMentionContext.js";
 import {
   listResumableSessions,
   loadResumableSession,
@@ -866,6 +867,14 @@ class WebAgentSession {
     }
 
     await autoEnableSkills(content, this.activeSkillsRef, this.skillIndex);
+    const mentionContext = await buildFileMentionContext(content, { cwd: this.workspaceDir });
+    const modelContent = mentionContext.prompt;
+    const attachedMentions = mentionContext.mentions.filter((item) => item.status === "inline" || item.status === "preview");
+    if (attachedMentions.length > 0) {
+      this.publish("log", {
+        line: `attached referenced files: ${attachedMentions.filter((item) => item.status === "inline").length} inline, ${attachedMentions.filter((item) => item.status === "preview").length} preview`,
+      });
+    }
     this.running = true;
     this.activeTask = text;
     this.lastError = "";
@@ -876,7 +885,7 @@ class WebAgentSession {
     this.publish("task.start", { input: text });
 
     try {
-      const result = await this.agent.runTurn(content, { planOnly: Boolean(options.planOnly) });
+      const result = await this.agent.runTurn(modelContent, { planOnly: Boolean(options.planOnly) });
       const contentOut = typeof result === "string" ? result : JSON.stringify(result, null, 2);
       const assistantMessage = { id: makeId("msg"), role: "assistant", content: contentOut, at: new Date().toISOString() };
       this.messages.push(assistantMessage);
