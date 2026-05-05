@@ -25,6 +25,7 @@ export class Agent {
     workspaceDir,
     autoApproveRef,
     askApproval,
+    askClarification,
     onEvent,
     activeSkillsRef,
     activePluginsRef,
@@ -45,6 +46,7 @@ export class Agent {
     this.workspaceDir = workspaceDir;
     this.autoApproveRef = autoApproveRef;
     this.askApproval = askApproval;
+    this.askClarification = askClarification;
     this.onEvent = onEvent;
     this.onTodoWrite = onTodoWrite;
     this.onMemoryWrite = onMemoryWrite;
@@ -86,6 +88,7 @@ export class Agent {
       workspaceDir: this.workspaceDir,
       autoApproveRef: this.autoApproveRef,
       askApproval: this.askApproval,
+      askClarification: this.askClarification,
       onToolStart: (tool, input) => this.onEvent?.({ type: "tool_start", tool, input }),
       onTodoWrite: this.onTodoWrite,
       onMemoryWrite: this.onMemoryWrite,

@@ -91,6 +91,9 @@ const SLASH_COMMANDS = [
   "/debug last",
   "/debug save",
   "/model",
+  "/think",
+  "/thinking",
+  "/reasoning",
   "/mcp",
   "/mcp list",
   "/mcp show",
@@ -227,12 +230,27 @@ function resolveProviderOptions(args, settings) {
     settings.apiKey ||
     null;
 
+  const thinkingEffort =
+    args.thinkingEffort ||
+    providerSettings.thinkingEffort ||
+    providerSettings.thinking_effort ||
+    providerSettings.reasoningEffort ||
+    providerSettings.reasoning_effort ||
+    settings.thinkingEffort ||
+    settings.thinking_effort ||
+    settings.reasoningEffort ||
+    settings.reasoning_effort ||
+    process.env.PIECODE_THINKING_EFFORT ||
+    process.env.PIECODE_REASONING_EFFORT ||
+    null;
+
   return {
     provider,
     apiKey,
     model,
     baseUrl: endpoint,
     endpoint,
+    thinkingEffort,
   };
 }
 
@@ -571,6 +589,7 @@ Options:
   --api-key, -K        API key for the provider
   --model, -M          Model name to use
   --base-url, -B       Base URL for OpenAI-compatible endpoints (default: https://api.openai.com/v1)
+  --thinking-effort    Model thinking/reasoning effort (none, minimal, low, medium, high, xhigh)
   --skill, -S          Enable skill by name (repeatable)
   --plugin, -G         Enable plugin by name (repeatable)
   --plugin-install     Install plugin from local directory or git URL and exit
@@ -610,6 +629,7 @@ Environment:
   PIECODE_PLAN_MODE       Optional (set 1 to start in plan-only mode)
   PIECODE_PLAN_FIRST      Optional (default off; set 1 to enable lightweight pre-plan)
   PIECODE_TOOL_BUDGET     Optional (default 6, range 1-12)
+  PIECODE_THINKING_EFFORT Optional model thinking/reasoning effort (alias: PIECODE_REASONING_EFFORT)
   PIECODE_VERBOSE_TOOL_LOGS Optional (set 1 for full tool input details in logs)
   PIECODE_LLM_DEBUG_HISTORY Optional (number of LLM debug entries kept in memory; default 20)
   PIECODE_SETTINGS_FILE Optional (default ~/.piecode/settings.json)
@@ -653,6 +673,8 @@ Slash commands in interactive mode:
   /debug save          Force-save the current session trace/log files
   /model               Show active provider/model
                        Tip: use /model codex:gpt-5.3-codex to force Codex provider
+  /think <none|minimal|low|medium|high|xhigh|off>
+                       Show or set model thinking/reasoning effort and save it to settings
   /mcp                 Show MCP status and usage
   /mcp list            List active MCP servers
   /mcp show <name>     Show one MCP server config
@@ -713,6 +735,7 @@ function parseArgs(argv) {
     model: null,
     baseUrl: null,
     disableCodex: false,
+    thinkingEffort: null,
     skills: [],
     plugins: [],
     pluginInstall: "",
@@ -747,6 +770,9 @@ function parseArgs(argv) {
       i += 1;
     } else if (a === "--base-url" || a === "-B") {
       args.baseUrl = argv[i + 1] || "";
+      i += 1;
+    } else if (a === "--thinking-effort" || a === "--reasoning-effort") {
+      args.thinkingEffort = argv[i + 1] || "";
       i += 1;
     } else if (a === "--disable-codex") {
       args.disableCodex = true;
@@ -1114,6 +1140,10 @@ function summarizeThinkingResponseForLog(payload) {
 
 function formatToolInputSummary(tool, input, maxLen = 120) {
   const safe = input && typeof input === "object" ? input : {};
+  if (tool === "clarify_user") {
+    const count = Array.isArray(safe.options) ? safe.options.length : 0;
+    return summarizeForLog(`${safe.multiple ? "multi" : "single"} ${count} options: ${safe.question || ""}`, maxLen);
+  }
   if (tool === "shell") {
     return summarizeForLog(safe.command || "", maxLen);
   }
@@ -1163,6 +1193,8 @@ function formatReadableToolRunLine(tool, input = {}) {
   const summary = formatToolInputSummary(name, input, 180);
   const suffix = summary && summary !== "<empty>" ? ` ${summary}` : "";
   switch (name) {
+    case "clarify_user":
+      return `[ask] ${summary || "clarification"}`;
     case "shell":
       return `[run] ${summary || "shell command"}`;
     case "read_file":
@@ -1838,6 +1870,93 @@ async function waitForTuiApproval({ stdinStream, defaultYes }) {
   });
 }
 
+function normalizeClarificationOptions(options) {
+  if (!Array.isArray(options)) return [];
+  return options
+    .map((option, index) => {
+      if (typeof option === "string") {
+        const label = option.trim();
+        return label ? { id: `option-${index + 1}`, label, value: label, description: "" } : null;
+      }
+      if (!option || typeof option !== "object") return null;
+      const label = String(option.label || option.title || option.name || option.value || option.id || "").trim();
+      if (!label) return null;
+      return {
+        id: String(option.id || `option-${index + 1}`),
+        label,
+        value: option.value ?? option.id ?? label,
+        description: String(option.description || option.detail || "").trim(),
+      };
+    })
+    .filter(Boolean);
+}
+
+function makeClarificationSelection(options, selectedIndexes) {
+  const list = normalizeClarificationOptions(options);
+  return [...selectedIndexes]
+    .sort((a, b) => a - b)
+    .map((idx) => ({
+      index: idx,
+      id: list[idx]?.id || `option-${idx + 1}`,
+      label: list[idx]?.label || "",
+      value: list[idx]?.value ?? list[idx]?.label ?? "",
+      description: list[idx]?.description || "",
+    }))
+    .filter((item) => item.label);
+}
+
+async function waitForTuiClarification({ stdinStream, tui, question, options, multiple = false, required = true }) {
+  const list = normalizeClarificationOptions(options);
+  if (list.length === 0) return { cancelled: true, selected: [] };
+  const state = {
+    question: String(question || "").trim(),
+    options: list,
+    multiple: Boolean(multiple),
+    index: 0,
+    selected: new Set(Boolean(multiple) ? [] : [0]),
+  };
+  const render = () => tui?.setClarificationPrompt?.(state);
+  render();
+  return new Promise((resolve) => {
+    const finish = (cancelled = false) => {
+      stdinStream.off("keypress", handler);
+      tui?.clearClarificationPrompt?.();
+      if (cancelled) {
+        resolve({ cancelled: true, selected: [] });
+        return;
+      }
+      const selectedIndexes = multiple ? state.selected : new Set([state.index]);
+      resolve({ cancelled: false, selected: makeClarificationSelection(list, selectedIndexes) });
+    };
+    const handler = (str, key = {}) => {
+      const name = String(key?.name || "").toLowerCase();
+      if (name === "escape") return finish(true);
+      if (name === "up" || name === "down") {
+        const delta = name === "up" ? -1 : 1;
+        state.index = (state.index + delta + list.length) % list.length;
+        if (!multiple) state.selected = new Set([state.index]);
+        render();
+        return;
+      }
+      if (multiple && (name === "space" || str === " ")) {
+        if (state.selected.has(state.index)) state.selected.delete(state.index);
+        else state.selected.add(state.index);
+        render();
+        return;
+      }
+      if (name === "return" || name === "enter" || str === "\r" || str === "\n") {
+        if (required && multiple && state.selected.size === 0) {
+          tui?.setInputHint?.("Select at least one option, or press ESC to cancel.");
+          render();
+          return;
+        }
+        finish(false);
+      }
+    };
+    stdinStream.on("keypress", handler);
+  });
+}
+
 function normalizeTodos(items) {
   const allowed = new Set(["pending", "in_progress", "completed"]);
   if (!Array.isArray(items)) return [];
@@ -2085,7 +2204,9 @@ function isCodexCliProvider(provider) {
 function formatProviderModel(provider) {
   const prefix = providerPrefix(provider?.kind);
   const model = String(provider?.model || "").trim() || "unknown";
-  return `${model}(${prefix}, tools:${providerToolMode(provider)}, ${providerTransport(provider)})`;
+  const thinkingEffort = String(provider?.thinkingEffort || "").trim();
+  const thinking = thinkingEffort ? `, think:${thinkingEffort}` : "";
+  return `${model}(${prefix}, tools:${providerToolMode(provider)}, ${providerTransport(provider)}${thinking})`;
 }
 
 function formatProviderWarning(provider) {
@@ -2802,6 +2923,7 @@ async function handleSlashCommand(input, ctx) {
     autoApproveRef,
     traceRef,
     providerRef,
+    providerOptionsRef,
     skillIndex,
     activeSkillsRef,
     pluginIndex,
@@ -2849,6 +2971,25 @@ async function handleSlashCommand(input, ctx) {
   };
   const formatPlanModeStatus = (prefix = "plan mode", enabled = planModeRef?.value) =>
     enabled ? `${prefix}: on` : `${prefix}: off`;
+  const normalizeThinkingEffortInput = (value) => {
+    const effort = String(value || "").trim().toLowerCase();
+    if (!effort || effort === "show" || effort === "status") return { ok: true, value: "", showOnly: true };
+    if (effort === "off" || effort === "default") return { ok: true, value: "" };
+    const normalizedAliases = {
+      "extra": "xhigh",
+      "extra-high": "xhigh",
+      "extra_high": "xhigh",
+      "max": "xhigh",
+    };
+    const normalized = normalizedAliases[effort] || effort;
+    if (["none", "minimal", "low", "medium", "high", "xhigh"].includes(normalized)) return { ok: true, value: normalized };
+    return { ok: false, value: effort };
+  };
+  const getCurrentThinkingEffort = () => String(providerRef.value?.thinkingEffort || providerOptionsRef?.value?.thinkingEffort || "").trim();
+  const formatThinkingEffortStatus = (prefix = "thinking effort") => {
+    const effort = getCurrentThinkingEffort();
+    return `${prefix}: ${effort || "default"} | model=${formatProviderModel(providerRef.value)}`;
+  };
   const mcpImportEnvEnabled = String(process.env.PIECODE_MCP_IMPORT || "1") !== "0";
   const getActiveMcpHub = () =>
     mcpHubRef?.value && typeof mcpHubRef.value.hasServers === "function" ? mcpHubRef.value : null;
@@ -2951,6 +3092,8 @@ async function handleSlashCommand(input, ctx) {
         "/debug last",
         "/debug save",
         "/model",
+        "/think <none|minimal|low|medium|high|xhigh|off>",
+        "/reasoning <none|minimal|low|medium|high|xhigh|off>",
         "/mcp",
         "/mcp list",
         "/mcp show <name>",
@@ -3000,6 +3143,75 @@ async function handleSlashCommand(input, ctx) {
   if (lower === "/status") {
     const active = ctx.subagentsRef?.value?.active instanceof Map ? ctx.subagentsRef.value.active.size : 0;
     logLine(`status: idle | model=${formatProviderModel(providerRef.value)} | subagents=${active} active`);
+    return { done: false, handled: true };
+  }
+  if (lower === "/think" || lower === "/thinking" || lower === "/reasoning" || lower.startsWith("/think ") || lower.startsWith("/thinking ") || lower.startsWith("/reasoning ")) {
+    const requested = raw.replace(/^\/(?:think|thinking|reasoning)(?:\s+|$)/i, "").trim();
+    const parsedEffort = normalizeThinkingEffortInput(requested);
+    if (!parsedEffort.ok) {
+      logLine(`usage: /think none|minimal|low|medium|high|xhigh|off (got: ${parsedEffort.value})`);
+      return { done: false, handled: true };
+    }
+    if (parsedEffort.showOnly) {
+      logLine(formatThinkingEffortStatus());
+      return { done: false, handled: true };
+    }
+
+    const previous = getCurrentThinkingEffort() || "default";
+    providerOptionsRef.value = {
+      ...providerOptionsRef.value,
+      thinkingEffort: parsedEffort.value || null,
+    };
+    if (parsedEffort.value) {
+      settings.thinkingEffort = parsedEffort.value;
+    } else {
+      delete settings.thinkingEffort;
+      delete settings.thinking_effort;
+      delete settings.reasoningEffort;
+      delete settings.reasoning_effort;
+    }
+    const providerName = providerOptionsRef.value.provider || settings.provider || providerPrefix(providerRef.value?.kind);
+    if (providerName) {
+      if (!settings.providers || typeof settings.providers !== "object") settings.providers = {};
+      const existingProviderSettings =
+        settings.providers[providerName] && typeof settings.providers[providerName] === "object"
+          ? settings.providers[providerName]
+          : {};
+      settings.providers[providerName] = {
+        ...existingProviderSettings,
+        thinkingEffort: parsedEffort.value || undefined,
+      };
+      if (!parsedEffort.value) {
+        delete settings.providers[providerName].thinkingEffort;
+        delete settings.providers[providerName].thinking_effort;
+        delete settings.providers[providerName].reasoningEffort;
+        delete settings.providers[providerName].reasoning_effort;
+      }
+    }
+
+    try {
+      const nextProvider = getProvider(providerOptionsRef.value);
+      providerRef.value = nextProvider;
+      agent.provider = nextProvider;
+      await saveSettings(settingsFile, settings);
+      const nextContextLimit = resolveContextWindow({
+        modelName: nextProvider?.model,
+        providerName: providerPrefix(nextProvider?.kind),
+        settings,
+        dynamicByModel: modelContextWindowsRef?.value,
+      });
+      if (agent?.contextWindowRef) agent.contextWindowRef.value = nextContextLimit;
+      if (tui) {
+        tui.onModelCall(formatProviderModel(nextProvider));
+        tui.setContextUsage(0, nextContextLimit);
+        tui.onThinkingDone();
+      }
+      const next = getCurrentThinkingEffort() || "default";
+      logLine(`thinking effort changed: ${previous} -> ${next}`);
+      logLine(formatThinkingEffortStatus());
+    } catch (err) {
+      logLine(`unable to set thinking effort: ${String(err?.message || err)}`);
+    }
     return { done: false, handled: true };
   }
   if (lower === "/btw" || lower.startsWith("/btw ")) {
@@ -4359,6 +4571,7 @@ async function main() {
   const exitArmedRef = { value: false };
   const userExitRequestedRef = { value: false };
   const approvalActiveRef = { value: false };
+  const clarificationActiveRef = { value: false };
   const suppressNextSubmitRef = { value: false };
   const pendingCommandSubmitRef = { value: "" };
   const modelPickerRef = { active: false, query: "", options: [], index: 0 };
@@ -4627,8 +4840,9 @@ async function main() {
       return false;
     };
     onKeypress = (str, key = {}) => {
+      key = key && typeof key === "object" ? key : {};
       if (isReadlineClosed()) return;
-      if (approvalActiveRef.value) return;
+      if (approvalActiveRef.value || clarificationActiveRef.value) return;
       const keyNameRaw = String(key?.name || "");
       const keyName = keyNameRaw.toLowerCase();
       const enterPressed = keyName === "return" || keyName === "enter" || str === "\r" || str === "\n";
@@ -5166,7 +5380,7 @@ async function main() {
         if (cleanedLine) safeRlWrite(cleanedLine);
         renderLiveInput();
       }
-      if (approvalActiveRef.value) return;
+      if (approvalActiveRef.value || clarificationActiveRef.value) return;
       if (!Array.isArray(parsed.deltas) || parsed.deltas.length === 0) return;
       for (const delta of parsed.deltas) tui.scrollLines(delta);
     };
@@ -5222,6 +5436,17 @@ async function main() {
       ...providerOptionsRef.value,
       provider: nextProviderName,
       model: selectedModel,
+      thinkingEffort:
+        providerOptionsRef.value.thinkingEffort ??
+        (settings?.providers?.[nextProviderName]?.thinkingEffort ||
+          settings?.providers?.[nextProviderName]?.thinking_effort ||
+          settings?.providers?.[nextProviderName]?.reasoningEffort ||
+          settings?.providers?.[nextProviderName]?.reasoning_effort ||
+          settings.thinkingEffort ||
+          settings.thinking_effort ||
+          settings.reasoningEffort ||
+          settings.reasoning_effort ||
+          null),
     };
     if (inferredProvider) {
       const providerSettings =
@@ -5277,6 +5502,37 @@ async function main() {
       tui.onThinkingDone();
     }
     return nextProvider;
+  };
+
+  const askClarification = async ({ question, options, multiple = false, required = true } = {}) => {
+    const normalizedOptions = normalizeClarificationOptions(options);
+    const prompt = String(question || "").trim();
+    if (!prompt || normalizedOptions.length === 0) return { selected: [] };
+    const nonInteractive = oneShotPromptMode || !filteredInput.isTTY || isReadlineClosed();
+    if (nonInteractive || !tui) {
+      logLine(`[clarify] ${prompt}`);
+      normalizedOptions.forEach((option, index) => {
+        logLine(`[clarify] ${index + 1}. ${option.label}${option.description ? ` - ${option.description}` : ""}`);
+      });
+      logLine("[clarify] unavailable in non-interactive mode; no option selected");
+      return { cancelled: true, selected: [], nonInteractive: true };
+    }
+    clarificationActiveRef.value = true;
+    try {
+      const result = await waitForTuiClarification({
+        stdinStream: keypressSource,
+        tui,
+        question: prompt,
+        options: normalizedOptions,
+        multiple,
+        required,
+      });
+      tui.render(currentInputRef.value, result.cancelled ? "clarification cancelled" : "clarification answered");
+      return result;
+    } finally {
+      clarificationActiveRef.value = false;
+      tui.clearClarificationPrompt?.();
+    }
   };
 
   const askApproval = async (q, details = null) => {
@@ -5352,6 +5608,7 @@ async function main() {
     workspaceDir,
     autoApproveRef,
     askApproval,
+    askClarification,
     activeSkillsRef,
     activePluginsRef,
     projectInstructionsRef,
@@ -5923,6 +6180,7 @@ async function main() {
 }
 
 main().catch((err) => {
-  console.error(`fatal: ${err.message}`);
+  const detail = err?.stack || err?.message || String(err);
+  console.error(`fatal: ${detail}`);
   process.exit(1);
 });

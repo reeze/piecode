@@ -37,6 +37,7 @@ describe('Prompt functions', () => {
       expect(prompt).toContain('TOOLS');
       expect(prompt).toContain('"type":"thought"');
       expect(prompt).toContain('todo_write/todowrite');
+      expect(prompt).toContain('clarify_user');
       expect(prompt).toContain('edit_file');
       expect(prompt).not.toContain('apply_patch');
     });
@@ -137,6 +138,10 @@ describe('Prompt functions', () => {
       expect(prompt).toContain('VALIDATION LADDER');
       expect(prompt).toContain('WORKTREE SAFETY');
       expect(prompt).toContain('DONE CRITERIA');
+      expect(prompt).toContain('USER-FACING PROGRESS CONTRACT');
+      expect(prompt).toContain('surface progress in phases');
+      expect(prompt).toContain('Final responses should be user-friendly');
+      expect(prompt).toContain('The harness will show that sentence as progress');
       expect(prompt).toContain('changed files, validation, blockers, and next step');
       expect(prompt).toContain('brief progress syncs');
       expect(prompt).toContain('Do not expand file diffs by default');
@@ -155,7 +160,8 @@ describe('Prompt functions', () => {
       expect(prompt).toContain('Before editing existing files, read them first');
       expect(prompt).toContain('Prefer targeted edits');
       expect(prompt).toContain('write_file is for new files or explicit rewrites');
-      expect(prompt).toContain('before tool calls, briefly say what context you are gathering');
+      expect(prompt).toContain('Before tool calls, say what context you are gathering');
+      expect(prompt).toContain('include a non-empty `thought` field');
       expect(prompt).toContain('show diffs only when the user asks for review');
     });
   });
@@ -195,6 +201,16 @@ describe('Prompt functions', () => {
       expect(result.type).toBe('tool_use');
       expect(result.tool).toBe('read_file');
       expect(result.input).toEqual({ path: 'test.txt' });
+    });
+
+    test('should parse clarify_user tool', () => {
+      const result = parseModelAction(
+        '{"type":"tool_use","tool":"clarify_user","input":{"question":"Choose mode","options":[{"label":"Fast"}],"multiple":false}}'
+      );
+      expect(result.type).toBe('tool_use');
+      expect(result.tool).toBe('clarify_user');
+      expect(result.input.question).toBe('Choose mode');
+      expect(result.input.options).toEqual([{ label: 'Fast' }]);
     });
 
     test('should parse todo_write tool', () => {
@@ -343,6 +359,10 @@ describe('Prompt functions', () => {
       const tools = buildToolDefinitions('anthropic');
       expect(tools.length).toBeGreaterThanOrEqual(5);
 
+      const clarify = tools.find((t) => t.name === 'clarify_user');
+      expect(clarify).toBeDefined();
+      expect(clarify.input_schema.properties.options).toBeDefined();
+
       const shell = tools.find((t) => t.name === 'shell');
       expect(shell).toBeDefined();
       expect(shell.input_schema).toBeDefined();
@@ -356,6 +376,10 @@ describe('Prompt functions', () => {
     test('returns OpenAI format with function wrapper', () => {
       const tools = buildToolDefinitions('openai');
       expect(tools.length).toBeGreaterThanOrEqual(5);
+
+      const clarify = tools.find((t) => t.function?.name === 'clarify_user');
+      expect(clarify).toBeDefined();
+      expect(clarify.function.parameters.properties.multiple).toBeDefined();
 
       const shell = tools.find((t) => t.function?.name === 'shell');
       expect(shell).toBeDefined();
@@ -598,6 +622,7 @@ describe('Prompt functions', () => {
       expect(action.tool).toBe('read_file');
       expect(action.input).toEqual({ path: 'test.txt' });
       expect(action.reason).toBe('Let me read that file.');
+      expect(action.thought).toBe('Let me read that file.');
       expect(action._callId).toBe('toolu_01');
     });
 
@@ -612,6 +637,19 @@ describe('Prompt functions', () => {
       const action = parseNativeResponse(response, 'anthropic');
       expect(action.type).toBe('final');
       expect(action.message).toBe('The answer is 42.');
+    });
+
+    test('preserves Anthropic final answer formatting', () => {
+      const response = {
+        content: [
+          { type: 'text', text: 'Done:\n- changed prompt\n- ran tests' },
+        ],
+        stop_reason: 'end_turn',
+      };
+
+      const action = parseNativeResponse(response, 'anthropic');
+      expect(action.type).toBe('final');
+      expect(action.message).toBe('Done:\n- changed prompt\n- ran tests');
     });
 
     test('parses Anthropic response with only tool_use (no text)', () => {
@@ -642,6 +680,8 @@ describe('Prompt functions', () => {
       expect(action.type).toBe('tool_uses');
       expect(action.calls).toHaveLength(2);
       expect(action.calls[0]._callId).toBe('toolu_01');
+      expect(action.calls[0].thought).toBe('read both');
+      expect(action.calls[1].reason).toBe('read both');
       expect(action.calls[1].input).toEqual({ path: 'b.txt' });
     });
 
@@ -666,7 +706,32 @@ describe('Prompt functions', () => {
       expect(action.tool).toBe('read_file');
       expect(action.input).toEqual({ path: 'config.json' });
       expect(action.reason).toBe('Reading the file now.');
+      expect(action.thought).toBe('Reading the file now.');
       expect(action._callId).toBe('call_abc');
+    });
+
+    test('preserves OpenAI array content before tool calls as progress thought', () => {
+      const response = {
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'I will search the prompt path first.' }],
+          tool_calls: [
+            {
+              id: 'call_rg',
+              type: 'function',
+              function: { name: 'rg', arguments: '{"pattern":"progress","path":"src/lib"}' },
+            },
+          ],
+        },
+        finishReason: 'tool_calls',
+      };
+
+      const action = parseNativeResponse(response, 'openai');
+      expect(action.type).toBe('tool_use');
+      expect(action.tool).toBe('rg');
+      expect(action.input).toEqual({ pattern: 'progress', path: 'src/lib' });
+      expect(action.reason).toBe('I will search the prompt path first.');
+      expect(action.thought).toBe('I will search the prompt path first.');
     });
 
     test('parses OpenAI final text response', () => {
@@ -681,6 +746,20 @@ describe('Prompt functions', () => {
       const action = parseNativeResponse(response, 'openai');
       expect(action.type).toBe('final');
       expect(action.message).toBe('All done!');
+    });
+
+    test('preserves OpenAI final answer formatting', () => {
+      const response = {
+        message: {
+          role: 'assistant',
+          content: [{ type: 'text', text: 'Done:\n- prompt\n- tests' }],
+        },
+        finishReason: 'stop',
+      };
+
+      const action = parseNativeResponse(response, 'openai');
+      expect(action.type).toBe('final');
+      expect(action.message).toBe('Done:\n- prompt\n- tests');
     });
 
     test('handles null/undefined response gracefully', () => {

@@ -307,6 +307,31 @@ export class TurnEngine {
     return String(raw || "").trim();
   }
 
+  hasToolEvidence() {
+    return this.agent.history.some((msg) => {
+      if (msg?.role !== "user") return false;
+      try {
+        const parsed = JSON.parse(String(msg.content || ""));
+        return parsed?.type === "tool_result" || parsed?.type === "tool_results";
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  async recoverEmptyFinal({ signal = null } = {}) {
+    if (this.hasToolEvidence()) {
+      const forced = await this.synthesizeFinalFromEvidence({
+        requireCommitMessage: Boolean(this.turnPolicy?.requireCommitMessage),
+        signal,
+      }).catch(() => "");
+      const body = String(forced || "").trim();
+      if (body) return body;
+      return "The model returned an empty final response after tool use. I collected evidence, but final synthesis also returned empty. Please retry or ask me to continue from the current session.";
+    }
+    return "The model returned an empty final response before producing an answer. Please retry the request.";
+  }
+
   async finalizeAfterRepeatedToolResult({ signal = null, reason = "repeated_tool_result" } = {}) {
     if (this.commitFlowSignalCount <= 0) {
       const forced = await this.synthesizeFinalFromEvidence({
@@ -826,7 +851,9 @@ export class TurnEngine {
 
       if (action.type === "final") {
         this.agent.onEvent?.({ type: "thinking_done" });
-        const finalMessage = this.planOnly ? this.formatPlanModeFinalMessage(action.message) : action.message;
+        const rawFinalMessage = String(action.message || "").trim();
+        const recoveredMessage = rawFinalMessage ? rawFinalMessage : await this.recoverEmptyFinal({ signal });
+        const finalMessage = this.planOnly ? this.formatPlanModeFinalMessage(recoveredMessage) : recoveredMessage;
         this.agent.history.push({ role: "assistant", content: finalMessage });
         return finalMessage;
       }

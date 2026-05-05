@@ -1,6 +1,7 @@
 import { DEFAULT_INPUT_HINTS, sanitizeInputHints } from "./inputHints.js";
 
-const ANSI_PATTERN = /\x1b\[[0-9;?]*[ -/]*[@-~]/g;
+const ANSI_PATTERN = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|[%()][ -~])/g;
+const TERMINAL_PAINT_PREFIX = "\x1b[?25l\x1b%G\x1b(B\x1b[0m\x1b[2J\x1b[H";
 
 function stripAnsi(text) {
   return String(text || "").replace(ANSI_PATTERN, "");
@@ -490,9 +491,13 @@ function trimWorkspaceText(text, maxChars = 6000) {
 function charDisplayWidth(ch) {
   const cp = ch.codePointAt(0);
   if (cp == null) return 0;
-  // Control chars and combining marks do not advance cursor width.
+  // Control chars, combining marks, zero-width joiners, and variation selectors
+  // do not advance the terminal cursor by themselves.
   if (cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f)) return 0;
   if (
+    cp === 0x200d ||
+    (cp >= 0xfe00 && cp <= 0xfe0f) ||
+    (cp >= 0xe0100 && cp <= 0xe01ef) ||
     (cp >= 0x300 && cp <= 0x36f) ||
     (cp >= 0x1ab0 && cp <= 0x1aff) ||
     (cp >= 0x1dc0 && cp <= 0x1dff) ||
@@ -521,6 +526,36 @@ function charDisplayWidth(ch) {
   return 1;
 }
 
+const graphemeSegmenter = typeof Intl !== "undefined" && Intl.Segmenter
+  ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+  : null;
+
+function isEmojiCodePoint(cp) {
+  return (
+    (cp >= 0x1f000 && cp <= 0x1faff) ||
+    (cp >= 0x2600 && cp <= 0x27bf)
+  );
+}
+
+function graphemeDisplayWidth(cluster) {
+  const text = String(cluster || "");
+  if (!text) return 0;
+  let width = 0;
+  let hasEmoji = false;
+  let hasJoinerOrVariation = false;
+  for (let i = 0; i < text.length;) {
+    const cp = text.codePointAt(i);
+    const char = cp != null && cp > 0xffff ? text.slice(i, i + 2) : text[i];
+    if (cp === 0x200d || (cp >= 0xfe00 && cp <= 0xfe0f)) hasJoinerOrVariation = true;
+    if (isEmojiCodePoint(cp)) hasEmoji = true;
+    width += charDisplayWidth(char);
+    i += char.length;
+  }
+  // ZWJ emoji and emoji-presentation clusters render as one terminal glyph.
+  if (hasEmoji && hasJoinerOrVariation) return 2;
+  return width;
+}
+
 function stringDisplayWidth(value) {
   const text = String(value || "");
   let width = 0;
@@ -530,10 +565,22 @@ function stringDisplayWidth(value) {
       i += ansiMatch[0].length;
       continue;
     }
-    const cp = text.codePointAt(i);
-    const char = cp != null && cp > 0xffff ? text.slice(i, i + 2) : text[i];
-    width += charDisplayWidth(char);
-    i += char.length;
+    const ansiIndex = text.slice(i).search(/\x1b\[[0-9;?]*[ -/]*[@-~]/);
+    const end = ansiIndex < 0 ? text.length : i + ansiIndex;
+    const plain = text.slice(i, end);
+    if (graphemeSegmenter) {
+      for (const segment of graphemeSegmenter.segment(plain)) {
+        width += graphemeDisplayWidth(segment.segment);
+      }
+    } else {
+      for (let j = 0; j < plain.length;) {
+        const cp = plain.codePointAt(j);
+        const char = cp != null && cp > 0xffff ? plain.slice(j, j + 2) : plain[j];
+        width += charDisplayWidth(char);
+        j += char.length;
+      }
+    }
+    i = end;
   }
   return width;
 }
@@ -623,12 +670,23 @@ function padDisplayLine(line, width) {
   return `${truncated}${" ".repeat(pad)}`;
 }
 
-function renderFrameLines(lines, width) {
-  return (Array.isArray(lines) ? lines : []).map((line) => padDisplayLine(line, width)).join("\n");
+function renderFrameLines(lines, width, height = 0) {
+  const paintWidth = Math.max(1, (Number(width) || 1) - 1);
+  const out = (Array.isArray(lines) ? lines : []).map((line) => padDisplayLine(line, paintWidth));
+  const minHeight = Math.max(0, Number(height) || 0);
+  while (out.length < minHeight) out.push(padDisplayLine("", paintWidth));
+  return out.join("\n");
+}
+
+function terminalFrame(frame) {
+  // Some commands can leave terminal newline handling in a state where LF no
+  // longer returns to column 1. Use CRLF for full-frame paints so the cursor
+  // position stays stable after long shell/tool runs.
+  return String(frame || "").replace(/\n/g, "\r\n");
 }
 
 function colorFullLine(line, code, width) {
-  return color(padDisplayLine(line, width), code);
+  return color(padDisplayLine(line, Math.max(1, (Number(width) || 1) - 1)), code);
 }
 
 function hasBackgroundColor(line) {
@@ -643,6 +701,9 @@ function timelineContinuationIndent(line) {
   if (/^(?:◆|\*)\s+Task:/i.test(trimmed)) return leading;
   if (/^(?:↳|->)\s+/.test(trimmed)) return `${leading}  `;
   if (/^(?:›|>)\s+/.test(trimmed)) return `${leading}  `;
+  const ordered = trimmed.match(/^(\d+[.)])\s+/);
+  if (ordered) return `${leading}${" ".repeat(stringDisplayWidth(ordered[1]) + 1)}`;
+  if (/^(?:•|◦|▪|-)\s+/.test(trimmed)) return `${leading}  `;
   if (/^(?:•|\*|✓|×|\[ok\]|\[x\]|\[i\])\s+/.test(trimmed)) return `${leading}  `;
   if (leading.length > 0) return leading;
   return "  ";
@@ -713,6 +774,7 @@ export class SimpleTui {
     this.approvalPrompt = "";
     this.approvalMeta = null;
     this.approvalDefaultYes = false;
+    this.clarificationPrompt = null;
     this.inputHint = "";
     this.startupShortcutHint = "";
     this.inputHints = sanitizeInputHints(DEFAULT_INPUT_HINTS);
@@ -720,6 +782,7 @@ export class SimpleTui {
     this.currentInput = "";
     this.thinkingTick = 0;
     this.thinkingTimer = null;
+    this.animateThinking = String(process.env.PIECODE_TUI_ANIMATION || "").trim() === "1";
     this.modelSuggestionsVisible = false;
     this.modelSuggestions = [];
     this.modelSuggestionIndex = 0;
@@ -998,12 +1061,13 @@ export class SimpleTui {
   }
 
   startThinkingAnimation() {
+    if (!this.animateThinking) return;
     if (this.thinkingTimer) return;
     this.thinkingTimer = setInterval(() => {
       if (!this.active || !this.thinking) return;
       this.thinkingTick = (this.thinkingTick + 1) % 5;
       this.render();
-    }, 220);
+    }, 900);
   }
 
   stopThinkingAnimation() {
@@ -1092,6 +1156,44 @@ export class SimpleTui {
     this.approvalMeta = null;
     this.approvalDefaultYes = false;
     this.render();
+  }
+
+  setClarificationPrompt(prompt = null) {
+    this.clarificationPrompt = prompt && typeof prompt === "object" ? prompt : null;
+    this.lastStatus = this.clarificationPrompt ? "Awaiting clarification" : this.lastStatus;
+    this.render();
+  }
+
+  clearClarificationPrompt() {
+    this.clarificationPrompt = null;
+    this.render();
+  }
+
+  formatClarificationLines(width) {
+    const prompt = this.clarificationPrompt && typeof this.clarificationPrompt === "object" ? this.clarificationPrompt : null;
+    if (!prompt) return [];
+    const question = String(prompt.question || "").trim();
+    const options = Array.isArray(prompt.options) ? prompt.options : [];
+    const selected = prompt.selected instanceof Set ? prompt.selected : new Set();
+    const index = Math.max(0, Math.min(options.length - 1, Number(prompt.index) || 0));
+    const multiple = Boolean(prompt.multiple);
+    const lines = [color(` ? ${multiple ? "choose one or more" : "choose one"}`, "1;33")];
+    if (question) lines.push(truncateLine(`   ${color("q:", "1;36")} ${question}`, width));
+    options.slice(0, 12).forEach((option, idx) => {
+      const active = idx === index;
+      const checked = multiple ? (selected.has(idx) ? "◉" : "◯") : (active ? "●" : "○");
+      const marker = active ? ">" : " ";
+      const label = String(option?.label || option?.value || option || "").trim();
+      const description = String(option?.description || "").trim();
+      const body = `${marker} ${checked} ${label}${description ? ` - ${description}` : ""}`;
+      lines.push(truncateLine(`   ${active ? color(body, "1;32") : color(body, "2;37")}`, width));
+    });
+    if (options.length > 12) lines.push(truncateLine(`   ${color(`... ${options.length - 12} more`, "2;37")}`, width));
+    const help = multiple
+      ? "↑/↓ move  space toggle  enter confirm  esc cancel"
+      : "↑/↓ move  enter confirm  esc cancel";
+    lines.push(truncateLine(`   ${color(help, "2;36")}`, width));
+    return lines;
   }
 
   setInputHint(hint) {
@@ -1475,9 +1577,24 @@ export class SimpleTui {
       return items.map((item, index) => (index === 0 ? `${prefix}${item}` : `  ${item}`));
     };
     const responseBlock = (marker, lines, markerColor = "1;32") => {
-      const items = (Array.isArray(lines) ? lines : [lines]).map((item) => String(item || "")).filter(Boolean);
+      const items = (Array.isArray(lines) ? lines : [lines]).map((item) => String(item || ""));
+      while (items.length > 0 && !items[0].trim()) items.shift();
+      while (items.length > 0 && !items[items.length - 1].trim()) items.pop();
       if (items.length === 0) return [];
-      return items.map((item, index) => (index === 0 ? `  ${color(marker, markerColor)} ${item}` : `    ${item}`));
+      let usedMarker = false;
+      const isStructural = (item) => {
+        const plain = stripAnsi(String(item || "")).trimStart();
+        return /^(?:[•◦▪]\s+|\d+[.)]\s+|\[[ xX~-]\]\s+|[◆›·]\s+|│)/.test(plain);
+      };
+      return items.map((item) => {
+        if (!item.trim()) return "";
+        if (isStructural(item)) return item;
+        if (!usedMarker) {
+          usedMarker = true;
+          return `${color(marker, markerColor)} ${item}`;
+        }
+        return `  ${item}`;
+      });
     };
     const toolLabel = (tool, details = "") => {
       const name = String(tool || "tool");
@@ -1595,7 +1712,13 @@ export class SimpleTui {
       });
     if (!line) return [];
     if (line.startsWith("[task] ")) {
-      return [colorFullLine(` ${this.symbols.task} Task: ${line.slice(7).trim()} `, "1;37;48;5;236", Math.max(20, (this.out?.columns || 100) - 1))];
+      const width = Math.max(20, (this.out?.columns || 100) - 1);
+      const textWidth = Math.max(8, width - stringDisplayWidth(` ${this.symbols.task} Task:  `));
+      const taskLines = wrapText(line.slice(7).trim(), textWidth);
+      return taskLines.map((taskLine, index) => {
+        const prefix = index === 0 ? `${this.symbols.task} Task: ` : "  ";
+        return colorFullLine(` ${prefix}${taskLine} `, "1;37;48;5;236", width);
+      });
     }
     if (line.startsWith("[model] ")) {
       return [];
@@ -1765,7 +1888,7 @@ export class SimpleTui {
 
   buildInputState(input, width, cursorIndex = null) {
     const rawInput = String(input || "");
-    const normalizedSource = rawInput.replace(/\r/g, "");
+    const normalizedSource = rawInput.replace(/\r/g, "").replace(/\t/g, "  ");
     const safeCursorIndex =
       Number.isFinite(cursorIndex) && Number(cursorIndex) >= 0
         ? Math.min(normalizedSource.length, Math.max(0, Math.floor(Number(cursorIndex))))
@@ -1787,8 +1910,12 @@ export class SimpleTui {
       let chunk = "";
       let chunkWidth = 0;
       let widthLimit = firstLimit;
-      for (const ch of source) {
-        const w = charDisplayWidth(ch);
+      const segments = graphemeSegmenter
+        ? Array.from(graphemeSegmenter.segment(source), (segment) => segment.segment)
+        : Array.from(source);
+      for (const segment of segments) {
+        const text = segment === "\t" ? "  " : segment;
+        const w = graphemeDisplayWidth(text);
         if (chunk && chunkWidth + w > widthLimit) {
           chunks.push(chunk);
           chunk = "";
@@ -1796,11 +1923,11 @@ export class SimpleTui {
           widthLimit = continuationLimit;
         }
         if (!chunk && w > widthLimit) {
-          chunks.push(ch);
+          chunks.push(text);
           widthLimit = continuationLimit;
           continue;
         }
-        chunk += ch;
+        chunk += text;
         chunkWidth += w;
       }
       chunks.push(chunk);
@@ -1847,9 +1974,13 @@ export class SimpleTui {
     }
 
     const cursorPrefix = wrappedCursorRowOffset === 0 ? firstPrefix : contPrefix;
+    // Keep the cursor inside the same conservative input width used for
+    // wrapping. Placing it in the terminal's last column can trigger implicit
+    // auto-wrap in several terminals/tmux/mobile clients, making the visible
+    // cursor appear one row below the input.
     const cursorCol = Math.max(
       1,
-      Math.min(Math.max(1, width), 1 + stringDisplayWidth(cursorPrefix) + stringDisplayWidth(cursorShown))
+      Math.min(Math.max(1, width - 1), 1 + stringDisplayWidth(cursorPrefix) + stringDisplayWidth(cursorShown))
     );
 
     return {
@@ -1941,7 +2072,7 @@ export class SimpleTui {
       const scrollLabel = ` lines ${Math.min(wrapped.length, this.overlayScroll + 1)}-${Math.min(wrapped.length, this.overlayScroll + visible.length)} / ${wrapped.length}`;
       const statusLine = truncateLine(scrollLabel, width);
       const frameLines = [sep, `\x1b[1m${title}\x1b[0m`, sep, ...visible, sep, `\x1b[2m${statusLine}\x1b[0m`, `\x1b[2m${hint}\x1b[0m`];
-      const frame = renderFrameLines(frameLines, width);
+      const frame = renderFrameLines(frameLines, width, height);
       this.lastFrameLineCount = frameLines.length;
       this.lastInputRow = 1;
       this.lastInputLine = "";
@@ -1956,7 +2087,7 @@ export class SimpleTui {
         });
         return;
       }
-      this.out.write("\x1b[?25l\x1b[H\x1b[2J" + frame + `\x1b[?25h\x1b[1;1H`);
+      this.out.write(TERMINAL_PAINT_PREFIX + terminalFrame(frame) + `\x1b[1;1H\x1b[?25h`);
       return;
     }
 
@@ -1977,6 +2108,8 @@ export class SimpleTui {
     const todoBlockLines = this.showTodoPanel ? 1 + todoLines : 0; // sep + content
     const approvalContentLines = this.approvalPrompt ? this.formatApprovalLines(width) : [];
     const approvalLines = this.approvalPrompt ? 1 + approvalContentLines.length : 0;
+    const clarificationContentLines = this.clarificationPrompt ? this.formatClarificationLines(width) : [];
+    const clarificationLines = this.clarificationPrompt ? 1 + clarificationContentLines.length : 0;
     const commandSuggestionLines = this.commandSuggestionsVisible ? (1 + this.commandSuggestions.length) : 0;
     const modelSuggestionViewport = this.modelSuggestionsVisible ? this.getModelSuggestionViewport() : null;
     const modelSuggestionLines = modelSuggestionViewport
@@ -1994,11 +2127,12 @@ export class SimpleTui {
     const thoughtStreamLines = 0;
     const inputState = this.buildInputState(this.currentInput, bottomWidth, cursorIndex);
     const inputLineCount = Math.max(1, inputState.lines.length);
-    const bottomLines = inputLineCount + 4 + commandSuggestionLines + modelSuggestionLines + hintLines + shortcutHintLines; // input + pickers + separators + status/hints
+    const bottomLines = inputLineCount + 2 + commandSuggestionLines + modelSuggestionLines + hintLines + shortcutHintLines; // input + separator + status/hints
     const reservedLines =
       headerLines +
       todoBlockLines +
       approvalLines +
+      clarificationLines +
       taskContextLines +
       thinkingLines +
       thoughtStreamLines +
@@ -2051,6 +2185,7 @@ export class SimpleTui {
           : `${" ".repeat(Math.max(0, bottomWidth - stringDisplayWidth(raw)))}${raw}`;
     }
     const approvalBlock = this.approvalPrompt ? [sep, ...approvalContentLines] : [];
+    const clarificationBlock = this.clarificationPrompt ? [sep, ...clarificationContentLines] : [];
     const taskContextBlock = taskContextLine ? ["", taskContextLine] : [];
     const thinkingColors = ["82", "118", "154", "190", "201"];
     const thinkingColor = thinkingColors[this.thinkingTick % thinkingColors.length];
@@ -2116,6 +2251,7 @@ export class SimpleTui {
       ...visibleLogs,
       ...todoLinesBlock,
       ...approvalBlock,
+      ...clarificationBlock,
       ...taskContextBlock,
       ...thinkingBlock,
       ...thoughtStreamBlock,
@@ -2132,11 +2268,11 @@ export class SimpleTui {
       ...(this.inputHint ? [`\x1b[2m${truncateLine(` ${this.inputHint}`, bottomWidth)}\x1b[0m`] : []),
     ];
 
-    const frame = renderFrameLines(frameLines, width);
+    const frame = renderFrameLines(frameLines, width, height);
     this.lastFrameLineCount = frameLines.length;
     this.lastInputRow = Math.max(1, beforeInputLines.length + 1);
     this.lastInputLine = inputState.lines.join("\n");
-    const cursorRow = this.lastInputRow + Math.max(0, inputState.cursorRowOffset);
+    const cursorRow = Math.max(1, Math.min(height, this.lastInputRow + Math.max(0, inputState.cursorRowOffset)));
     if (this.layout) {
       const inputComposite = [
         ...inputState.lines.map((line) => line),
@@ -2157,6 +2293,6 @@ export class SimpleTui {
       });
       return;
     }
-    this.out.write("\x1b[?25l\x1b[H\x1b[2J" + frame + `\x1b[?25h\x1b[${cursorRow};${inputState.cursorCol}H`);
+    this.out.write(TERMINAL_PAINT_PREFIX + terminalFrame(frame) + `\x1b[${cursorRow};${inputState.cursorCol}H\x1b[?25h`);
   }
 }

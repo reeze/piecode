@@ -12,6 +12,7 @@ const state = {
   messages: [],
   timeline: [],
   approvals: [],
+  clarifications: [],
   todos: [],
   slashCommands: [],
   selectedSuggestion: 0,
@@ -303,7 +304,26 @@ function approvalReason(item) {
   return details.classification?.reason || details.reason || details.question || "Review this action before PieCode continues.";
 }
 
+function renderClarifications() {
+  const clarificationHtml = state.clarifications
+    .map((item) => `<div class="approval-item clarification-item">
+      <strong>${escapeHtml(item.question || "Clarification needed")}</strong>
+      <div class="muted">Choose ${item.multiple ? "one or more options" : "one option"} so PieCode can continue.</div>
+      <div class="approval-actions clarification-actions">
+        ${(Array.isArray(item.options) ? item.options : []).map((option, index) => `<button class="secondary" data-clarification="${escapeHtml(item.id)}" data-option-index="${index}">
+          ${escapeHtml(option.label || option.value || `Option ${index + 1}`)}${option.description ? `<small>${escapeHtml(option.description)}</small>` : ""}
+        </button>`).join("")}
+        ${item.required ? "" : `<button class="danger" data-clarification="${escapeHtml(item.id)}" data-option-index="">Skip</button>`}
+      </div>
+    </div>`)
+    .join("");
+
+  document.body.classList.toggle("has-clarifications", state.clarifications.length > 0);
+  return clarificationHtml;
+}
+
 function renderApprovals() {
+  const clarificationHtml = renderClarifications();
   const approvalHtml = state.approvals
     .map((item) => `<div class="approval-item">
       <strong>${escapeHtml(approvalTitle(item))}</strong>
@@ -318,18 +338,20 @@ function renderApprovals() {
     </div>`)
     .join("");
 
-  document.body.classList.toggle("has-approvals", state.approvals.length > 0);
-  if (!state.approvals.length) {
+  const pendingCount = state.approvals.length + state.clarifications.length;
+  document.body.classList.toggle("has-approvals", pendingCount > 0);
+  if (!pendingCount) {
     el.approvalList.className = "muted";
     el.approvalList.innerHTML = "No pending approvals";
     el.mobileApprovalPanel.hidden = true;
     el.mobileApprovalList.innerHTML = "";
     return;
   }
+  const combinedHtml = `${clarificationHtml}${approvalHtml}`;
   el.approvalList.className = "";
-  el.approvalList.innerHTML = approvalHtml;
+  el.approvalList.innerHTML = combinedHtml;
   el.mobileApprovalPanel.hidden = false;
-  el.mobileApprovalList.innerHTML = approvalHtml;
+  el.mobileApprovalList.innerHTML = combinedHtml;
 }
 
 function renderSessions() {
@@ -557,6 +579,7 @@ function applySnapshot(snapshot) {
   if (Array.isArray(snapshot.timeline)) state.timeline = snapshot.timeline;
   else state.timeline = state.messages.map((msg) => ({ ...msg, type: "message" }));
   if (Array.isArray(snapshot.approvals)) state.approvals = snapshot.approvals;
+  if (Array.isArray(snapshot.clarifications)) state.clarifications = snapshot.clarifications;
   if (Array.isArray(snapshot.todos)) state.todos = snapshot.todos;
   if (Array.isArray(snapshot.slashCommands)) state.slashCommands = snapshot.slashCommands;
   renderStatus(snapshot);
@@ -596,6 +619,18 @@ function handleEvent(event) {
     state.approvals = state.approvals.filter((item) => item.id !== payload.id);
     renderApprovals();
     pushEvent(`Approval ${payload.decision}`);
+    return;
+  }
+  if (type === "clarification.request") {
+    state.clarifications = [payload, ...state.clarifications.filter((item) => item.id !== payload.id)];
+    renderApprovals();
+    pushEvent("Clarification required");
+    return;
+  }
+  if (type === "clarification.resolved") {
+    state.clarifications = state.clarifications.filter((item) => item.id !== payload.id);
+    renderApprovals();
+    pushEvent("Clarification answered");
     return;
   }
   if (type === "todos") {
@@ -688,7 +723,7 @@ function connectEvents() {
     el.connection.className = "pill";
   };
   const eventTypes = [
-    "snapshot", "ready", "message", "timeline", "timeline.update", "approval.request", "approval.resolved", "todos", "sessions",
+    "snapshot", "ready", "message", "timeline", "timeline.update", "approval.request", "approval.resolved", "clarification.request", "clarification.resolved", "todos", "sessions",
     "task.start", "task.done", "task.error", "tool_use", "tool_start", "tool_end",
     "plan", "replan", "thought", "log", "model_call", "planning_call", "replanning_call", "llm_response", "context.update",
   ];
@@ -822,11 +857,30 @@ el.recentSessions.addEventListener("click", async (evt) => {
 });
 
 async function handleApprovalClick(evt) {
+  const clarificationButton = evt.target.closest("button[data-clarification]");
+  if (clarificationButton) {
+    clarificationButton.disabled = true;
+    const rawIndex = clarificationButton.dataset.optionIndex;
+    const selectedIndexes = rawIndex === "" ? [] : [Number(rawIndex)];
+    const id = clarificationButton.dataset.clarification;
+    state.clarifications = state.clarifications.filter((item) => item.id !== id);
+    renderApprovals();
+    try {
+      await postJson("/api/clarifications", { id, selectedIndexes });
+    } catch (err) {
+      pushEvent(err.message);
+    }
+    return;
+  }
+
   const button = evt.target.closest("button[data-approval]");
   if (!button) return;
   button.disabled = true;
+  const id = button.dataset.approval;
+  state.approvals = state.approvals.filter((item) => item.id !== id);
+  renderApprovals();
   try {
-    await postJson("/api/approvals", { id: button.dataset.approval, decision: button.dataset.decision });
+    await postJson("/api/approvals", { id, decision: button.dataset.decision });
   } catch (err) {
     pushEvent(err.message);
   }

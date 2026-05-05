@@ -879,6 +879,57 @@ describe("agent context controls", () => {
     expect(batchedResults?.toolResults).toHaveLength(2);
   });
 
+  test("recovers when native model returns empty final after tool use", async () => {
+    let nativeTurns = 0;
+    let finalizeTurns = 0;
+    const agent = new Agent({
+      provider: {
+        kind: "openrouter-compatible",
+        model: "test-model",
+        supportsNativeTools: true,
+        async complete(args = {}) {
+          if (args?.tools) {
+            nativeTurns += 1;
+            if (nativeTurns === 1) {
+              return {
+                message: {
+                  role: "assistant",
+                  content: "",
+                  tool_calls: [
+                    {
+                      id: "read:0",
+                      type: "function",
+                      function: { name: "read_file", arguments: "{\"path\":\"AGENTS.md\"}" },
+                    },
+                  ],
+                },
+                finishReason: "tool_calls",
+              };
+            }
+            return {
+              message: { role: "assistant", content: "" },
+              finishReason: "stop",
+            };
+          }
+          finalizeTurns += 1;
+          return "Recovered final summary from collected evidence.";
+        },
+      },
+      workspaceDir: process.cwd(),
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      activeSkillsRef: { value: [] },
+      projectInstructionsRef: { value: null },
+    });
+
+    const result = await agent.runTurn("inspect AGENTS.md and summarize");
+
+    expect(nativeTurns).toBe(2);
+    expect(finalizeTurns).toBe(1);
+    expect(result).toBe("Recovered final summary from collected evidence.");
+    expect(agent.history[agent.history.length - 1]?.content).toBe("Recovered final summary from collected evidence.");
+  });
+
   test("native llm_request logs full messages including user prompt", async () => {
     const llmRequests = [];
     const agent = new Agent({

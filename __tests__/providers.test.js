@@ -125,6 +125,59 @@ describe('provider selection', () => {
     }
   });
 
+  test('openai-compatible providers include configured thinking effort', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = async (_url, init) => {
+      const body = JSON.parse(String(init?.body || '{}'));
+      expect(body.reasoning_effort).toBe('xhigh');
+      expect(body.reasoning).toMatchObject({ effort: 'xhigh' });
+      return new Response(
+        JSON.stringify({ choices: [{ message: { role: 'assistant', content: 'ok' } }] }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    };
+
+    try {
+      const provider = getProvider({
+        provider: 'openai',
+        apiKey: 'openai-test-key',
+        model: 'gpt-5-mini',
+        thinkingEffort: 'extra-high',
+      });
+      expect(provider.thinkingEffort).toBe('xhigh');
+      await provider.complete({ systemPrompt: 'sys', prompt: 'hello' });
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  test('anthropic provider does not send openai reasoning fields', async () => {
+    const originalFetch = global.fetch;
+    global.fetch = async (_url, init) => {
+      const body = JSON.parse(String(init?.body || '{}'));
+      expect(body.reasoning).toBeUndefined();
+      expect(body.reasoning_effort).toBeUndefined();
+      expect(body.thinking).toBeUndefined();
+      return new Response(
+        JSON.stringify({ content: [{ type: 'text', text: 'ok' }], usage: { input_tokens: 1, output_tokens: 1 } }),
+        { status: 200, headers: { 'content-type': 'application/json' } }
+      );
+    };
+
+    try {
+      const provider = getProvider({
+        provider: 'anthropic',
+        apiKey: 'anthropic-test-key',
+        model: 'claude-test',
+        thinkingEffort: 'high',
+      });
+      expect(provider.thinkingEffort).toBe('high');
+      await provider.complete({ systemPrompt: 'sys', prompt: 'hello' });
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
   test('openrouter complete stores normalized usage metadata', async () => {
     const originalFetch = global.fetch;
     global.fetch = async () =>
@@ -200,6 +253,8 @@ describe('provider selection', () => {
       expect(body.store).toBe(false);
       expect(body.instructions).toBe('sys');
       expect(body.input?.[0]?.role).toBe('user');
+      expect(body.reasoning).toMatchObject({ effort: 'high' });
+      expect(body.thinking).toBeUndefined();
       const chunks = [
         'data: {"type":"response.output_text.delta","delta":"{\\"type\\":\\"final\\","}\n\n',
         'data: {"type":"response.output_text.delta","delta":"\\"message\\":\\"done\\"}"}\n\n',
@@ -220,7 +275,8 @@ describe('provider selection', () => {
     };
 
     try {
-      const provider = getProvider({ provider: 'codex' });
+      const provider = getProvider({ provider: 'codex', thinkingEffort: 'high' });
+      expect(provider.thinkingEffort).toBe('high');
       const deltas = [];
       const text = await provider.completeStream({
         systemPrompt: 'sys',

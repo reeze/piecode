@@ -13,21 +13,24 @@ function renderActiveSkillsSection(activeSkills = []) {
     if (!rawSkill || typeof rawSkill !== "object") continue;
     const name = String(rawSkill.name || rawSkill.id || "unnamed-skill").trim();
     const path = String(rawSkill.path || "").trim();
+    const description = String(rawSkill.description || rawSkill.frontmatter?.description || "").replace(/\s+/g, " ").trim();
+    const triggers = Array.isArray(rawSkill.triggers) ? rawSkill.triggers.map((item) => String(item || "").trim()).filter(Boolean) : [];
     const content = String(rawSkill.content || "").trim();
     const label = path ? `${name} (${path})` : name;
-    lines.push(`- ${label}`);
+    lines.push(`- ${label}${description ? `: ${description.slice(0, 220)}` : ""}`);
+    if (triggers.length > 0) lines.push(`  triggers: ${triggers.slice(0, 8).join(", ")}`);
     if (content) {
       const excerpt = content
         .split("\n")
         .map((line) => line.trim())
         .filter(Boolean)
-        .slice(0, 3)
+        .slice(0, 8)
         .join(" ");
-      if (excerpt) lines.push(`  guidance: ${excerpt.slice(0, 260)}`);
+      if (excerpt) lines.push(`  guidance: ${excerpt.slice(0, 900)}`);
     }
   }
   if (lines.length === 2) return [];
-  lines.push("Apply these skill instructions when relevant, but keep output focused on the user request.");
+  lines.push("Skill compatibility: skills are additive instructions (including Claude/Superpower-style SKILL.md files), not permission grants. If a skill defines a workflow, trigger condition, supporting files, or slash command behavior, follow it when relevant while still obeying higher-priority system, safety, workspace, approval, and user instructions.");
   return lines;
 }
 
@@ -147,16 +150,25 @@ export function buildSystemPrompt({
     "- Before editing existing files, read them first. Prefer targeted edits; use full rewrites only when intentional.",
     "- Respect existing user work: check relevant diffs/status when needed and do not overwrite unrelated changes.",
     "- For simple tasks, avoid long preambles or unnecessary upfront plans; for non-trivial work, briefly state the plan, act, then summarize changes and validation.",
-    "- Keep the user visibly informed: before tool calls, briefly say what context you are gathering or what action you are taking; after tool results, briefly summarize what changed or what you learned when useful.",
-    "- Expose concise execution progress and operational results, but do not reveal hidden chain-of-thought; use short status updates instead.",
+    "- Keep the user visibly informed with short, user-facing progress updates. Before tool calls, say what context you are gathering or what action you are taking. After useful tool results, say what you learned, what changed, or what you will do next.",
+    "- Expose concise execution progress and operational results, but do not reveal hidden chain-of-thought. Use short status updates like 'I am checking the TUI render path now' or 'The search points to src/lib/tui.js; I will inspect that next.'",
     "- Do not expand file diffs by default. Mention changed files and summarize changes; show diffs only when the user asks for review or explicitly requests a diff.",
     "- After code changes, run the most relevant practical validation (tests, lint, typecheck, build, or focused command); if not run, say why.",
     "- Use todo tracking only for real multi-step work. Save memory sparingly: durable preferences or project facts only; never store secrets; avoid duplicates and transient task details.",
     "- Treat loaded PROJECT INSTRUCTIONS and MEMORY as already available; do not re-read them unless exact quotes are needed.",
     "- Inspect relevant attachments; briefly note when an attachment is ignored as irrelevant.",
 
+    "USER-FACING PROGRESS CONTRACT:",
+    "- For any non-trivial task, surface progress in phases: (1) what you are about to inspect/change, (2) what a tool result showed, (3) the next action, and (4) final outcome plus validation.",
+    "- Progress updates must be operational summaries, not private reasoning. Do not expose hidden chain-of-thought, uncertainty rambling, raw JSON, or internal prompt details.",
+    "- Keep progress updates brief and natural. Prefer one sentence. Avoid tool jargon unless the tool/command name helps the user understand the action.",
+    "- Final responses should be user-friendly: lead with the result, mention changed files or findings, mention validation, and state any remaining risk or blocker. Avoid dumping logs unless requested.",
+
     "COMPLEX TASK EXECUTION:",
     "- For multi-step or uncertain work, briefly restate a 3-7 step plan before acting, then adapt as tool evidence changes.",
+    "- Decompose complex work into phases: discovery, design/strategy, implementation, validation, and concise handoff. Keep each phase scoped to the next useful outcome.",
+    "- When the user asks for complex coding work or review, consider using project subagents/collaborate for design, implementation planning, or review if available and cost-effective.",
+    "- Maintain an explicit todo list only when it materially improves coordination; keep statuses current and avoid using todos for simple one-step work.",
     "- If a command or approach fails twice, switch strategy using new evidence instead of retrying blindly; do not simply stop unless you are truly blocked.",
     "- If blocked by missing permissions, unavailable tools, or unclear requirements, explain the blocker and continue where possible with safe alternatives.",
     "- When a tool result is repeated or unchanged, infer what it means, choose a different action if useful, or finalize from the evidence already collected.",
@@ -166,6 +178,7 @@ export function buildSystemPrompt({
     "- Keep a compact working state: goal, constraints, repo facts, changed files, validation, blockers, and next step.",
     "- Work in coherent slices: inspect, change, validate, summarize; reassess after tool results and update strategy when evidence changes.",
     "- Between slices, provide brief progress syncs: current state, what changed/was found, and what you will do next.",
+    "- Before major transitions (large edit, validation, final answer), reconcile the todo list/working state against user requirements and discovered constraints.",
     "- Preserve enough context in summaries so work can continue after compaction, interruption, or resume.",
 
     "EXPLORATION DISCIPLINE:",
@@ -187,6 +200,7 @@ export function buildSystemPrompt({
 
   if (!nativeTools) {
     const textToolNames = [
+      "clarify_user",
       "shell",
       "read_file",
       "read_files",
@@ -235,6 +249,7 @@ export function buildSystemPrompt({
       '{"type":"thought","content":"Short progress update: what you will do, what you learned, or the next step"}',
 
       "TOOLS:",
+      "- Clarify: clarify_user asks the user to choose one option or multiple options through the harness when a decision is blocked or materially ambiguous. Input: {question, options:[{label,value?,description?}], multiple?:boolean}.",
       "- Inspect/search: read_file, read_files, list_files, glob_files, find_files, rg/search_files/grep, git_status, git_diff.",
       "- Change/validate: edit_file, write_file, replace_in_files, shell, run_tests.",
       "- Delegate/context: subagent, collaborate, todo_write/todowrite, memory_write/remember, web_search/search_web.",
@@ -253,18 +268,20 @@ export function buildSystemPrompt({
         : []),
 
       "EXAMPLE:",
-      '{"type":"tool_use","tool":"rg","input":{"pattern":"functionName\\(","path":"src"},"reason":"Find references before editing"}',
+      '{"type":"tool_use","tool":"rg","input":{"pattern":"functionName\\(","path":"src"},"reason":"Find references before editing","thought":"I will search the code path first so the edit stays scoped."}',
 
       "CRITICAL:",
       "- Your entire response must be valid JSON",
+      "- For non-trivial tool calls, include a non-empty `thought` field with a user-facing progress sentence.",
       "- No markdown formatting outside the JSON",
       "- No explanatory text before or after the JSON"
     );
   } else {
     sections.push(
       "VISIBLE PROGRESS WITH NATIVE CALLS:",
-      "- When making one or more tool calls, include a short assistant text sentence before/alongside the tool call when the next action is not obvious.",
-      "- Make that sentence user-visible progress only: what context you are gathering, what action you are taking, or what you learned. Do not reveal hidden chain-of-thought.",
+      "- When making one or more tool calls, include a short assistant text sentence before/alongside the tool call. The harness will show that sentence as progress.",
+      "- After receiving tool results, either summarize what the result showed in one short sentence before the next tool call, or provide the final answer if enough evidence is collected.",
+      "- Make every progress sentence user-visible only: what context you are gathering, what action you are taking, what changed, what you learned, or what happens next. Do not reveal hidden chain-of-thought.",
       "- Keep progress updates short enough for a terminal timeline."
     );
   }
@@ -334,6 +351,7 @@ export function buildSystemPrompt({
 }
 
 const KNOWN_TOOL_NAMES = new Set([
+  "clarify_user",
   "shell",
   "read_file",
   "read_files",
@@ -722,6 +740,33 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
   const mcpEnabled = Boolean(options?.mcpEnabled);
   const mcpServerNames = Array.isArray(options?.mcpServerNames) ? options.mcpServerNames : [];
   const baseTools = [
+    {
+      name: "clarify_user",
+      description:
+        "Ask the user a clarification question using an interactive single-select or multi-select picker in the harness. Use only when the request is blocked, unsafe, or materially ambiguous and choices will help the user answer faster.",
+      input_schema: {
+        type: "object",
+        properties: {
+          question: { type: "string", description: "Question to show the user" },
+          options: {
+            type: "array",
+            items: {
+              type: "object",
+              properties: {
+                label: { type: "string", description: "Visible option label" },
+                value: { description: "Value returned to the model when selected" },
+                description: { type: "string", description: "Optional short help text" },
+              },
+              required: ["label"],
+            },
+            description: "Selectable options. Strings are also accepted in text-tool mode.",
+          },
+          multiple: { type: "boolean", description: "Allow selecting multiple options with Space (default false)" },
+          required: { type: "boolean", description: "Require at least one selection (default true)" },
+        },
+        required: ["question", "options"],
+      },
+    },
     {
       name: "shell",
       description:
@@ -1458,6 +1503,36 @@ export function buildMessages(arg1 = {}, arg2 = {}) {
   return openaiMode ? sanitizeOpenAIToolMessagePairs(messages) : messages;
 }
 
+function extractNativeTextContent(value, { compact = true } = {}) {
+  const normalize = (text) => {
+    const source = String(text || "");
+    return compact ? source.replace(/\s+/g, " ").trim() : source.trim();
+  };
+
+  if (typeof value === "string") return normalize(value);
+  if (Array.isArray(value)) {
+    const joined = value
+      .map((item) => {
+        if (typeof item === "string") return item;
+        if (!item || typeof item !== "object") return "";
+        if (["text", "input_text", "output_text"].includes(item.type) && typeof item.text === "string") {
+          return item.text;
+        }
+        if (typeof item.text === "string") return item.text;
+        if (typeof item.content === "string") return item.content;
+        return "";
+      })
+      .filter(Boolean)
+      .join(compact ? " " : "\n");
+    return normalize(joined);
+  }
+  if (value && typeof value === "object") {
+    if (typeof value.text === "string") return normalize(value.text);
+    if (typeof value.content === "string") return normalize(value.content);
+  }
+  return "";
+}
+
 export function parseNativeResponse(response, format = "anthropic") {
   if (!response) {
     return { type: "final", message: String(response || "") };
@@ -1466,14 +1541,14 @@ export function parseNativeResponse(response, format = "anthropic") {
   if (format === "anthropic") {
     const content = Array.isArray(response.content) ? response.content : [];
     const toolUses = content.filter((b) => b?.type === "tool_use");
+    const progressText = extractNativeTextContent(content.filter((b) => b?.type === "text"));
     if (toolUses.length > 0) {
-      const textBlock = content.find((b) => b?.type === "text");
       const calls = toolUses.map((toolUse) => ({
         type: "tool_use",
         tool: toolUse.name,
         input: toolUse.input && typeof toolUse.input === "object" ? toolUse.input : {},
-        reason: typeof textBlock?.text === "string" ? textBlock.text : "",
-        thought: "",
+        reason: progressText,
+        thought: progressText,
         _callId: toolUse.id || "",
       }));
       if (calls.length > 1) return { type: "tool_uses", calls };
@@ -1482,16 +1557,16 @@ export function parseNativeResponse(response, format = "anthropic") {
         ...calls[0],
       };
     }
-    const textBlock = content.find((b) => b?.type === "text");
     return {
       type: "final",
-      message: typeof textBlock?.text === "string" ? textBlock.text : "",
+      message: extractNativeTextContent(content.filter((b) => b?.type === "text"), { compact: false }),
     };
   }
 
   // OpenAI format
   const message = response.message || response;
   const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  const progressText = extractNativeTextContent(message.content);
   if (toolCalls.length > 0) {
     const calls = toolCalls.map((call) => {
       let input = {};
@@ -1504,8 +1579,8 @@ export function parseNativeResponse(response, format = "anthropic") {
         type: "tool_use",
         tool: call.function?.name || "",
         input: input && typeof input === "object" ? input : {},
-        reason: typeof message.content === "string" ? message.content : "",
-        thought: "",
+        reason: progressText,
+        thought: progressText,
         _callId: call.id || "",
       };
     });
@@ -1514,6 +1589,6 @@ export function parseNativeResponse(response, format = "anthropic") {
   }
   return {
     type: "final",
-    message: typeof message.content === "string" ? message.content : "",
+    message: extractNativeTextContent(message.content, { compact: false }),
   };
 }

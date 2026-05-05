@@ -344,7 +344,7 @@ function sendSse(res, event) {
   res.write(`data: ${JSON.stringify(event)}\n\n`);
 }
 
-class ApprovalBroker {
+export class ApprovalBroker {
   constructor({ publish }) {
     this.publish = publish;
     this.pending = new Map();
@@ -372,6 +372,77 @@ class ApprovalBroker {
     const value = String(decision || "deny").trim().toLowerCase() || "deny";
     item.resolve(value);
     this.publish("approval.resolved", { id: item.id, decision: value });
+    return true;
+  }
+
+  list() {
+    return [...this.pending.values()].map(({ resolve, ...item }) => item);
+  }
+}
+
+function normalizeClarificationOptions(options) {
+  if (!Array.isArray(options)) return [];
+  return options
+    .map((option, index) => {
+      if (typeof option === "string") {
+        const label = option.trim();
+        return label ? { id: `option-${index + 1}`, label, value: label, description: "" } : null;
+      }
+      if (!option || typeof option !== "object") return null;
+      const label = String(option.label || option.title || option.name || option.value || option.id || "").trim();
+      if (!label) return null;
+      return {
+        id: String(option.id || `option-${index + 1}`),
+        label,
+        value: option.value ?? option.id ?? label,
+        description: String(option.description || option.detail || "").trim(),
+      };
+    })
+    .filter(Boolean);
+}
+
+export class ClarificationBroker {
+  constructor({ publish }) {
+    this.publish = publish;
+    this.pending = new Map();
+  }
+
+  request({ question, options, multiple = false, required = true } = {}) {
+    const id = makeId("clarification");
+    const normalized = {
+      id,
+      question: String(question || "").trim(),
+      options: normalizeClarificationOptions(options),
+      multiple: Boolean(multiple),
+      required: Boolean(required),
+      createdAt: new Date().toISOString(),
+    };
+    const promise = new Promise((resolve) => {
+      this.pending.set(id, { ...normalized, resolve });
+    });
+    this.publish("clarification.request", normalized);
+    return promise;
+  }
+
+  resolve(id, selectedIndexes = []) {
+    const item = this.pending.get(String(id || ""));
+    if (!item) return false;
+    const indexes = (Array.isArray(selectedIndexes) ? selectedIndexes : [selectedIndexes])
+      .map((idx) => Math.floor(Number(idx)))
+      .filter((idx) => Number.isInteger(idx) && idx >= 0 && idx < item.options.length);
+    const unique = [...new Set(item.multiple ? indexes : indexes.slice(0, 1))];
+    if (item.required && unique.length === 0) return false;
+    this.pending.delete(item.id);
+    const selected = unique.map((idx) => {
+      const option = item.options[idx];
+      return {
+        label: option.label,
+        value: option.value,
+        ...(option.description ? { description: option.description } : {}),
+      };
+    });
+    item.resolve({ selected });
+    this.publish("clarification.resolved", { id: item.id, selectedIndexes: unique });
     return true;
   }
 
@@ -409,6 +480,7 @@ class WebAgentSession {
     this.projectInstructionsRef = { value: null };
     this.mcpHub = null;
     this.approvals = new ApprovalBroker({ publish: (type, payload) => this.publish(type, payload) });
+    this.clarifications = new ClarificationBroker({ publish: (type, payload) => this.publish(type, payload) });
   }
 
   async init() {
@@ -441,6 +513,7 @@ class WebAgentSession {
       autoApproveRef: this.autoApproveRef,
       shellPermissionRef: this.shellPermissionRef,
       askApproval: (kind, details) => this.askApproval(kind, details),
+      askClarification: (prompt) => this.askClarification(prompt),
       activeSkillsRef: this.activeSkillsRef,
       projectInstructionsRef: this.projectInstructionsRef,
       mcpHub: this.mcpHub,
@@ -474,6 +547,10 @@ class WebAgentSession {
     const safeDetails = details && typeof details === "object" ? { ...details } : {};
     if (safeDetails.input) safeDetails.input = redactInput(safeDetails.input);
     return this.approvals.request(kind, safeDetails);
+  }
+
+  askClarification(prompt = {}) {
+    return this.clarifications.request(prompt);
   }
 
   publish(type, payload = {}) {
@@ -578,6 +655,7 @@ class WebAgentSession {
       messages: this.messages.slice(-100),
       timeline: this.timeline.slice(-200),
       approvals: this.approvals.list(),
+      clarifications: this.clarifications.list(),
       contextUsage: this.getContextUsage(),
     };
   }
@@ -1128,6 +1206,12 @@ export async function main() {
       if (req.method === "POST" && url.pathname === "/api/approvals") {
         const body = await readJsonBody(req);
         const ok = session.approvals.resolve(body.id, body.decision);
+        jsonResponse(res, ok ? 200 : 404, { ok });
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/clarifications") {
+        const body = await readJsonBody(req);
+        const ok = session.clarifications.resolve(body.id, body.selectedIndexes || body.selected);
         jsonResponse(res, ok ? 200 : 404, { ok });
         return;
       }

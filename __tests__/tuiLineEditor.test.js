@@ -98,6 +98,22 @@ describe("tui line editor", () => {
     rl.close();
   });
 
+  test("write supports ctrl+b/ctrl+f cursor movement for programmatic completions", () => {
+    const source = new EventEmitter();
+    const rl = new TuiLineEditor({ keypressSource: source });
+
+    rl.write("中文🙂abc");
+    rl.write(null, { ctrl: true, name: "b" });
+    rl.write(null, { ctrl: true, name: "b" });
+    expect(rl.cursor).toBe("中文🙂a".length);
+    rl.write("X");
+    expect(rl.line).toBe("中文🙂aXbc");
+    rl.write(null, { ctrl: true, name: "f" });
+    rl.write("Y");
+    expect(rl.line).toBe("中文🙂aXbYc");
+    rl.close();
+  });
+
   test("handleKeypress can collect and submit input without a pending question", () => {
     const source = new EventEmitter();
     const rl = new TuiLineEditor({ keypressSource: source });

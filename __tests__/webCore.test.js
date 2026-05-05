@@ -1,5 +1,11 @@
 import { clipDiffText, getSessionDiff, parseToolResultDetails } from "../src/web/core.js";
-import { isAuthorizedWebRequest, normalizeWebAttachments, resolveWebBindOptions, validateWebOrigin } from "../src/web/server.js";
+import {
+  ClarificationBroker,
+  isAuthorizedWebRequest,
+  normalizeWebAttachments,
+  resolveWebBindOptions,
+  validateWebOrigin,
+} from "../src/web/server.js";
 
 describe("web server security helpers", () => {
   test("binds to loopback by default", () => {
@@ -33,6 +39,23 @@ describe("web server security helpers", () => {
   test("rejects web image attachment mime mismatches", () => {
     const gif = Buffer.from("GIF89a", "ascii");
     expect(() => normalizeWebAttachments([{ type: "image", mimeType: "image/png", data: gif.toString("base64") }])).toThrow(/does not match/);
+  });
+
+  test("clarification broker resolves selected options with stable payloads", async () => {
+    const events = [];
+    const broker = new ClarificationBroker({ publish: (type, payload) => events.push({ type, payload }) });
+    const promise = broker.request({
+      question: "Choose mode",
+      options: [{ label: "Fast", value: "fast" }, { label: "Safe", value: "safe" }],
+      multiple: false,
+      required: true,
+    });
+
+    expect(broker.list()).toHaveLength(1);
+    expect(events[0]).toMatchObject({ type: "clarification.request", payload: { question: "Choose mode", multiple: false } });
+    expect(broker.resolve(events[0].payload.id, [1])).toBe(true);
+    await expect(promise).resolves.toEqual({ selected: [{ label: "Safe", value: "safe" }] });
+    expect(events[1]).toMatchObject({ type: "clarification.resolved", payload: { id: events[0].payload.id, selectedIndexes: [1] } });
   });
 });
 

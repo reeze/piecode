@@ -90,6 +90,14 @@ export class TuiLineEditor {
       this.cursor = this.line.length;
       return;
     }
+    if (key && key.ctrl && String(key.name || "").toLowerCase() === "b") {
+      this.cursor = previousGraphemeIndex(this.line, this.cursor);
+      return;
+    }
+    if (key && key.ctrl && String(key.name || "").toLowerCase() === "f") {
+      this.cursor = nextGraphemeIndex(this.line, this.cursor);
+      return;
+    }
     if (typeof data !== "string" || !data) return;
     const head = this.line.slice(0, this.cursor);
     const tail = this.line.slice(this.cursor);

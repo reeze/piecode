@@ -279,6 +279,8 @@ body.has-approvals #approvalPanel {
   box-shadow: 0 0 0 1px rgba(255, 107, 120, .18), 0 18px 42px rgba(255, 107, 120, .12);
 }
 .approval-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 7px; margin-top: 9px; }
+.clarification-actions button { display: flex; flex-direction: column; align-items: flex-start; gap: 2px; text-align: left; }
+.clarification-actions small { color: var(--muted); font-weight: 600; }
 .mobile-approval-panel { display: none; }
 .todo-item { display: flex; gap: 8px; align-items: flex-start; font-size: 13px; }
 .todo-mark { color: var(--muted); }

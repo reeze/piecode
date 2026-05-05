@@ -38,6 +38,9 @@ export SEED_MODEL="doubao-seed-code-preview-latest"                  # optional
 # (reads ~/.codex/auth.json automatically)
 codex login
 export CODEX_MODEL="gpt-5-codex"                    # optional
+
+# Optional thinking/reasoning effort for supported models/providers
+export PIECODE_THINKING_EFFORT="high"                # none/minimal/low/medium/high/xhigh (provider-dependent)
 ```
 
 Or use persistent settings in `~/.piecode/settings.json`:
@@ -46,6 +49,7 @@ Or use persistent settings in `~/.piecode/settings.json`:
 {
   "provider": "seed",
   "model": "doubao-seed-code-preview-latest",
+  "thinkingEffort": "high",
   "endpoint": "https://ark.cn-beijing.volces.com/api/coding",
   "skills": {
     "enabled": ["vercel-react-best-practices"],
@@ -94,6 +98,9 @@ node src/cli.js --skill vercel-react-best-practices --prompt "optimize this Reac
 # auto-enable by mention in prompt
 node src/cli.js --prompt "use $vercel-react-best-practices to optimize this React component"
 
+# choose thinking/reasoning effort for one run
+node src/cli.js --thinking-effort high --prompt "inspect this repo"
+
 # start simple full-screen TUI mode
 node src/cli.js --tui
 
@@ -124,7 +131,7 @@ npm run release
 npm run release -- --publish
 ```
 
-TUI includes live model status (running/idle/error), last turn duration, and last tool used.
+TUI includes live model status (running/idle/error), last turn duration, and last tool used. The TUI avoids continuous redraw animation by default for better behavior in mobile terminals/tmux; set `PIECODE_TUI_ANIMATION=1` to opt into a slow thinking spinner.
 
 Web UI is available with `node src/cli.js --web` or `npm run web`. It serves a browser-based agent workspace on `0.0.0.0` by default so other devices on the same LAN can open the printed network URL. The Web UI reuses the same Agent, provider, tool, MCP, skills, and approval backend as the CLI/TUI, with chat timeline, compact tool summaries, optional detail mode, session diff, TODOs, plan mode, abort, and shell approval controls. Web sessions are saved under `.piecode/web-sessions/`; use `/sessions` to list recent sessions and `/resume <short-id|session-id>` to restore one.
 
@@ -218,4 +225,5 @@ You can also mention `$skill-name` in a prompt to auto-enable that skill for the
 - Set `PIECODE_SKILLS_DIR` to override/extend skill root directories (comma-separated).
 - Set `PIECODE_PLAN_FIRST=1` to enable lightweight pre-plan (disabled by default).
 - Set `PIECODE_TOOL_BUDGET` to set initial planning budget guidance (default `6`, range `1-12`).
+- Set `PIECODE_THINKING_EFFORT` (or `PIECODE_REASONING_EFFORT`) to request model thinking/reasoning effort for supported providers (`none`, `minimal`, `low`, `medium`, `high`, `xhigh`). It can also be set with `--thinking-effort`, top-level `thinkingEffort`, or per-provider `providers.<name>.thinkingEffort` in settings.
 - Model suggestions for `/model` are loaded from both built-in defaults and `~/.piecode/settings.json` (`model` and `providers.*.model`).

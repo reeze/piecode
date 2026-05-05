@@ -105,6 +105,7 @@ describe("tools usability", () => {
       askApproval: async () => true,
     });
 
+    expect(typeof tools.clarify_user).toBe("function");
     expect(typeof tools.read_files).toBe("function");
     expect(typeof tools.glob_files).toBe("function");
     expect(typeof tools.find_files).toBe("function");
@@ -158,6 +159,71 @@ describe("tools usability", () => {
         role: "security-reviewer",
       },
     ]);
+  });
+
+  test("clarify_user delegates to harness and returns selected options", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    const calls = [];
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      askClarification: async (input) => {
+        calls.push(input);
+        return { selected: [input.options[1]] };
+      },
+    });
+
+    const raw = await tools.clarify_user({
+      question: "Pick mode",
+      multiple: true,
+      options: ["Fast", { label: "Safe", value: "safe", description: "More checks" }],
+    });
+
+    const parsed = JSON.parse(raw);
+    expect(parsed.type).toBe("clarification_response");
+    expect(parsed.multiple).toBe(true);
+    expect(parsed.selected).toEqual([{ id: "option-2", label: "Safe", value: "safe", description: "More checks" }]);
+    expect(calls[0].options).toHaveLength(2);
+    expect(calls[0].options[0].label).toBe("Fast");
+  });
+
+  test("clarify_user fails closed when no harness is available", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+    });
+
+    const result = await tools.clarify_user({
+      question: "Proceed with risky change?",
+      options: ["Yes", "No"],
+    });
+
+    expect(result).toContain("Clarification is unavailable");
+    expect(result).toContain("No clarification option was selected");
+    expect(result).not.toContain("Please reply with your selected option");
+  });
+
+  test("clarify_user validates input and handles cancelled selections", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+      askClarification: async () => ({ selected: [] }),
+    });
+
+    await expect(tools.clarify_user({ question: "", options: ["A"] })).resolves.toContain(
+      "clarification question is required"
+    );
+    await expect(tools.clarify_user({ question: "Pick", options: [] })).resolves.toContain(
+      "at least one clarification option is required"
+    );
+    await expect(tools.clarify_user({ question: "Pick", options: ["A"] })).resolves.toBe(
+      "No clarification option was selected."
+    );
   });
 
   test("read_files reads multiple files with structured output", async () => {

@@ -1,7 +1,7 @@
 import { SimpleTui } from "../src/lib/tui.js";
 
 function stripAnsi(text) {
-  return String(text || "").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+  return String(text || "").replace(/\x1b(?:\[[0-9;?]*[ -/]*[@-~]|[%()][ -~])/g, "").replace(/\r/g, "");
 }
 
 function createOut(columns = 100, rows = 28) {
@@ -138,7 +138,7 @@ describe("tui usability", () => {
     const taskLine = rawFrame.split("\n").find((line) => stripAnsi(line).includes("Task: short task"));
     expect(taskLine).toBeTruthy();
     expect(taskLine).toMatch(/Task: short task\s+\x1b\[0m/);
-    expect(stripAnsi(taskLine).length).toBe(out.columns - 1);
+    expect(stripAnsi(taskLine).length).toBe(out.columns - 2);
   });
 
   test("timeline inserts breathing room between task, tools, results, and response", () => {
@@ -189,7 +189,27 @@ describe("tui usability", () => {
     const responseLines = frameLines.filter((line) => line.includes("alpha") || /^\s{4,}\S/.test(line));
     expect(responseLines.length).toBeGreaterThan(1);
     expect(responseLines[0]).toMatch(/^\s*(?:•|\*)\s/);
-    expect(responseLines.slice(1).some((line) => /^\s{4}\S/.test(line))).toBe(true);
+    expect(responseLines.slice(1).some((line) => /^\s{2,}\S/.test(line))).toBe(true);
+  });
+
+  test("wrapped response lists align continuation text under item body", () => {
+    const out = createOut(36, 18);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.event("[response] 1. 这是一个很长的澄清选项，用来验证中文换行后不会错位");
+    tui.render();
+    const lines = latestFrame(out).split("\n");
+    const first = lines.find((line) => line.includes("1."));
+    const continuation = lines.find((line) => /^\s{7,}\S/.test(line));
+    expect(first).toBeTruthy();
+    expect(continuation).toBeTruthy();
   });
 
   test("formatTimelineLines maps key event types and hides thinking noise", () => {
@@ -205,7 +225,7 @@ describe("tui usability", () => {
     const taskLineRaw = tui.formatTimelineLines("[task] simplify repo")[0];
     expect(stripAnsi(taskLineRaw)).toContain("Task: simplify repo");
     expect(taskLineRaw).toContain("\x1b[1;37;48;5;236m");
-    expect(stripAnsi(taskLineRaw).length).toBe(out.columns - 1);
+    expect(stripAnsi(taskLineRaw).length).toBe(out.columns - 2);
     const okIcon = tui.symbols.ok;
     const failIcon = tui.symbols.fail;
     expect(tui.formatTimelineLines("[model] seed-openai-compatible:doubao")).toEqual([]);
@@ -279,6 +299,11 @@ describe("tui usability", () => {
     expect(hrResponse).toContain("before");
     expect(hrResponse).toContain("after");
     expect(hrResponse).not.toContain("------");
+    const spacedResponse = stripAnsi(
+      tui.formatTimelineLines("[response] 第一段\n\n1. 第一个选项\n\n2. 第二个选项").join("\n")
+    );
+    expect(spacedResponse).toContain(`${tui.symbols.response} 第一段\n\n1. 第一个选项\n\n2. 第二个选项`);
+    expect(spacedResponse).not.toContain("    1. 第一个选项");
     const plainResponse = stripAnsi(tui.formatTimelineLines("[response] hello world")[0]);
     expect(plainResponse.trim()).toBe(`${tui.symbols.response} hello world`);
     expect(plainResponse).not.toContain("Assistant:");
@@ -303,6 +328,7 @@ describe("tui usability", () => {
     expect(richMarkdown).toContain("[x] done item");
     expect(richMarkdown).toContain("◦ nested item");
     expect(richMarkdown).toContain("1. ordered item");
+    expect(richMarkdown).not.toContain("• •");
     expect(richMarkdown).toContain("│ Name");
     expect(richMarkdown).toContain("alpha");
     expect(richMarkdown).toContain("│ quoted note");
@@ -429,6 +455,56 @@ describe("tui usability", () => {
     }
   });
 
+  test("startup shortcut hint keeps cursor on typed prompt row", () => {
+    const out = createOut(80, 22);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.setStartupShortcutHint("keys: CTRL+L logs | CTRL+T todos");
+    tui.renderInput("abc", 3);
+    const lastWrite = out.writes[out.writes.length - 1] || "";
+    const plainLines = latestFrame(out).split("\n");
+    const inputRow = plainLines.findIndex((line) => line.includes(`${tui.symbols.prompt} abc`)) + 1;
+    expect(inputRow).toBeGreaterThan(0);
+    expect(tui.lastInputRow).toBe(inputRow);
+    expect(lastWrite).toContain(`\x1b[${inputRow};7H`);
+  });
+
+  test("clarification prompt reserves rows above input without moving cursor into choices", () => {
+    const out = createOut(72, 18);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.setClarificationPrompt({
+      question: "Choose mode",
+      options: [{ label: "Fast" }, { label: "Safe", description: "run more checks" }],
+      index: 1,
+      selected: new Set(),
+      multiple: false,
+    });
+    tui.renderInput("answer", 6);
+    const frame = latestFrame(out);
+    const lines = frame.split("\n");
+    const promptRow = lines.findIndex((line) => line.includes(`${tui.symbols.prompt} answer`)) + 1;
+    const choiceRow = lines.findIndex((line) => line.includes("Safe - run more checks")) + 1;
+    expect(choiceRow).toBeGreaterThan(0);
+    expect(promptRow).toBeGreaterThan(choiceRow);
+    expect(tui.lastInputRow).toBe(promptRow);
+    expect(out.writes[out.writes.length - 1]).toContain(`\x1b[${promptRow};10H`);
+  });
+
   test("contextual input hints render as prompt placeholder", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
@@ -483,7 +559,7 @@ describe("tui usability", () => {
     tui.start();
     const frame = latestFrame(out);
     expect(frame).toContain("Ready. Type /help for commands.");
-    expect((frame.match(/─{10,}/g) || []).length).toBeGreaterThanOrEqual(2);
+    expect((frame.match(/[-─]{10,}/g) || []).length).toBeGreaterThanOrEqual(2);
     expect(frame).not.toContain("status:");
     expect(frame).not.toContain("llm:");
     expect(frame).not.toContain("view:");
@@ -491,8 +567,8 @@ describe("tui usability", () => {
     expect(frame).not.toContain("TODO(");
   });
 
-  test("frame separators use unicode when supported", () => {
-    const out = createOut(80, 18);
+  test("status redraw covers full terminal height and does not keep old status rows", () => {
+    const out = createOut(80, 14);
     const tui = new SimpleTui({
       out,
       workspaceDir: "/tmp/work",
@@ -502,10 +578,73 @@ describe("tui usability", () => {
     });
 
     tui.start();
-    tui.event("[thought] Preparing tool: run_tests");
-    tui.renderInput("");
-    const raw = out.writes.join("");
-    expect(raw).toContain("──────────");
+    tui.onToolUse("edit_file");
+    tui.render("", "thinking...");
+    const raw = out.writes[out.writes.length - 1] || "";
+    const frame = stripAnsi(raw);
+    expect(frame.split("\n").length).toBeGreaterThanOrEqual(out.rows);
+    expect(frame).toContain("thinking...");
+    expect(frame).not.toContain("Using tool: edit_file");
+  });
+
+  test("thinking animation is disabled by default to avoid idle full-screen flicker", () => {
+    withEnv("PIECODE_TUI_ANIMATION", null, () => {
+      const out = createOut(80, 14);
+      const tui = new SimpleTui({
+        out,
+        workspaceDir: "/tmp/work",
+        providerLabel: () => "seed:model",
+        getSkillsLabel: () => "none",
+        getApprovalLabel: () => "off",
+      });
+
+      tui.start();
+      tui.onThinking("tool");
+      expect(tui.thinking).toBe(true);
+      expect(tui.thinkingTimer).toBeNull();
+    });
+  });
+
+  test("frame separators can use ascii when requested", () => {
+    withEnv("PIECODE_TUI_ASCII", "1", () => {
+      const out = createOut(80, 18);
+      const tui = new SimpleTui({
+        out,
+        workspaceDir: "/tmp/work",
+        providerLabel: () => "seed:model",
+        getSkillsLabel: () => "none",
+        getApprovalLabel: () => "off",
+      });
+
+      tui.start();
+      tui.event("[thought] Preparing tool: run_tests");
+      tui.renderInput("");
+      const raw = out.writes.join("");
+      expect(raw).toContain("----------");
+      expect(raw).not.toContain("─");
+    });
+  });
+
+  test("frame separators use unicode by default in utf8 terminals", () => {
+    withEnv("PIECODE_TUI_ASCII", null, () => {
+      withEnv("PIECODE_TUI_UNICODE", null, () => {
+        withEnv("TERM", "xterm-256color", () => {
+          const out = createOut(80, 18);
+          const tui = new SimpleTui({
+            out,
+            workspaceDir: "/tmp/work",
+            providerLabel: () => "seed:model",
+            getSkillsLabel: () => "none",
+            getApprovalLabel: () => "off",
+          });
+
+          tui.start();
+          tui.renderInput("");
+          const raw = out.writes.join("");
+          expect(raw).toContain("──────────");
+        });
+      });
+    });
   });
 
   test("wide characters do not overflow truncated status lines", () => {
@@ -520,7 +659,7 @@ describe("tui usability", () => {
 
     tui.start();
     tui.setLiveThought("界面可能错乱的问题".repeat(10));
-    const frame = String(out.writes[out.writes.length - 1] || "").replace(/\x1b\[[0-9;?]*[ -/]*[@-~]/g, "");
+    const frame = stripAnsi(out.writes[out.writes.length - 1] || "");
     const width = out.columns - 1;
     for (const line of frame.split("\n")) {
       const printableWidth = Array.from(line).reduce((sum, ch) => {
@@ -745,7 +884,7 @@ describe("tui usability", () => {
       .find((line) => stripAnsi(line).includes("Task: create a small CLI calculator ·"));
     expect(rawTaskContextLine).toContain("\x1b[1;37;48;5;236m");
     expect(rawTaskContextLine).toMatch(/Task: create a small CLI calculator.*\s+\x1b\[0m/);
-    expect(stripAnsi(rawTaskContextLine).length).toBe(out.columns - 1);
+    expect(stripAnsi(rawTaskContextLine).length).toBe(out.columns - 2);
 
     tui.onTurnSuccess(1234);
     frame = latestFrame(out);
@@ -754,7 +893,7 @@ describe("tui usability", () => {
       .split("\n")
       .find((line) => stripAnsi(line).includes("Task: Done · create a small CLI calculator"));
     expect(rawTaskContextLine).toContain("\x1b[1;37;48;5;236m");
-    expect(stripAnsi(rawTaskContextLine).length).toBe(out.columns - 1);
+    expect(stripAnsi(rawTaskContextLine).length).toBe(out.columns - 2);
   });
 
   test("task context shows failed after task error", () => {
@@ -1027,6 +1166,44 @@ describe("tui usability", () => {
     const raw = out.writes[out.writes.length - 1] || "";
     expect(tui.lastInputLine).toContain("中文");
     expect(raw).toContain(`\x1b[${tui.lastInputRow};8H`);
+    expect(raw).toContain(`\x1b[${tui.lastInputRow};8H\x1b[?25h`);
+  });
+
+  test("input cursor stays off input wrap boundary to avoid terminal auto-wrap", () => {
+    const out = createOut(40, 18);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    const input = "a".repeat(34);
+    tui.renderInput(input, input.length);
+    const raw = out.writes[out.writes.length - 1] || "";
+    expect(tui.lastInputLine.split("\n")).toHaveLength(1);
+    expect(raw).toContain(`\x1b[${tui.lastInputRow};37H\x1b[?25h`);
+    expect(raw).not.toContain(`\x1b[${tui.lastInputRow};38H\x1b[?25h`);
+  });
+
+  test("emoji grapheme clusters do not over-count cursor columns", () => {
+    const out = createOut(80, 18);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    const input = "👨‍👩‍👧‍👦❤️";
+    tui.renderInput(input, input.length);
+    const raw = out.writes[out.writes.length - 1] || "";
+    expect(tui.lastInputLine).toContain(input);
+    expect(raw).toContain(`\x1b[${tui.lastInputRow};8H\x1b[?25h`);
   });
 
   test("renderInput repaints padded rows for CJK input", () => {
@@ -1044,7 +1221,7 @@ describe("tui usability", () => {
     const raw = out.writes[out.writes.length - 1] || "";
     const plainLines = stripAnsi(raw).split("\n");
     const inputLine = plainLines.find((line) => line.includes("这是一段中文"));
-    expect(raw.startsWith("\x1b[?25l\x1b[H\x1b[2J")).toBe(true);
+    expect(raw.startsWith("\x1b[?25l\x1b%G\x1b(B\x1b[0m\x1b[2J\x1b[H")).toBe(true);
     expect(inputLine).toBeTruthy();
     expect(inputLine.endsWith(" ")).toBe(true);
     expect(inputLine.length).toBeGreaterThan("❯ 这是一段中文".length);

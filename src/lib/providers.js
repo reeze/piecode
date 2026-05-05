@@ -256,6 +256,128 @@ function toFiniteNumber(value) {
   return Number.isFinite(n) ? Math.max(0, Math.round(n)) : null;
 }
 
+function normalizeThinkingEffort(value) {
+  const effort = String(value || '').trim().toLowerCase();
+  if (!effort) return '';
+  if (effort === 'extra' || effort === 'extra-high' || effort === 'extra_high' || effort === 'max') return 'xhigh';
+  if (effort === 'default' || effort === 'off') return '';
+  return effort;
+}
+
+function normalizeReasoningEffortList(values) {
+  if (!Array.isArray(values)) return null;
+  const out = [];
+  const seen = new Set();
+  for (const value of values) {
+    const normalized = normalizeThinkingEffort(value);
+    if (!normalized || seen.has(normalized)) continue;
+    seen.add(normalized);
+    out.push(normalized);
+  }
+  return out;
+}
+
+export function getReasoningEffortCapabilities({
+  provider = '',
+  kind = '',
+  model = '',
+  reasoningEfforts = null,
+  thinkingEfforts = null,
+} = {}) {
+  const configured = normalizeReasoningEffortList(reasoningEfforts || thinkingEfforts);
+  if (configured) {
+    return {
+      supported: configured.length > 0,
+      values: configured,
+      source: 'settings',
+    };
+  }
+
+  const providerKey = String(provider || '').trim().toLowerCase();
+  const kindKey = String(kind || '').trim().toLowerCase();
+  const modelKey = String(model || '').trim().toLowerCase();
+  const combined = `${providerKey} ${kindKey}`;
+  const reasoningModel =
+    /\bgpt-5\b|gpt-5[.\w-]*|\bo[134]\b|o[134][\w-]*|codex/.test(modelKey);
+
+  if (combined.includes('anthropic') && !combined.includes('openrouter')) {
+    return {
+      supported: false,
+      values: [],
+      source: 'provider',
+      reason: 'anthropic-direct-effort-unsupported',
+    };
+  }
+
+  if (combined.includes('codex')) {
+    return {
+      supported: true,
+      values: ['minimal', 'low', 'medium', 'high', 'xhigh'],
+      source: 'provider',
+    };
+  }
+
+  if (combined.includes('openrouter')) {
+    return {
+      supported: true,
+      values: reasoningModel
+        ? ['minimal', 'low', 'medium', 'high', 'xhigh']
+        : ['low', 'medium', 'high'],
+      source: 'provider',
+    };
+  }
+
+  if (combined.includes('seed')) {
+    return {
+      supported: true,
+      values: ['low', 'medium', 'high'],
+      source: 'provider',
+    };
+  }
+
+  if (combined.includes('openai')) {
+    return {
+      supported: true,
+      values: reasoningModel
+        ? ['minimal', 'low', 'medium', 'high', 'xhigh']
+        : ['low', 'medium', 'high'],
+      source: 'provider',
+    };
+  }
+
+  return {
+    supported: true,
+    values: ['low', 'medium', 'high'],
+    source: 'generic',
+  };
+}
+
+function normalizeThinkingEffortForProvider(value, context = {}) {
+  const effort = normalizeThinkingEffort(value);
+  if (!effort) return '';
+  const capabilities = getReasoningEffortCapabilities(context);
+  return capabilities.values.includes(effort) ? effort : '';
+}
+
+function withReasoningEffort(body, thinkingEffort, context = {}) {
+  const effort = normalizeThinkingEffortForProvider(thinkingEffort, context);
+  if (!effort || !body || typeof body !== 'object') return body;
+  return {
+    ...body,
+    reasoning_effort: effort,
+    reasoning: { ...(body.reasoning || {}), effort },
+  };
+}
+
+function withResponsesReasoningEffort(body, thinkingEffort, context = {}) {
+  const effort = normalizeThinkingEffortForProvider(thinkingEffort, context);
+  if (!effort || !body || typeof body !== 'object') return body;
+  return {
+    ...body,
+    reasoning: { ...(body.reasoning || {}), effort },
+  };
+}
+
 function normalizeUsage(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const inputTokens = toFiniteNumber(
@@ -884,6 +1006,8 @@ function createOpenAICompatibleProvider({
   apiKey,
   baseUrl,
   extraHeaders = {},
+  thinkingEffort = '',
+  reasoningEfforts = null,
 }) {
   const normalizedBase = (baseUrl || 'https://api.openai.com/v1').replace(
     /\/$/,
@@ -892,10 +1016,19 @@ function createOpenAICompatibleProvider({
   const chatUrl = normalizedBase.endsWith('/chat/completions')
     ? normalizedBase
     : `${normalizedBase}/chat/completions`;
+  const effortContext = { kind, model, reasoningEfforts };
+  const effortCapabilities = getReasoningEffortCapabilities(effortContext);
+  const effectiveThinkingEffort = normalizeThinkingEffortForProvider(
+    thinkingEffort,
+    effortContext
+  );
 
   return {
     kind,
     model,
+    thinkingEffort: effectiveThinkingEffort,
+    reasoningEffortOptions: effortCapabilities.values,
+    supportsReasoningEffort: effortCapabilities.supported,
     supportsNativeTools: true,
     _lastUsage: null,
     getLastUsage() {
@@ -922,7 +1055,7 @@ function createOpenAICompatibleProvider({
       const data = await postJson(
         chatUrl,
         { Authorization: `Bearer ${apiKey}`, ...extraHeaders },
-        body,
+        withReasoningEffort(body, thinkingEffort, effortContext),
         { signal }
       );
       this._lastUsage = normalizeUsage(data?.usage);
@@ -960,13 +1093,17 @@ function createOpenAICompatibleProvider({
         const streamed = await postJsonStreamOpenAINative(
           chatUrl,
           { Authorization: `Bearer ${apiKey}`, ...extraHeaders },
-          {
-            model,
-            temperature: 0.2,
-            stream: true,
-            messages: [{ role: 'system', content: systemPrompt }, ...messages],
-            tools,
-          },
+          withReasoningEffort(
+            {
+              model,
+              temperature: 0.2,
+              stream: true,
+              messages: [{ role: 'system', content: systemPrompt }, ...messages],
+              tools,
+            },
+            thinkingEffort,
+            effortContext
+          ),
           onDelta,
           { signal }
         );
@@ -982,15 +1119,19 @@ function createOpenAICompatibleProvider({
       const streamed = await postJsonStream(
         chatUrl,
         { Authorization: `Bearer ${apiKey}`, ...extraHeaders },
-        {
-          model,
-          temperature: 0.2,
-          stream: true,
-          messages: [
-            { role: 'system', content: systemPrompt },
-            { role: 'user', content: prompt },
-          ],
-        },
+        withReasoningEffort(
+          {
+            model,
+            temperature: 0.2,
+            stream: true,
+            messages: [
+              { role: 'system', content: systemPrompt },
+              { role: 'user', content: prompt },
+            ],
+          },
+          thinkingEffort,
+          effortContext
+        ),
         onDelta,
         { signal }
       );
@@ -1033,13 +1174,26 @@ function extractAnthropicText(data) {
   return text || '';
 }
 
-function createSeedProvider({ model, apiKey, baseUrl }) {
+function createSeedProvider({ model, apiKey, baseUrl, thinkingEffort = '', reasoningEfforts = null }) {
   const resolvedModel = model || DEFAULT_SEED_MODEL;
   const resolvedBase = baseUrl || DEFAULT_SEED_BASE_URL;
+  const effortContext = {
+    kind: 'seed-openai-compatible',
+    model: resolvedModel,
+    reasoningEfforts,
+  };
+  const effortCapabilities = getReasoningEffortCapabilities(effortContext);
+  const effectiveThinkingEffort = normalizeThinkingEffortForProvider(
+    thinkingEffort,
+    effortContext
+  );
 
   return {
     kind: 'seed-openai-compatible',
     model: resolvedModel,
+    thinkingEffort: effectiveThinkingEffort,
+    reasoningEffortOptions: effortCapabilities.values,
+    supportsReasoningEffort: effortCapabilities.supported,
     supportsNativeTools: true,
     _lastUsage: null,
     getLastUsage() {
@@ -1068,7 +1222,7 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
             const streamed = await postJsonStreamOpenAINative(
               url,
               { Authorization: `Bearer ${apiKey}` },
-              nativeBody,
+              withReasoningEffort(nativeBody, thinkingEffort, effortContext),
               onDelta,
               { signal }
             );
@@ -1114,7 +1268,7 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
           const streamed = await postJsonStream(
             url,
             { Authorization: `Bearer ${apiKey}` },
-            openaiBody,
+            withReasoningEffort(openaiBody, thinkingEffort, effortContext),
             onDelta,
             { signal }
           );
@@ -1162,7 +1316,7 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
           const data = await postJson(
             url,
             { Authorization: `Bearer ${apiKey}` },
-            openaiBody,
+            withReasoningEffort(openaiBody, thinkingEffort, effortContext),
             { signal }
           );
           this._lastUsage = normalizeUsage(data?.usage);
@@ -1214,9 +1368,12 @@ function createSeedProvider({ model, apiKey, baseUrl }) {
 
       for (const headers of anthHeaders) {
         try {
-          const data = await postJson(anthropicUrl, headers, anthropicBody, {
-            signal,
-          });
+          const data = await postJson(
+            anthropicUrl,
+            headers,
+            anthropicBody,
+            { signal }
+          );
           this._lastUsage = normalizeUsage(data?.usage);
           const text = extractAnthropicText(data);
           if (text) return text;
@@ -1313,13 +1470,22 @@ async function prepareCodexExecHome(codexHome) {
   return sandboxHome;
 }
 
-function createCodexCliProvider(customModel = null) {
+function createCodexCliProvider(customModel = null, thinkingEffort = '', reasoningEfforts = null) {
   const codexHome = getCodexHome();
   const requestedModel = customModel || process.env.CODEX_MODEL || null;
   const model = requestedModel || resolveCodexModel(codexHome, null);
+  const effortContext = { kind: 'codex-cli-session', model, reasoningEfforts };
+  const effortCapabilities = getReasoningEffortCapabilities(effortContext);
+  const effectiveThinkingEffort = normalizeThinkingEffortForProvider(
+    thinkingEffort,
+    effortContext
+  );
   return {
     kind: 'codex-cli-session',
     model,
+    thinkingEffort: effectiveThinkingEffort,
+    reasoningEffortOptions: effortCapabilities.values,
+    supportsReasoningEffort: effortCapabilities.supported,
     supportsNativeTools: false,
     _lastUsage: null,
     getLastUsage() {
@@ -1343,6 +1509,9 @@ function createCodexCliProvider(customModel = null) {
         'never',
         '-m',
         model,
+        ...(effectiveThinkingEffort
+          ? ['--config', `model_reasoning_effort="${effectiveThinkingEffort}"`]
+          : []),
         composedPrompt,
       ];
 
@@ -1387,6 +1556,7 @@ function createCodexTokenProvider({
   configuredModel,
   configuredBaseUrl,
   codexAuth,
+  thinkingEffort = '',
 }) {
   const model = configuredModel || codexAuth.model;
   const responsesUrl = resolveCodexResponsesUrl(
@@ -1402,37 +1572,44 @@ function createCodexTokenProvider({
   return {
     kind: 'codex-auth-token',
     model,
+    thinkingEffort: normalizeThinkingEffort(thinkingEffort),
     supportsNativeTools: true,
     _lastUsage: null,
     getLastUsage() {
       return this._lastUsage || null;
     },
     buildResponsesBody(systemPrompt, prompt) {
-      return {
-        model,
-        store: false,
-        instructions: systemPrompt,
-        input: [
-          { role: 'user', content: [{ type: 'input_text', text: prompt }] },
-        ],
-        text: { verbosity: 'medium' },
-        include: ['reasoning.encrypted_content'],
-      };
+      return withResponsesReasoningEffort(
+        {
+          model,
+          store: false,
+          instructions: systemPrompt,
+          input: [
+            { role: 'user', content: [{ type: 'input_text', text: prompt }] },
+          ],
+          text: { verbosity: 'medium' },
+          include: ['reasoning.encrypted_content'],
+        },
+        thinkingEffort
+      );
     },
     buildNativeResponsesBody(systemPrompt, messages, tools) {
       const input = convertOpenAIMessagesToResponsesInput(messages);
       const convertedTools = convertOpenAIToolsToResponsesTools(tools);
-      return {
-        model,
-        store: false,
-        instructions: systemPrompt,
-        input,
-        text: { verbosity: 'medium' },
-        include: ['reasoning.encrypted_content'],
-        tool_choice: 'auto',
-        parallel_tool_calls: true,
-        ...(convertedTools.length > 0 ? { tools: convertedTools } : {}),
-      };
+      return withResponsesReasoningEffort(
+        {
+          model,
+          store: false,
+          instructions: systemPrompt,
+          input,
+          text: { verbosity: 'medium' },
+          include: ['reasoning.encrypted_content'],
+          tool_choice: 'auto',
+          parallel_tool_calls: true,
+          ...(convertedTools.length > 0 ? { tools: convertedTools } : {}),
+        },
+        thinkingEffort
+      );
     },
     async complete({ systemPrompt, prompt, messages, tools, signal }) {
       this._lastUsage = null;
@@ -1501,6 +1678,7 @@ function createCodexDirectProvider({
   configuredModel,
   configuredBaseUrl,
   codexAuth,
+  thinkingEffort = '',
 }) {
   if (codexAuth?.openaiApiKey) {
     return createOpenAICompatibleProvider({
@@ -1512,6 +1690,7 @@ function createCodexDirectProvider({
         configuredBaseUrl ||
         process.env.OPENAI_BASE_URL ||
         'https://api.openai.com/v1',
+      thinkingEffort,
     });
   }
 
@@ -1520,6 +1699,7 @@ function createCodexDirectProvider({
       configuredModel,
       configuredBaseUrl,
       codexAuth,
+      thinkingEffort,
     });
   }
 
@@ -1530,10 +1710,11 @@ function prefersCodexCli() {
   return process.env.PIECODE_CODEX_PREFER_CLI === '1';
 }
 
-function createAnthropicProvider({ apiKey, model }) {
+function createAnthropicProvider({ apiKey, model, thinkingEffort = '' }) {
   return {
     kind: 'anthropic',
     model,
+    thinkingEffort: normalizeThinkingEffort(thinkingEffort),
     supportsNativeTools: true,
     _lastUsage: null,
     getLastUsage() {
@@ -1594,6 +1775,9 @@ export function getProvider(options = {}) {
   const configuredModel = options.model || null;
   const configuredBaseUrl = options.baseUrl || options.endpoint || null;
   const configuredApiKey = options.apiKey || null;
+  const configuredThinkingEffort = normalizeThinkingEffort(
+    options.thinkingEffort || options.thinking_effort || options.reasoningEffort || options.reasoning_effort
+  );
 
   // Command line arguments take highest priority
   if (options.provider) {
@@ -1606,6 +1790,7 @@ export function getProvider(options = {}) {
           options.model ||
           process.env.ANTHROPIC_MODEL ||
           DEFAULT_ANTHROPIC_MODEL,
+        thinkingEffort: configuredThinkingEffort,
       });
     }
 
@@ -1619,6 +1804,7 @@ export function getProvider(options = {}) {
           configuredBaseUrl ||
           process.env.OPENAI_BASE_URL ||
           'https://api.openai.com/v1',
+        thinkingEffort: configuredThinkingEffort,
       });
     }
 
@@ -1635,6 +1821,7 @@ export function getProvider(options = {}) {
         model: configuredModel || DEFAULT_OPENROUTER_MODEL,
         apiKey: openRouterApiKey,
         baseUrl: configuredBaseUrl || DEFAULT_OPENROUTER_BASE_URL,
+        thinkingEffort: configuredThinkingEffort,
         extraHeaders: {
           'HTTP-Referer':
             process.env.OPENROUTER_SITE_URL || 'https://piecode.local',
@@ -1655,6 +1842,7 @@ export function getProvider(options = {}) {
         model: configuredModel || DEFAULT_SEED_MODEL,
         apiKey: seedApiKey,
         baseUrl: configuredBaseUrl || DEFAULT_SEED_BASE_URL,
+        thinkingEffort: configuredThinkingEffort,
       });
     }
 
@@ -1665,6 +1853,7 @@ export function getProvider(options = {}) {
           configuredModel,
           configuredBaseUrl,
           codexAuth,
+          thinkingEffort: configuredThinkingEffort,
         });
         if (directProvider) {
           return directProvider;
@@ -1672,7 +1861,7 @@ export function getProvider(options = {}) {
       }
       const cliAvailable = hasCodexCliSession();
       const cliProvider = cliAvailable
-        ? createCodexCliProvider(options.model)
+        ? createCodexCliProvider(options.model, configuredThinkingEffort)
         : null;
       if (cliProvider) return cliProvider;
     }
@@ -1686,6 +1875,7 @@ export function getProvider(options = {}) {
         configuredModel,
         configuredBaseUrl,
         codexAuth,
+        thinkingEffort: configuredThinkingEffort,
       });
       if (directProvider) {
         return directProvider;
@@ -1693,7 +1883,7 @@ export function getProvider(options = {}) {
     }
     const cliAvailable = hasCodexCliSession();
     const cliProvider = cliAvailable
-      ? createCodexCliProvider(configuredModel)
+      ? createCodexCliProvider(configuredModel, configuredThinkingEffort)
       : null;
     if (cliProvider) return cliProvider;
   }
@@ -1706,6 +1896,7 @@ export function getProvider(options = {}) {
         configuredModel ||
         process.env.ANTHROPIC_MODEL ||
         DEFAULT_ANTHROPIC_MODEL,
+      thinkingEffort: configuredThinkingEffort,
     });
   }
 
@@ -1719,6 +1910,7 @@ export function getProvider(options = {}) {
         configuredBaseUrl ||
         process.env.OPENAI_BASE_URL ||
         'https://api.openai.com/v1',
+      thinkingEffort: configuredThinkingEffort,
     });
   }
 
@@ -1728,6 +1920,7 @@ export function getProvider(options = {}) {
       model: configuredModel || DEFAULT_OPENROUTER_MODEL,
       apiKey: process.env.OPENROUTER_API_KEY,
       baseUrl: configuredBaseUrl || DEFAULT_OPENROUTER_BASE_URL,
+      thinkingEffort: configuredThinkingEffort,
       extraHeaders: {
         'HTTP-Referer':
           process.env.OPENROUTER_SITE_URL || 'https://piecode.local',
@@ -1741,6 +1934,7 @@ export function getProvider(options = {}) {
       model: configuredModel || DEFAULT_SEED_MODEL,
       apiKey: process.env.SEED_API_KEY || process.env.ARK_API_KEY,
       baseUrl: configuredBaseUrl || DEFAULT_SEED_BASE_URL,
+      thinkingEffort: configuredThinkingEffort,
     });
   }
 
@@ -1750,6 +1944,7 @@ export function getProvider(options = {}) {
       configuredModel,
       configuredBaseUrl,
       codexAuth,
+      thinkingEffort: configuredThinkingEffort,
     });
     if (directProvider) {
       return directProvider;
@@ -1757,7 +1952,7 @@ export function getProvider(options = {}) {
   }
   const cliAvailable = hasCodexCliSession();
   const cliProvider = cliAvailable
-    ? createCodexCliProvider(configuredModel)
+    ? createCodexCliProvider(configuredModel, configuredThinkingEffort)
     : null;
   if (cliProvider) return cliProvider;
 

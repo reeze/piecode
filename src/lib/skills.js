@@ -26,12 +26,16 @@ export function resolveSkillRoots(settings = {}, workspaceDir = process.cwd()) {
     path.join(workspaceRoot, "Agents", "skills"),
     path.join(workspaceRoot, "agents", "skills"),
     path.join(workspaceRoot, ".skills"),
+    path.join(workspaceRoot, ".claude", "skills"),
+    path.join(workspaceRoot, ".superpowers", "skills"),
     path.join(workspaceRoot, ".piecode", "skills"),
   ];
   const defaults = [
     ...projectRoots,
     path.join(os.homedir(), ".agents", "skills"),
     path.join(os.homedir(), ".codex", "skills"),
+    path.join(os.homedir(), ".claude", "skills"),
+    path.join(os.homedir(), ".superpowers", "skills"),
   ];
 
   return [...new Set([...envRoots, ...settingsRoots, ...defaults].map((p) => path.resolve(workspaceRoot, p)))];
@@ -212,18 +216,31 @@ function parseYamlValue(value) {
  */
 export function extractTriggers(frontmatter, body) {
   const triggers = [];
-  
-  // Check frontmatter for triggers field
-  if (frontmatter.triggers) {
-    if (Array.isArray(frontmatter.triggers)) {
-      triggers.push(...frontmatter.triggers);
-    } else if (typeof frontmatter.triggers === "string") {
-      triggers.push(...frontmatter.triggers.split(",").map(t => t.trim()).filter(Boolean));
+  const addTriggerValue = (value) => {
+    if (!value) return;
+    if (Array.isArray(value)) {
+      for (const item of value) addTriggerValue(item);
+      return;
     }
-  }
+    if (typeof value === "object") {
+      addTriggerValue(value.description || value.summary || value.pattern || value.keyword || value.name);
+      return;
+    }
+    triggers.push(...String(value).split(",").map(t => t.trim()).filter(Boolean));
+  };
+  
+  // Check common Claude/Superpower-style frontmatter trigger fields.
+  addTriggerValue(frontmatter.triggers);
+  addTriggerValue(frontmatter.when_to_use);
+  addTriggerValue(frontmatter.whenToUse);
+  addTriggerValue(frontmatter["when-to-use"]);
+  addTriggerValue(frontmatter.activation);
+  addTriggerValue(frontmatter.applies_to);
+  addTriggerValue(frontmatter.appliesTo);
+  addTriggerValue(frontmatter.keywords);
   
   // Also check for "when to apply" section in body
-  const whenToApplyMatch = body.match(/##?\s*(?:When to Apply|Triggers|Apply when)[\s\S]*?(?=\n##|\n###|$)/i);
+  const whenToApplyMatch = body.match(/##?\s*(?:When to Apply|When to Use|When To Use|Triggers|Apply when|Use when)[\s\S]*?(?=\n##|\n###|$)/i);
   if (whenToApplyMatch) {
     const section = whenToApplyMatch[0];
     // Extract list items
@@ -238,7 +255,14 @@ export function extractTriggers(frontmatter, body) {
     }
   }
   
-  return triggers.map(t => t.toLowerCase());
+  const seen = new Set();
+  return triggers
+    .map(t => t.toLowerCase().trim())
+    .filter((trigger) => {
+      if (!trigger || seen.has(trigger)) return false;
+      seen.add(trigger);
+      return true;
+    });
 }
 
 export async function discoverSkills(skillRoots) {

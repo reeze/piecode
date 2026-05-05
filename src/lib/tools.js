@@ -711,6 +711,7 @@ export function createToolset({
   workspaceDir,
   autoApproveRef,
   askApproval,
+  askClarification,
   onToolStart,
   onTodoWrite,
   onMemoryWrite,
@@ -731,6 +732,48 @@ export function createToolset({
   };
 
   const asObject = (value) => (value && typeof value === "object" && !Array.isArray(value) ? value : {});
+
+  const normalizeClarificationOptions = (options) => {
+    if (!Array.isArray(options)) return [];
+    return options
+      .map((option, index) => {
+        if (typeof option === "string") {
+          const label = option.trim();
+          return label ? { label, value: label } : null;
+        }
+        if (!option || typeof option !== "object") return null;
+        const label = String(option.label || option.title || option.name || option.value || option.id || "").trim();
+        if (!label) return null;
+        const value = option.value ?? option.id ?? label;
+        return {
+          id: String(option.id || `option-${index + 1}`),
+          label,
+          value,
+          description: String(option.description || option.detail || "").trim(),
+        };
+      })
+      .filter(Boolean);
+  };
+
+  const clarifyUser = async ({ question, options, multiple = false, required = true } = {}) => {
+    onToolStart?.("clarify_user", { question, options, multiple, required });
+    const prompt = String(question || "").trim();
+    const normalizedOptions = normalizeClarificationOptions(options);
+    if (!prompt) return "Tool error: clarification question is required.";
+    if (normalizedOptions.length === 0) return "Tool error: at least one clarification option is required.";
+    if (typeof askClarification !== "function") {
+      return "Clarification is unavailable in this session. No clarification option was selected.";
+    }
+    const answer = await askClarification({ question: prompt, options: normalizedOptions, multiple, required });
+    const selected = Array.isArray(answer?.selected) ? answer.selected : [];
+    if (selected.length === 0) return "No clarification option was selected.";
+    return formatStructuredResult({
+      type: "clarification_response",
+      question: prompt,
+      multiple: Boolean(multiple),
+      selected,
+    });
+  };
 
   const formatStructuredResult = (value, maxChars = 12000) => {
     const text = typeof value === "string" ? value : JSON.stringify(value ?? {}, null, 2);
@@ -1696,6 +1739,7 @@ export function createToolset({
   };
 
   return {
+    clarify_user: clarifyUser,
     shell: runShell,
     read_file: readFile,
     read_files: readFiles,
