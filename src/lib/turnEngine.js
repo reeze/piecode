@@ -669,7 +669,25 @@ export class TurnEngine {
     return { done: false };
   }
 
+  consumeSteersIntoHistory() {
+    if (typeof this.agent.getSteers !== "function") return;
+    const steers = this.agent.getSteers();
+    if (!Array.isArray(steers) || steers.length === 0) return;
+    const lines = steers
+      .map((item, index) => `${index + 1}. ${String(item?.content || item || "").trim()}`)
+      .filter((line) => !/^\d+\.\s*$/.test(line));
+    if (lines.length === 0) return;
+    const content = [
+      "[USER STEERING UPDATE]",
+      "The user sent this while the current task was running. Treat it as a live correction or constraint for the current task.",
+      ...lines,
+    ].join("\n");
+    this.agent.history.push({ role: "user", content });
+    this.agent.onEvent?.({ type: "steer_applied", count: lines.length, content: lines.join("\n") });
+  }
+
   async nextModelAction(signal) {
+    this.consumeSteersIntoHistory();
     let action;
     const useNativeTools = this.agent.provider.supportsNativeTools === true;
 

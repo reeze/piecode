@@ -4,7 +4,7 @@ import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
-import { spawnSync, exec as execCb } from "node:child_process";
+import { exec as execCb } from "node:child_process";
 import { promisify } from "node:util";
 import * as readlineCore from "node:readline";
 import { createInterface } from "node:readline/promises";
@@ -40,6 +40,7 @@ import {
 import { installPlugin, updatePlugin } from "./lib/pluginInstaller.js";
 import { createSkillInteractive } from "./lib/skillCreator.js";
 import { SimpleTui } from "./lib/tui.js";
+import { InkTuiLayout } from "./lib/inkLayout.js";
 import { buildInputHints } from "./lib/inputHints.js";
 import { Display } from "./lib/display.js";
 import { consumeMouseWheelDeltas, stripMouseInputNoise } from "./lib/mouse.js";
@@ -1026,42 +1027,19 @@ function openLlmDebugOverlay({ tui, llmHistoryRef, llmLastRef, logLine }) {
   return true;
 }
 
-let neoBlessedProbe = null;
-async function hasNeoBlessedInstalled() {
-  if (neoBlessedProbe !== null) return neoBlessedProbe;
-  try {
-    await import("neo-blessed");
-    neoBlessedProbe = true;
-  } catch {
-    neoBlessedProbe = false;
+function createTuiKeypressSource({ input }) {
+  readlineCore.emitKeypressEvents(input);
+  const wasRaw = Boolean(stdin.isRaw);
+  if (input?.isTTY && typeof input.setRawMode === "function") {
+    input.setRawMode(true);
   }
-  return neoBlessedProbe;
-}
-
-async function createNeoBlessedKeypressSource({ input, output }) {
-  const loaded = await import("neo-blessed");
-  const blessed = loaded?.default || loaded;
-  const programFactory =
-    (blessed && typeof blessed.program === "function" && blessed.program) ||
-    (loaded && typeof loaded.program === "function" && loaded.program) ||
-    null;
-  if (!programFactory) {
-    return { source: input, destroy: () => {}, blessed: null, program: null };
-  }
-  const rawTerm = String(process.env.TERM || "").toLowerCase();
-  const terminal = rawTerm.includes("ghostty") ? "xterm-256color" : (process.env.TERM || "xterm-256color");
-  const program = programFactory({
-    input,
-    output,
-    terminal,
-  });
   return {
-    source: program || input,
-    blessed,
-    program,
+    source: input,
     destroy: () => {
       try {
-        if (program && typeof program.destroy === "function") program.destroy();
+        if (!wasRaw && input?.isTTY && typeof input.setRawMode === "function") {
+          input.setRawMode(false);
+        }
       } catch {
         // best effort
       }
@@ -1152,7 +1130,10 @@ function formatToolInputSummary(tool, input, maxLen = 120) {
   }
   if (tool === "read_files") {
     const count = Array.isArray(safe.paths) ? safe.paths.length : 0;
-    return `${count} paths`;
+    const paths = Array.isArray(safe.paths) ? safe.paths.map((item) => String(item || "").trim()).filter(Boolean) : [];
+    const shown = paths.slice(0, 3).join(", ");
+    const more = paths.length > 3 ? ` +${paths.length - 3}` : "";
+    return summarizeForLog(shown ? `${shown}${more}` : `${count} paths`, maxLen);
   }
   if (tool === "replace_in_files") {
     return summarizeForLog(`${safe.file_pattern || "**/*"} :: ${safe.find || ""}`, maxLen);
@@ -1168,6 +1149,12 @@ function formatToolInputSummary(tool, input, maxLen = 120) {
   }
   if (tool === "web_search" || tool === "search_web") {
     return summarizeForLog(safe.query || safe.q || "", maxLen);
+  }
+  if (tool === "rg" || tool === "grep" || tool === "search_files") {
+    const pattern = safe.pattern || safe.regex || safe.query || "";
+    const scope = safe.path || safe.glob || safe.file_pattern || "";
+    const mode = safe.fixed_strings ? "fixed" : safe.case_sensitive === false ? "ignore-case" : "";
+    return summarizeForLog(`${pattern}${scope ? ` in ${scope}` : ""}${mode ? ` (${mode})` : ""}`, maxLen);
   }
   if (tool === "subagent") {
     return summarizeForLog(safe.task || "", maxLen);
@@ -1292,7 +1279,42 @@ function formatToolResultLinesForTimeline(tool, result, error) {
     return out;
   }
 
-  if (name === "git_status" || name === "git_diff" || name === "rg" || name === "grep" || name === "search_files") {
+  if (name === "rg" || name === "grep" || name === "search_files") {
+    if (/^No matches found/i.test(raw) || /^No files matched/i.test(raw)) {
+      return [`[tool-result] ${summarizeForLog(raw.split("\n")[0], 180)}`];
+    }
+    const found = raw.match(/^Found matches in\s+(\d+)\s+files?\s+for\s+"([^"]+)"/i);
+    if (found) return [`[tool-result] Found matches in ${found[1]} files for "${found[2]}"`];
+    const files = [];
+    for (const line of raw.split("\n")) {
+      const file = line.match(/^([^:\n]+):\d+:/)?.[1] || line.match(/^([^:\n]+):/)?.[1] || "";
+      if (file && !files.includes(file)) files.push(file);
+      if (files.length >= 6) break;
+    }
+    if (files.length > 0) {
+      const shown = files.slice(0, 4).join(", ");
+      const more = files.length > 4 ? ` +${files.length - 4}` : "";
+      return [`[tool-result] Matches in ${shown}${more}`];
+    }
+    return [];
+  }
+
+  if (name === "git_diff") {
+    const files = [];
+    for (const line of raw.split("\n")) {
+      const match = line.match(/^diff --git a\/(.+?) b\//);
+      if (match?.[1] && !files.includes(match[1])) files.push(match[1]);
+      if (files.length >= 6) break;
+    }
+    if (files.length > 0) {
+      const shown = files.slice(0, 4).join(", ");
+      const more = files.length > 4 ? ` +${files.length - 4}` : "";
+      return [`[tool-result] Diff includes ${shown}${more}`];
+    }
+    return [];
+  }
+
+  if (name === "git_status") {
     const lines = raw.split("\n").map((line) => line.trimEnd()).filter(Boolean).slice(0, 8);
     if (lines.length === 0) return [];
     return lines.map((line) => `[tool-result] ${summarizeForLog(line, 220)}`);
@@ -1312,19 +1334,6 @@ function formatToolResultLinesForTimeline(tool, result, error) {
 
     const diffStat = String(parsed?.details?.diffStat || "").trim();
     if (diffStat) lines.push(`[tool-result] ${diffStat}`);
-
-    const diffText = String(parsed?.details?.diff || "").trim();
-    if (diffText) {
-      lines.push("[tool-result] diff:");
-      const diffLines = diffText.split("\n");
-      const maxPreviewLines = 40;
-      for (const line of diffLines.slice(0, maxPreviewLines)) {
-        lines.push(`[tool-result] ${line}`);
-      }
-      if (diffLines.length > maxPreviewLines) {
-        lines.push(`[tool-result] ... (${diffLines.length - maxPreviewLines} more lines)`);
-      }
-    }
 
     return lines;
   } catch {
@@ -2820,6 +2829,11 @@ async function handleNonInterruptingCommand(input, ctx = {}) {
   const lower = raw.replace(/\s+/g, " ").toLowerCase();
   const logLine = ctx.logLine || (() => {});
   if (!raw.startsWith("/")) {
+    if (ctx.steerQueueRef?.value && Array.isArray(ctx.steerQueueRef.value)) {
+      ctx.steerQueueRef.value.push({ id: `steer-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, content: raw, at: new Date().toISOString() });
+      logLine(`[steer] queued for current task: ${summarizeForLog(raw, 160)}`);
+      return true;
+    }
     logLine("task is running; only non-interrupting slash commands are accepted now");
     return true;
   }
@@ -2868,7 +2882,7 @@ async function handleNonInterruptingCommand(input, ctx = {}) {
     return true;
   }
   logLine(`command not available while task is running: ${raw}`);
-  logLine("available now: /btw <question>, /status, /agents, /debug, /debug llm, /help");
+  logLine("available now: plain text to steer, /btw <question>, /status, /agents, /debug, /debug llm, /help");
   return true;
 }
 
@@ -4520,12 +4534,6 @@ async function main() {
   const historyFile = getHistoryFilePath();
   const initialHistory = await loadHistory(historyFile);
   const useTui = args.tui || process.env.PIECODE_TUI === "1";
-  if (useTui) {
-    const neoBlessedAvailable = await hasNeoBlessedInstalled();
-    if (!neoBlessedAvailable) {
-      throw new Error("neo-blessed is required for TUI mode. Please run: npm install");
-    }
-  }
   const display = useTui ? null : new Display();
   const llmLastRef = { value: { request: null, response: null } };
   const llmHistoryRef = { value: { entries: [], seq: 0, index: -1 } };
@@ -4588,6 +4596,7 @@ async function main() {
     return [...names].sort((a, b) => a.localeCompare(b));
   };
   const taskRunningRef = { value: false };
+  const steerQueueRef = { value: [] };
   const escAbortArmedRef = { value: false };
   const readlineOutput = useTui ? createMutedTtyOutput(stdout) : stdout;
 
@@ -4605,18 +4614,14 @@ async function main() {
   };
   const filteredInput = stdinFilter;
 
-  // In non-TUI mode, normalize keypress events directly from stdin.
-  // In TUI mode, neo-blessed provides its own key event stream.
-  if (!useTui) {
-    readlineCore.emitKeypressEvents(filteredInput);
-  }
+  // TUI mode renders through Ink, but input is still owned by PieCode's
+  // line editor so model pickers, approvals, command mode, and multiline
+  // shortcuts all share the same key handling path.
+  if (!useTui) readlineCore.emitKeypressEvents(filteredInput);
   let keypressSource = filteredInput;
   let destroyKeypressSource = () => {};
   if (useTui) {
-    const keypressHub = await createNeoBlessedKeypressSource({
-      input: filteredInput,
-      output: readlineOutput,
-    });
+    const keypressHub = createTuiKeypressSource({ input: filteredInput });
     keypressSource = keypressHub.source || filteredInput;
     destroyKeypressSource = typeof keypressHub.destroy === "function" ? keypressHub.destroy : () => {};
   }
@@ -4703,6 +4708,11 @@ async function main() {
   let tui = null;
   let onResize = null;
   if (useTui) {
+    const inkLayout = new InkTuiLayout({
+      input: filteredInput,
+      output: stdout,
+      error: process.stderr,
+    });
     tui = new SimpleTui({
       out: stdout,
       workspaceDir,
@@ -4710,6 +4720,7 @@ async function main() {
       getSkillsLabel: () => formatSkillLabel(activeSkillsRef),
       getPluginsLabel: () => formatPluginLabel(activePluginsRef),
       getApprovalLabel: () => (autoApproveRef.value ? "on" : "off"),
+      layout: inkLayout,
     });
     tui.setProjectInstructionsStatus(projectInstructionsStatusRef.value);
     tui.setTodos(todosRef.value);
@@ -5036,6 +5047,7 @@ async function main() {
                   contextWindowRef,
                   llmHistoryRef,
                   llmLastRef,
+                  steerQueueRef,
                 }).catch((err) => logLine(`command failed: ${String(err?.message || err)}`));
               }
             }
@@ -5614,6 +5626,11 @@ async function main() {
     projectInstructionsRef,
     memoryRef,
     agentDefinitionsRef,
+    getSteers: () => {
+      const items = steerQueueRef.value;
+      steerQueueRef.value = [];
+      return items;
+    },
     mcpHub: mcpHubRef.value,
     webSearch: settings?.webSearch || settings?.tools?.web?.search || null,
     contextWindowRef,
@@ -5680,6 +5697,14 @@ async function main() {
       advanceTodosOnToolStart,
     }),
   });
+
+  const baseAgentOnEvent = agent.onEvent;
+  agent.onEvent = (evt) => {
+    if (evt?.type === "steer_applied") {
+      logLine(`[steer] applied to current task: ${summarizeForLog(evt.content || "", 180)}`);
+    }
+    baseAgentOnEvent?.(evt);
+  };
 
   if (startupResumeSession) {
     agent.history = Array.isArray(startupResumeSession.agentHistory) ? startupResumeSession.agentHistory : [];
@@ -5808,7 +5833,6 @@ async function main() {
   }
 
   if (tui) {
-    tui.start();
     contextWindowRef.value = resolveProviderContextLimit(providerRef.value);
     tui.setContextUsage(0, contextWindowRef.value);
     emitStartupLogo(tui, providerRef.value, workspaceDir, stdout.columns || 100);
@@ -5831,6 +5855,7 @@ async function main() {
       tui.event(`resumed session ${startupResumeSession.sessionId} (${startupResumeSession.messages?.length || agent.history.length} messages)`);
       refreshTuiContextUsage?.();
     }
+    tui.start();
     tui.render(currentInputRef.value, "Type /help for commands");
   } else {
     console.log(`Pie Code (${formatProviderModel(providerRef.value)})`);

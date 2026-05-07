@@ -1,9 +1,11 @@
 import { clipDiffText, getSessionDiff, parseToolResultDetails } from "../src/web/core.js";
 import {
   ClarificationBroker,
+  createWebAuthToken,
   isAuthorizedWebRequest,
   normalizeWebAttachments,
   resolveWebBindOptions,
+  summarizeToolIntent,
   validateWebOrigin,
 } from "../src/web/server.js";
 
@@ -13,9 +15,15 @@ describe("web server security helpers", () => {
     expect(resolveWebBindOptions({ PIECODE_WEB_HOST: "0.0.0.0" }).host).toBe("0.0.0.0");
   });
 
-  test("requires token for api requests", () => {
+  test("does not require a token by default", () => {
+    expect(createWebAuthToken({})).toBe("");
+    expect(isAuthorizedWebRequest({ headers: {} }, new URL("http://localhost/api/state"), "")).toBe(true);
+  });
+
+  test("requires token for api requests when configured", () => {
     const req = { headers: {} };
     const url = new URL("http://localhost/api/state");
+    expect(createWebAuthToken({ PIECODE_WEB_TOKEN: "secret" })).toBe("secret");
     expect(isAuthorizedWebRequest(req, url, "secret")).toBe(false);
     url.searchParams.set("token", "secret");
     expect(isAuthorizedWebRequest(req, url, "secret")).toBe(true);
@@ -39,6 +47,13 @@ describe("web server security helpers", () => {
   test("rejects web image attachment mime mismatches", () => {
     const gif = Buffer.from("GIF89a", "ascii");
     expect(() => normalizeWebAttachments([{ type: "image", mimeType: "image/png", data: gif.toString("base64") }])).toThrow(/does not match/);
+  });
+
+  test("summarizes tool intent when native tool calls have no user-visible thought", () => {
+    expect(summarizeToolIntent("shell", { command: "pwd" })).toBe("Running a shell command.");
+    expect(summarizeToolIntent("read_file", { path: "src/web/server.js" })).toBe("Reading src/web/server.js.");
+    expect(summarizeToolIntent("rg", { pattern: "model_call" })).toBe("Searching for model_call.");
+    expect(summarizeToolIntent("custom_tool", {})).toBe("Using custom_tool.");
   });
 
   test("clarification broker resolves selected options with stable payloads", async () => {

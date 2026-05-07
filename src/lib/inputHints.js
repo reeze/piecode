@@ -54,10 +54,6 @@ function textHasQuestion(text) {
   return /[?？]\s*$/.test(value) || /(which|what|should i|do you want|would you like|要不要|是否|需要我|你想)/i.test(value);
 }
 
-function textMentionsTests(text) {
-  return /\b(test|tests|jest|vitest|npm test|failing|failed|failure)\b|测试|失败|报错/i.test(String(text || ""));
-}
-
 function textMentionsDiffOrChanges(text) {
   return /\b(diff|changed|modified|updated|edited|created|wrote)\b|改动|修改|变更|已更新/i.test(String(text || ""));
 }

@@ -1,6 +1,5 @@
 #!/usr/bin/env node
 import http from "node:http";
-import crypto from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 import { promises as fs } from "node:fs";
@@ -184,6 +183,24 @@ function redactInput(input) {
   return out;
 }
 
+export function summarizeToolIntent(tool, input = {}) {
+  const name = String(tool || "tool");
+  const args = input && typeof input === "object" ? input : {};
+  const pathValue = args.path || args.file || args.filePath || args.pattern || "";
+  const shortValue = String(pathValue || "").trim().slice(0, 120);
+
+  if (name === "shell") return "Running a shell command.";
+  if (name === "read_file" || name === "read_files") return shortValue ? `Reading ${shortValue}.` : "Reading workspace file content.";
+  if (["rg", "grep", "search_files"].includes(name)) return shortValue ? `Searching for ${shortValue}.` : "Searching the codebase.";
+  if (name === "glob_files" || name === "find_files" || name === "list_files") return shortValue ? `Listing ${shortValue}.` : "Inspecting workspace files.";
+  if (name === "edit_file") return shortValue ? `Editing ${shortValue}.` : "Editing a file.";
+  if (name === "write_file") return shortValue ? `Writing ${shortValue}.` : "Writing a file.";
+  if (name === "replace_in_files") return "Applying replacements across files.";
+  if (name === "run_tests") return "Running tests.";
+  if (name.includes("mcp")) return "Calling an MCP tool.";
+  return `Using ${name}.`;
+}
+
 function makePublicEvent(type, payload = {}) {
   return {
     id: makeId("event"),
@@ -200,8 +217,7 @@ export function resolveWebBindOptions(env = process.env) {
 }
 
 export function createWebAuthToken(env = process.env) {
-  const configured = String(env.PIECODE_WEB_TOKEN || "").trim();
-  return configured || crypto.randomBytes(24).toString("hex");
+  return String(env.PIECODE_WEB_TOKEN || "").trim();
 }
 
 export function isAuthorizedWebRequest(req, url, token) {
@@ -376,7 +392,12 @@ export class ApprovalBroker {
   }
 
   list() {
-    return [...this.pending.values()].map(({ resolve, ...item }) => item);
+    return [...this.pending.values()].map((entry) => ({
+      id: entry.id,
+      kind: entry.kind,
+      details: entry.details,
+      createdAt: entry.createdAt,
+    }));
   }
 }
 
@@ -447,7 +468,14 @@ export class ClarificationBroker {
   }
 
   list() {
-    return [...this.pending.values()].map(({ resolve, ...item }) => item);
+    return [...this.pending.values()].map((entry) => ({
+      id: entry.id,
+      question: entry.question,
+      options: entry.options,
+      multiple: entry.multiple,
+      required: entry.required,
+      createdAt: entry.createdAt,
+    }));
   }
 }
 
@@ -467,6 +495,10 @@ class WebAgentSession {
     this.maxTimeline = 1000;
     this.activeToolRuns = new Map();
     this.todos = [];
+    this.messageQueue = [];
+    this.maxQueue = 20;
+    this.processingQueue = false;
+    this.pendingSteers = [];
     this.planOnly = false;
     this.detailMode = false;
     this.running = false;
@@ -517,6 +549,7 @@ class WebAgentSession {
       activeSkillsRef: this.activeSkillsRef,
       projectInstructionsRef: this.projectInstructionsRef,
       mcpHub: this.mcpHub,
+      getSteers: () => this.consumeSteers(),
       webSearch: this.settings?.webSearch || this.settings?.tools?.web?.search || null,
       onTodoWrite: (todos) => {
         this.todos = normalizeTodos(todos);
@@ -608,6 +641,77 @@ class WebAgentSession {
     });
   }
 
+  publicQueue() {
+    return this.messageQueue.map(({ options, ...item }) => ({
+      ...item,
+      hasAttachments: Array.isArray(options?.attachments) && options.attachments.length > 0,
+      planOnly: Boolean(options?.planOnly),
+    }));
+  }
+
+  enqueueMessage(content, options = {}) {
+    const item = {
+      id: makeId("queue"),
+      content: String(content || "").trim(),
+      options,
+      status: "queued",
+      createdAt: new Date().toISOString(),
+    };
+    if (!item.content && !Array.isArray(options.attachments)) throw new Error("Message is required");
+    if (this.messageQueue.filter((entry) => entry.status === "queued").length >= this.maxQueue) {
+      throw new Error(`Message queue is full (max ${this.maxQueue})`);
+    }
+    this.messageQueue.push(item);
+    this.publish("queue.update", { queue: this.publicQueue() });
+    return item;
+  }
+
+  addSteer(content) {
+    const text = String(content || "").trim();
+    if (!text) throw new Error("Steer message is required");
+    const item = { id: makeId("steer"), content: text, at: new Date().toISOString() };
+    this.pendingSteers.push(item);
+    const message = { id: item.id, role: "user", content: text, steer: true, at: item.at };
+    this.messages.push(message);
+    this.addTimelineItem({ ...message, type: "message" });
+    this.publish("steer", item);
+    return item;
+  }
+
+  consumeSteers() {
+    const items = this.pendingSteers;
+    this.pendingSteers = [];
+    return items;
+  }
+
+  async processQueue() {
+    if (this.processingQueue || this.running) return;
+    this.processingQueue = true;
+    try {
+      while (!this.running) {
+        const next = this.messageQueue.find((item) => item.status === "queued");
+        if (!next) break;
+        next.status = "running";
+        next.startedAt = new Date().toISOString();
+        this.publish("queue.update", { queue: this.publicQueue() });
+        try {
+          await this.sendMessage(next.content, { ...next.options, fromQueue: true });
+          next.status = "done";
+          next.finishedAt = new Date().toISOString();
+        } catch (err) {
+          next.status = "error";
+          next.error = String(err?.message || err);
+          next.finishedAt = new Date().toISOString();
+        }
+        this.publish("queue.update", { queue: this.publicQueue() });
+        this.messageQueue = this.messageQueue.filter((item) => item.status === "queued" || item.status === "running").slice(-this.maxQueue);
+        this.publish("queue.update", { queue: this.publicQueue() });
+      }
+    } finally {
+      this.processingQueue = false;
+    }
+  }
+
   getContextUsage() {
     const used =
       typeof this.agent?.estimateMessagesTokens === "function"
@@ -656,6 +760,8 @@ class WebAgentSession {
       timeline: this.timeline.slice(-200),
       approvals: this.approvals.list(),
       clarifications: this.clarifications.list(),
+      queue: this.publicQueue(),
+      pendingSteers: this.pendingSteers.length,
       contextUsage: this.getContextUsage(),
     };
   }
@@ -795,16 +901,23 @@ class WebAgentSession {
     const type = String(evt?.type || "event");
     if (type === "tool_use") {
       const key = this.makeToolRunKey(evt);
+      const tool = String(evt.tool || "tool");
+      const input = redactInput(evt.input);
+      const reason = String(evt.reason || "");
+      const thought = String(evt.thought || "");
+      const note = thought || reason;
       const item = this.addTimelineItem({
         type: "tool",
         status: "queued",
-        tool: String(evt.tool || "tool"),
-        input: redactInput(evt.input),
-        reason: String(evt.reason || ""),
+        tool,
+        input,
+        reason,
+        thought,
+        note,
         parallel: Boolean(evt.parallel),
       });
       this.activeToolRuns.set(key, item.id);
-      this.publish(type, { ...evt, input: redactInput(evt.input), timelineId: item.id });
+      this.publish(type, { ...evt, input, reason, thought, note, timelineId: item.id });
       return;
     }
     if (type === "tool_start") {
@@ -876,6 +989,11 @@ class WebAgentSession {
     }
     if (type === "thought") {
       this.addTimelineItem({ type: "progress", kind: "thought", title: "Thinking", content: String(evt.content || "") });
+      this.publish(type, evt);
+      return;
+    }
+    if (type === "steer_applied") {
+      this.addTimelineItem({ type: "progress", kind: "steer", title: "Steer applied", content: String(evt.content || "") });
       this.publish(type, evt);
       return;
     }
@@ -1060,7 +1178,7 @@ class WebAgentSession {
     if (!text) throw new Error("Message is required");
     if (attachments.length > 0 && text.startsWith("/")) throw new Error("Attachments cannot be used with slash commands.");
     const isBtw = /^\/btw(?:\s+|$)/i.test(text);
-    if (this.running && !isBtw) throw new Error("A task is already running");
+    if (this.running && !isBtw && !options.fromQueue) throw new Error("A task is already running");
 
     if (text.startsWith("/")) {
       const slash = await this.handleSlashCommand(text);
@@ -1108,6 +1226,7 @@ class WebAgentSession {
       this.running = false;
       this.activeTask = "";
       this.publish("snapshot", this.snapshot());
+      if (!options.fromQueue) void this.processQueue();
     }
   }
 }
@@ -1190,11 +1309,19 @@ export async function main() {
         const body = await readJsonBody(req, MAX_MESSAGE_BODY_BYTES);
         const message = String(body.message || "").trim();
         const attachments = normalizeWebAttachments(body.attachments);
-        if (session.running && !/^\/btw(?:\s+|$)/i.test(message)) {
-          jsonResponse(res, 409, { error: "A task is already running" });
+        if (typeof body.planOnly === "boolean") session.planOnly = body.planOnly;
+        const mode = String(body.mode || "auto").trim().toLowerCase();
+        const isBtw = /^\/btw(?:\s+|$)/i.test(message);
+        if (session.running && !isBtw) {
+          if ((mode === "steer" || mode === "auto") && attachments.length === 0) {
+            const steer = session.addSteer(message);
+            jsonResponse(res, 202, { ok: true, steered: true, id: steer.id });
+            return;
+          }
+          const queued = session.enqueueMessage(message, { planOnly: session.planOnly, attachments });
+          jsonResponse(res, 202, { ok: true, queued: true, id: queued.id });
           return;
         }
-        if (typeof body.planOnly === "boolean") session.planOnly = body.planOnly;
         session.sendMessage(message, { planOnly: session.planOnly, attachments }).catch((err) => {
           const error = String(err?.message || err || "message failed");
           session.lastError = error;
@@ -1260,8 +1387,9 @@ export async function main() {
   server.listen(port, host, () => {
     const urls = host === "127.0.0.1" || host === "localhost" ? [`http://localhost:${port}`] : getLocalNetworkUrls(port);
     console.log("PieCode Web is running:");
-    for (const item of urls) console.log(`  ${item}?token=${authToken}`);
-    if (host === "0.0.0.0") console.log("warning: web UI is bound to all interfaces; keep the token private.");
+    for (const item of urls) console.log(`  ${authToken ? `${item}?token=${authToken}` : item}`);
+    if (authToken) console.log("Web API token auth is enabled by PIECODE_WEB_TOKEN.");
+    if (host === "0.0.0.0") console.log(authToken ? "warning: web UI is bound to all interfaces; keep the token private." : "warning: web UI is bound to all interfaces without token auth.");
     console.log(`Current Session ID: ${session.sessionId} (short: ${shortSessionId(session.sessionId)})`);
     if (session.recentSessions.length > 0) {
       console.log("Recent resumable sessions:");

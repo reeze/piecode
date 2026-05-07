@@ -41,6 +41,7 @@ export class Agent {
     agentManager = null,
     agentDefinitionsRef = null,
     currentAgentDefinition = null,
+    getSteers = null,
   }) {
     this.provider = provider;
     this.workspaceDir = workspaceDir;
@@ -62,6 +63,7 @@ export class Agent {
     this.agentManager = agentManager instanceof AgentManager ? agentManager : new AgentManager();
     this.agentDefinitionsRef = agentDefinitionsRef && typeof agentDefinitionsRef === "object" ? agentDefinitionsRef : { value: [] };
     this.currentAgentDefinition = currentAgentDefinition && typeof currentAgentDefinition === "object" ? currentAgentDefinition : null;
+    this.getSteers = typeof getSteers === "function" ? getSteers : null;
     this.history = [];
     this.rebuildToolset();
     this.enablePlanner = process.env.PIECODE_ENABLE_PLANNER === "1";

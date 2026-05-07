@@ -10,6 +10,8 @@ describe("prompt complex-task refinements", () => {
     expect(prompt).toContain("COMPLEX TASK EXECUTION:");
     expect(prompt).toContain("3-7 step plan");
     expect(prompt).toContain("switch strategy using new evidence");
+    expect(prompt).toContain("discovery, design/strategy, implementation, validation");
+    expect(prompt).toContain("consider using project subagents/collaborate");
     expect(prompt).toContain("mention validation status");
   });
 
@@ -49,6 +51,8 @@ describe("prompt complex-task refinements", () => {
     expect(prompt).toContain("demo-skill (/skills/demo/SKILL.md)");
     expect(prompt).toContain("Use strict typing.");
     expect(prompt).toContain("Write tests for edge cases.");
+    expect(prompt).toContain("Skill compatibility");
+    expect(prompt).toContain("Claude/Superpower-style SKILL.md");
   });
 
   test("renders string active plan content", () => {

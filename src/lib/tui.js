@@ -148,6 +148,167 @@ function renderInlineMarkdown(line) {
   return out;
 }
 
+function normalizeCodeLang(lang = "") {
+  const value = String(lang || "").trim().toLowerCase();
+  if (["js", "jsx", "javascript", "mjs", "cjs"].includes(value)) return "js";
+  if (["ts", "tsx", "typescript", "mts", "cts"].includes(value)) return "js";
+  if (["json", "jsonc"].includes(value)) return "json";
+  if (["sh", "bash", "zsh", "shell", "shellscript"].includes(value)) return "shell";
+  if (["diff", "patch"].includes(value)) return "diff";
+  if (["md", "markdown"].includes(value)) return "markdown";
+  return value;
+}
+
+function scanCodeLine(line, {
+  keywords = new Set(),
+  builtins = new Set(),
+  commentStart = "//",
+  hashComments = false,
+  variables = false,
+} = {}) {
+  const source = String(line ?? "");
+  let out = "";
+  for (let i = 0; i < source.length;) {
+    const rest = source.slice(i);
+    if (commentStart && rest.startsWith(commentStart)) {
+      out += color(rest, "2;37");
+      break;
+    }
+    if (hashComments && rest.startsWith("#")) {
+      out += color(rest, "2;37");
+      break;
+    }
+    if (variables && rest.startsWith("$")) {
+      const match = rest.match(/^\$[A-Za-z_][A-Za-z0-9_]*|^\$\{[^}]+\}/);
+      if (match) {
+        out += color(match[0], "1;36");
+        i += match[0].length;
+        continue;
+      }
+    }
+    const quote = source[i];
+    if (quote === "\"" || quote === "'" || quote === "`") {
+      let token = quote;
+      i += 1;
+      while (i < source.length) {
+        const ch = source[i];
+        token += ch;
+        i += 1;
+        if (ch === "\\") {
+          if (i < source.length) {
+            token += source[i];
+            i += 1;
+          }
+          continue;
+        }
+        if (ch === quote) break;
+      }
+      out += color(token, "32");
+      continue;
+    }
+    const number = rest.match(/^\b(?:0x[\da-fA-F]+|\d+(?:\.\d+)?)\b/);
+    if (number) {
+      out += color(number[0], "35");
+      i += number[0].length;
+      continue;
+    }
+    const ident = rest.match(/^[A-Za-z_$][A-Za-z0-9_$-]*/);
+    if (ident) {
+      const token = ident[0];
+      if (keywords.has(token)) out += color(token, "1;35");
+      else if (builtins.has(token)) out += color(token, "36");
+      else out += token;
+      i += token.length;
+      continue;
+    }
+    out += source[i];
+    i += 1;
+  }
+  return out;
+}
+
+function highlightJsonLine(line) {
+  const source = String(line ?? "");
+  let out = "";
+  for (let i = 0; i < source.length;) {
+    const rest = source.slice(i);
+    if (rest[0] === "\"") {
+      let token = "\"";
+      i += 1;
+      while (i < source.length) {
+        const ch = source[i];
+        token += ch;
+        i += 1;
+        if (ch === "\\") {
+          if (i < source.length) {
+            token += source[i];
+            i += 1;
+          }
+          continue;
+        }
+        if (ch === "\"") break;
+      }
+      const after = source.slice(i).trimStart();
+      out += color(token, after.startsWith(":") ? "1;34" : "32");
+      continue;
+    }
+    const literal = rest.match(/^(true|false|null)\b/);
+    if (literal) {
+      out += color(literal[0], literal[0] === "null" ? "2;37" : "33");
+      i += literal[0].length;
+      continue;
+    }
+    const number = rest.match(/^-?\d+(?:\.\d+)?(?:e[+-]?\d+)?/i);
+    if (number) {
+      out += color(number[0], "35");
+      i += number[0].length;
+      continue;
+    }
+    out += source[i];
+    i += 1;
+  }
+  return out;
+}
+
+function highlightDiffLine(line) {
+  const source = String(line ?? "");
+  if (source.startsWith("+") && !source.startsWith("+++")) return color(source, "32");
+  if (source.startsWith("-") && !source.startsWith("---")) return color(source, "31");
+  if (source.startsWith("@@")) return color(source, "1;36");
+  if (/^(diff --git|index |--- |\+\+\+ )/.test(source)) return color(source, "2;37");
+  return source;
+}
+
+function highlightCodeLine(line, lang = "") {
+  const normalized = normalizeCodeLang(lang);
+  if (normalized === "json") return highlightJsonLine(line);
+  if (normalized === "diff") return highlightDiffLine(line);
+  if (normalized === "shell") {
+    return scanCodeLine(line, {
+      keywords: new Set(["if", "then", "else", "elif", "fi", "for", "in", "do", "done", "case", "esac", "while", "function"]),
+      builtins: new Set(["cd", "echo", "export", "source", "npm", "pnpm", "yarn", "node", "git", "rg"]),
+      commentStart: "",
+      hashComments: true,
+      variables: true,
+    });
+  }
+  if (normalized === "js") {
+    return scanCodeLine(line, {
+      keywords: new Set([
+        "await", "async", "break", "case", "catch", "class", "const", "continue", "default", "else", "export",
+        "extends", "finally", "for", "from", "function", "if", "import", "let", "new", "return", "switch",
+        "throw", "try", "typeof", "var", "while", "yield", "true", "false", "null", "undefined"
+      ]),
+      builtins: new Set(["Array", "Boolean", "Date", "JSON", "Map", "Math", "Number", "Object", "Promise", "React", "Set", "String", "console", "process"]),
+      commentStart: "//",
+    });
+  }
+  if (normalized === "markdown") {
+    return String(line ?? "").replace(/^(#{1,6})\s+(.+)$/, (_m, marks, title) => `${color(marks, "2;37")} ${color(title, "1;36")}`);
+  }
+  return color(line || " ", "36");
+}
+
 function stripMarkdownForTableCell(value) {
   return stripAnsi(renderInlineMarkdown(String(value || "").trim()));
 }
@@ -402,7 +563,7 @@ function renderMarkdownBlock(block) {
     case "blank":
       return [""];
     case "code":
-      return block.lines.map((line) => color(line || " ", "36"));
+      return block.lines.map((line) => highlightCodeLine(line || " ", block.lang || ""));
     case "table":
       return Array.isArray(block.rendered) ? block.rendered : [];
     case "heading": {
@@ -625,7 +786,7 @@ function makeTuiSymbols(useUnicode = true) {
         prompt: "❯",
         task: "◆",
         tool: "›",
-        result: "",
+        result: "↳",
         response: "•",
         ok: "✓",
         fail: "×",
@@ -836,6 +997,10 @@ export class SimpleTui {
     if (!this.active) return;
     this.active = false;
     this.stopThinkingAnimation();
+    if (this.layout && typeof this.layout.destroy === "function") {
+      this.layout.destroy();
+      return;
+    }
     // Disable mouse reporting on exit (only if it was enabled).
     if (!this.layout) {
       if (this.mouseCaptureEnabled) this.out.write("\x1b[?1000l\x1b[?1006l");
@@ -1596,12 +1761,59 @@ export class SimpleTui {
         return `  ${item}`;
       });
     };
+    const compactToolDetail = (tool, details = "", maxLen = 96) => {
+      const name = String(tool || "");
+      const raw = String(details || "").trim().replace(/^\((.*)\)$/, "$1").trim();
+      if (!raw) return "";
+      if (this.showRawLogs || /^\[trace\]/i.test(raw)) return trimWorkspaceText(raw, maxLen).text.replace(/\n/g, " ");
+      const fromJson = (source) => {
+        try {
+          const parsed = JSON.parse(source);
+          if (!parsed || typeof parsed !== "object") return "";
+          if (name === "read_files" && Array.isArray(parsed.paths)) {
+            const shown = parsed.paths.slice(0, 3).map((item) => String(item || "").trim()).filter(Boolean).join(", ");
+            return shown ? `${shown}${parsed.paths.length > 3 ? ` +${parsed.paths.length - 3}` : ""}` : "";
+          }
+          if (name === "rg" || name === "grep" || name === "search_files") {
+            const pattern = parsed.pattern || parsed.regex || parsed.query || "";
+            const scope = parsed.path || parsed.glob || parsed.file_pattern || "";
+            return `${pattern}${scope ? ` in ${scope}` : ""}`.trim();
+          }
+          return parsed.path || parsed.query || parsed.pattern || parsed.command || "";
+        } catch {
+          return "";
+        }
+      };
+      const jsonDetail = raw.startsWith("{") ? fromJson(raw) : "";
+      if (jsonDetail) return trimWorkspaceText(jsonDetail, maxLen).text.replace(/\n/g, " ");
+      const pairs = {};
+      for (const match of raw.matchAll(/([a-zA-Z0-9_.-]+)=("[^"]*"|'[^']*'|\[[^\]]*\]|\{[^}]*\}|\S+)/g)) {
+        let value = match[2];
+        try {
+          value = JSON.parse(value);
+        } catch {
+          value = String(value).replace(/^['"]|['"]$/g, "");
+        }
+        pairs[match[1]] = value;
+      }
+      if (Object.keys(pairs).length > 0) {
+        if (Array.isArray(pairs.paths)) {
+          const shown = pairs.paths.slice(0, 3).map((item) => String(item || "").trim()).filter(Boolean).join(", ");
+          return trimWorkspaceText(shown ? `${shown}${pairs.paths.length > 3 ? ` +${pairs.paths.length - 3}` : ""}` : "", maxLen).text;
+        }
+        if (name === "rg" || name === "grep" || name === "search_files") {
+          const pattern = pairs.pattern || pairs.regex || pairs.query || "";
+          const scope = pairs.path || pairs.glob || pairs.file_pattern || "";
+          return trimWorkspaceText(`${pattern}${scope ? ` in ${scope}` : ""}`.trim(), maxLen).text;
+        }
+        return trimWorkspaceText(String(pairs.path || pairs.query || pairs.pattern || pairs.command || ""), maxLen).text;
+      }
+      return trimWorkspaceText(raw.replace(/\s+/g, " "), maxLen).text;
+    };
     const toolLabel = (tool, details = "") => {
       const name = String(tool || "tool");
-      const body = String(details || "").trim();
-      const clean = body ? body.replace(/^\((.*)\)$/, "$1").trim() : "";
-      const showDetails = this.showRawLogs || Boolean(clean) || /^\[trace\]|\b(?:path|command|query|regex|find|oldText|newText|content|input)=/i.test(clean);
-      const suffix = clean && showDetails ? ` ${color(clean, "2;37")}` : "";
+      const detail = compactToolDetail(name, details);
+      const suffix = detail ? ` ${color(detail, "2;37")}` : "";
       switch (name) {
         case "read_file":
           return `${color("Read", "36")}${suffix}`;
@@ -1641,6 +1853,52 @@ export class SimpleTui {
         default:
           return `${color(name, "36")}${suffix}`;
       }
+    };
+    const summarizeToolBatch = (text) => {
+      const body = String(text || "").trim();
+      if (!body) return "";
+      if (this.showRawLogs) return trimWorkspaceText(body, 420).text.replace(/\n/g, " ");
+      const match = body.match(/^([a-zA-Z0-9_.-]+)\s+x(\d+)\b/i);
+      if (match) {
+        const detailSource = body.split(/\s+-\s+/).slice(1).join(" - ").trim();
+        const names = [];
+        for (const item of detailSource.split(";")) {
+          const value = item.trim().match(/^[a-zA-Z0-9_.-]+\((.*)\)$/)?.[1]?.trim();
+          if (value) names.push(value);
+        }
+        const shown = names.slice(0, 3).join(", ");
+        const more = names.length > 3 ? ` +${names.length - 3}` : "";
+        return `${match[1]} x${match[2]}${shown ? ` · ${shown}${more}` : ""}`;
+      }
+      const first = body.split(/\s+-\s+/, 1)[0]?.trim();
+      return trimWorkspaceText(first || body, 120).text.replace(/\n/g, " ");
+    };
+    const summarizeToolResult = (text) => {
+      const body = String(text || "").replace(/\r/g, "").trim();
+      if (!body) return [];
+      if (this.showRawLogs) {
+        return body
+          .split("\n")
+          .map((part) => part.trimEnd())
+          .filter((part) => part.trim())
+          .slice(0, 8);
+      }
+      const savedMatch = body.match(/Result too long \(chars:\s*([0-9]+)\), saved to\s+(\S+)/i);
+      if (savedMatch) return [`Output saved (${savedMatch[1]} chars) · ${savedMatch[2]}`];
+      const exitMatch = body.match(/\bexit_code:\s*(-?\d+)/i);
+      if (exitMatch && Number(exitMatch[1]) !== 0) {
+        const lines = body.split("\n").map((part) => part.trim()).filter(Boolean);
+        const detail = lines.find((part) => !/^command:|^exit_code:|^stdout:|^stderr:/i.test(part));
+        return [`Command failed (exit ${exitMatch[1]})${detail ? ` · ${trimWorkspaceText(detail, 140).text}` : ""}`];
+      }
+      const diffStat = body.match(/\b\d+\s+files?\s+changed\b[^\n]*/i)?.[0]
+        || body.match(/\b\d+\s+insertions?\(\+\).*?\d+\s+deletions?\(-\)/i)?.[0];
+      if (diffStat) return [diffStat];
+      const lines = body.split("\n").map((part) => part.trim()).filter(Boolean);
+      if (lines.length === 1 && lines[0].length <= 120 && !/^command:|^exit_code:|^stdout:|^stderr:/i.test(lines[0])) {
+        return [lines[0]];
+      }
+      return [];
     };
     const compactJsonDetail = (text, keys = ["task", "path", "query", "pattern", "command"]) => {
       const source = String(text || "").trim();
@@ -1779,7 +2037,8 @@ export class SimpleTui {
     }
     if (line.startsWith("[tools] ")) {
       const body = line.slice(8).trim();
-      return timelineItem(this.symbols.tool, `${color("Run", "1;36")} ${body}`, "1;36");
+      const summary = summarizeToolBatch(body);
+      return timelineItem(this.symbols.tool, `${color("Run", "1;36")}${summary ? ` ${summary}` : ""}`, "1;36");
     }
     if (line.startsWith("[agent] ")) {
       return timelineItem(this.symbols.agent, `${color("Agent", "1;35")} ${trimWorkspaceText(line.slice(8).trim(), 600).text}`, "1;35");
@@ -1796,20 +2055,12 @@ export class SimpleTui {
       const lower = body.toLowerCase();
       const failed = /\b(fail(?:ed|ure)?|error|aborted|denied|timeout|timed out)\b/.test(lower);
       const ok = !failed && /\b(done|ok|success|succeeded|completed)\b/.test(lower);
-      const icon = failed ? "[x]" : ok ? "[ok]" : "[i]";
       const iconColor = failed ? "1;31" : ok ? "1;32" : "2;37";
       return timelineItem(failed ? this.symbols.fail : ok ? this.symbols.ok : this.symbols.response, color(body, "2;37"), iconColor);
     }
     if (line.startsWith("[tool-result] ")) {
-      const body = trimWorkspaceText(line.slice(14).trimEnd(), 2000).text;
-      if (!body.trim()) return [];
-      const compact = body
-        .replace(/\r/g, "")
-        .split("\n")
-        .map((part) => part.trimEnd())
-        .filter((part) => part.trim())
-        .slice(0, 6);
-      const rendered = compact.length > 0 ? compact : [body];
+      const rendered = summarizeToolResult(line.slice(14).trimEnd());
+      if (rendered.length === 0) return [];
       return timelineBlock(
         this.symbols.result,
         rendered.map((part) => color(part.trimStart(), "2;37")),
@@ -2078,11 +2329,9 @@ export class SimpleTui {
       this.lastInputLine = "";
       if (this.layout) {
         this.layout.render({
-          workspaceLines: frameLines,
-          inputLines: [""],
-          statusLine: "",
-          hintLine: "",
-          cursorRowOffset: 0,
+          mode: "rawFrame",
+          frameLines,
+          cursorRow: 1,
           cursorCol: 1,
         });
         return;
@@ -2123,7 +2372,6 @@ export class SimpleTui {
     const rawTaskContextLine = this.formatTaskContextLine(width);
     const taskContextLines = rawTaskContextLine ? 2 : 0;
     const thinkingLines = this.thinking ? 1 : 0;
-    const thoughtWrapped = [];
     const thoughtStreamLines = 0;
     const inputState = this.buildInputState(this.currentInput, bottomWidth, cursorIndex);
     const inputLineCount = Math.max(1, inputState.lines.length);
@@ -2212,6 +2460,15 @@ export class SimpleTui {
           ].map((line) => truncateLine(line, width)),
         ]
       : [];
+    const hasWorkspaceContent =
+      Boolean(errorLine) ||
+      visibleLogs.length > 0 ||
+      todoLinesBlock.length > 0 ||
+      approvalBlock.length > 0 ||
+      clarificationBlock.length > 0 ||
+      taskContextBlock.length > 0 ||
+      thinkingBlock.length > 0 ||
+      thoughtStreamBlock.length > 0;
 
     const commandSuggestionBlock = this.commandSuggestionsVisible
       ? [
@@ -2255,6 +2512,7 @@ export class SimpleTui {
       ...taskContextBlock,
       ...thinkingBlock,
       ...thoughtStreamBlock,
+      ...(hasWorkspaceContent ? [""] : []),
       sep,
     ];
     const frameLines = [
@@ -2280,6 +2538,8 @@ export class SimpleTui {
         ...modelSuggestionBlock,
       ];
       this.layout.render({
+        frameLines,
+        cursorRow,
         workspaceLines: beforeInputLines.slice(0, -1),
         inputLines: inputComposite,
         statusLine: promptStatus,

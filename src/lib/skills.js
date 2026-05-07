@@ -133,7 +133,7 @@ export function parseFrontmatter(content) {
     // Check for array item (starts with - )
     const arrayItemMatch = line.match(/^(\s*)-\s*(.+)$/);
     if (arrayItemMatch && context.length > 0) {
-      const [, itemIndent, value] = arrayItemMatch;
+      const [, , value] = arrayItemMatch;
       const parent = context[context.length - 1];
       if (parent && Array.isArray(parent.obj[parent.key])) {
         parent.obj[parent.key].push(parseYamlValue(value));
@@ -144,7 +144,7 @@ export function parseFrontmatter(content) {
     // Check for key-value pair
     const keyMatch = line.match(/^(\s*)([\w-]+):\s*(.*)$/);
     if (keyMatch) {
-      const [, keyIndent, key, value] = keyMatch;
+      const [, , key, value] = keyMatch;
 
       // Pop context stack based on indentation
       while (context.length > 0 && context[context.length - 1].indent >= indent) {

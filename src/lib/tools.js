@@ -1909,7 +1909,7 @@ async function searchWithGrep({
   grepArgs.push(absPath);
 
   try {
-    const { stdout, stderr } = await execFile("grep", grepArgs, {
+    const { stdout } = await execFile("grep", grepArgs, {
       cwd: workspaceDir,
       maxBuffer: 10 * 1024 * 1024,
     });
@@ -1990,7 +1990,6 @@ async function searchNative({
   const pattern = fixedStrings ? null : new RegExp(regex, flags);
   const literalNeedle = caseSensitive ? String(regex) : String(regex).toLowerCase();
 
-  const globPattern = filePattern || "*";
   const isMatch = (filename) => {
     if (!filePattern) return true;
     // Simple glob matching

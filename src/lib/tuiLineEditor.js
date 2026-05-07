@@ -105,7 +105,7 @@ export class TuiLineEditor {
     this.cursor += data.length;
   }
 
-  async question(_prompt = "") {
+  async question() {
     if (this.closed) {
       throw new Error("readline was closed");
     }

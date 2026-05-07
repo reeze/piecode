@@ -28,7 +28,7 @@ npm run agent
 
 | Technology | Purpose |
 |------------|---------|
-| Node.js 18+ | Runtime |
+| Node.js 22+ | Runtime |
 | JavaScript (ES modules) | Language |
 | Axios | HTTP requests |
 | JSDOM | DOM manipulation |
@@ -220,4 +220,3 @@ npm run lint
 ## Contributing
 
 [Insert Contributing Guidelines Here]
-

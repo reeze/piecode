@@ -1,6 +1,22 @@
 import { promises as fs } from "node:fs";
 
 describe("web app approval and clarification contract", () => {
+  test("timeline hides model call cards unless detail mode is enabled", async () => {
+    const script = await fs.readFile("src/web/public/app.js", "utf8");
+
+    expect(script).toContain('if (item.kind === "model" && !state.status.detailMode) return "";');
+  });
+
+  test("tool thinking is rendered outside the collapsible details", async () => {
+    const script = await fs.readFile("src/web/public/app.js", "utf8");
+
+    expect(script).toContain('const note = String(item.note || item.thought || item.reason || "").trim();');
+    expect(script).toContain('<section class="tool-wrap');
+    expect(script).toContain('${note ? `<div class="tool-note">${escapeHtml(note)}</div>` : ""}');
+    expect(script).not.toContain("<span>Thinking</span>");
+    expect(script).not.toContain('${note ? `<div class="tool-reason">${escapeHtml(note)}</div>` : ""}');
+  });
+
   test("frontend listens for clarification events and posts answers to the API", async () => {
     const script = await fs.readFile("src/web/public/app.js", "utf8");
 

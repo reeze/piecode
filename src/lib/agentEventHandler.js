@@ -42,7 +42,6 @@ export function createAgentEventHandler(deps = {}) {
     verboseToolLogs,
     formatToolBatchSummary,
     formatToolCounts,
-    formatToolInputSummary,
     formatReadableToolRunLine,
     formatToolResultLinesForTimeline,
     advanceTodosOnToolStart,

@@ -15,7 +15,7 @@ A Claude Code-like command line coding agent.
 
 Requirements:
 
-- Node.js 18+
+- Node.js 22+
 
 Configure one provider:
 
@@ -131,7 +131,7 @@ npm run release
 npm run release -- --publish
 ```
 
-TUI includes live model status (running/idle/error), last turn duration, and last tool used. The TUI avoids continuous redraw animation by default for better behavior in mobile terminals/tmux; set `PIECODE_TUI_ANIMATION=1` to opt into a slow thinking spinner.
+TUI includes live model status (running/idle/error), last turn duration, and last tool used. The TUI is rendered with Ink and avoids continuous redraw animation by default for better behavior in mobile terminals/tmux; set `PIECODE_TUI_ANIMATION=1` to opt into a slow thinking spinner.
 
 Web UI is available with `node src/cli.js --web` or `npm run web`. It serves a browser-based agent workspace on `0.0.0.0` by default so other devices on the same LAN can open the printed network URL. The Web UI reuses the same Agent, provider, tool, MCP, skills, and approval backend as the CLI/TUI, with chat timeline, compact tool summaries, optional detail mode, session diff, TODOs, plan mode, abort, and shell approval controls. Web sessions are saved under `.piecode/web-sessions/`; use `/sessions` to list recent sessions and `/resume <short-id|session-id>` to restore one.
 

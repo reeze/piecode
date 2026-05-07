@@ -21,6 +21,7 @@ const state = {
   recentSessions: [],
   sessionId: "",
   attachments: [],
+  queue: [],
 };
 
 const el = {
@@ -138,7 +139,12 @@ function renderStatus(snapshot = {}) {
   if (el.detailMode) el.detailMode.checked = Boolean(snapshot.detailMode);
   if (el.abortBtn) el.abortBtn.disabled = !state.running;
   if (el.mobileAbortBtn) el.mobileAbortBtn.hidden = !state.running;
-  if (el.sendBtn) el.sendBtn.disabled = state.running;
+  if (el.sendBtn) el.sendBtn.disabled = false;
+  if (el.messageInput) {
+    el.messageInput.placeholder = state.running
+      ? "Steer the running task, or attach an image to queue next..."
+      : "Ask PieCode to inspect files, edit code, run tests, explain behavior, or review a diff...";
+  }
   renderContextUsage(snapshot.contextUsage);
 }
 
@@ -227,6 +233,7 @@ function renderTimelineItem(item) {
     </article>`;
   }
   if (item.type === "progress") {
+    if (item.kind === "model" && !state.status.detailMode) return "";
     const title = item.title || (item.kind === "model" ? "Model" : "Progress");
     const steps = Array.isArray(item.steps) && item.steps.length
       ? `<ol>${item.steps.map((step) => `<li>${escapeHtml(step)}</li>`).join("")}</ol>`
@@ -240,24 +247,27 @@ function renderTimelineItem(item) {
   if (item.type === "tool") {
     const status = String(item.status || "queued");
     const summary = summarizeToolInput(item);
+    const note = String(item.note || item.thought || item.reason || "").trim();
     const icon = status === "done" ? "✓" : status === "error" ? "!" : "↯";
     const openAttr = state.status.detailMode ? " open" : "";
-    return `<details class="tool-card ${escapeHtml(status)}" data-id="${escapeHtml(item.id)}"${openAttr}>
-      <summary class="tool-summary">
-        <span class="tool-icon">${icon}</span>
-        <span class="tool-main">
-          <strong>${escapeHtml(toolTitle(item))}</strong>
-          <code>${escapeHtml(summary)}</code>
-        </span>
-        <span class="tool-status">${escapeHtml(status)}</span>
-      </summary>
-      <div class="tool-body">
-        ${item.reason ? `<div class="tool-reason">${escapeHtml(item.reason)}</div>` : ""}
-        ${renderJsonBlock("Input", item.input || {})}
-        ${item.error ? `<div class="tool-error">${escapeHtml(item.error)}</div>` : ""}
-        ${renderToolResult(item.result)}
-      </div>
-    </details>`;
+    return `<section class="tool-wrap ${escapeHtml(status)}" data-id="${escapeHtml(item.id)}">
+      ${note ? `<div class="tool-note">${escapeHtml(note)}</div>` : ""}
+      <details class="tool-card ${escapeHtml(status)}"${openAttr}>
+        <summary class="tool-summary">
+          <span class="tool-icon">${icon}</span>
+          <span class="tool-main">
+            <strong>${escapeHtml(toolTitle(item))}</strong>
+            <code>${escapeHtml(summary)}</code>
+          </span>
+          <span class="tool-status">${escapeHtml(status)}</span>
+        </summary>
+        <div class="tool-body">
+          ${renderJsonBlock("Input", item.input || {})}
+          ${item.error ? `<div class="tool-error">${escapeHtml(item.error)}</div>` : ""}
+          ${renderToolResult(item.result)}
+        </div>
+      </details>
+    </section>`;
   }
   return "";
 }
@@ -581,6 +591,7 @@ function applySnapshot(snapshot) {
   if (Array.isArray(snapshot.approvals)) state.approvals = snapshot.approvals;
   if (Array.isArray(snapshot.clarifications)) state.clarifications = snapshot.clarifications;
   if (Array.isArray(snapshot.todos)) state.todos = snapshot.todos;
+  if (Array.isArray(snapshot.queue)) state.queue = snapshot.queue;
   if (Array.isArray(snapshot.slashCommands)) state.slashCommands = snapshot.slashCommands;
   renderStatus(snapshot);
   renderMessages();
@@ -636,6 +647,16 @@ function handleEvent(event) {
   if (type === "todos") {
     state.todos = payload.todos || [];
     renderTodos();
+    return;
+  }
+  if (type === "queue.update") {
+    state.queue = payload.queue || [];
+    const queued = state.queue.filter((item) => item.status === "queued").length;
+    if (queued > 0) pushEvent(`${queued} queued task${queued === 1 ? "" : "s"}`);
+    return;
+  }
+  if (type === "steer") {
+    pushEvent("Steer sent");
     return;
   }
   if (type === "sessions") {
@@ -723,7 +744,7 @@ function connectEvents() {
     el.connection.className = "pill";
   };
   const eventTypes = [
-    "snapshot", "ready", "message", "timeline", "timeline.update", "approval.request", "approval.resolved", "clarification.request", "clarification.resolved", "todos", "sessions",
+    "snapshot", "ready", "message", "timeline", "timeline.update", "approval.request", "approval.resolved", "clarification.request", "clarification.resolved", "todos", "queue.update", "steer", "steer_applied", "sessions",
     "task.start", "task.done", "task.error", "tool_use", "tool_start", "tool_end",
     "plan", "replan", "thought", "log", "model_call", "planning_call", "replanning_call", "llm_response", "context.update",
   ];
@@ -737,12 +758,15 @@ function connectEvents() {
 el.composer.addEventListener("submit", async (evt) => {
   evt.preventDefault();
   let message = el.messageInput.value.trim();
-  if ((!message && !state.attachments.length) || state.running) return;
+  if (!message && !state.attachments.length) return;
   if (!message && state.attachments.length) message = "Please inspect the attached image.";
   const attachments = state.attachments.map(({ type, name, mimeType, data, bytes }) => ({ type, name, mimeType, data, bytes }));
+  const mode = state.running ? (attachments.length > 0 ? "queue" : "steer") : "normal";
   el.messageInput.value = "";
   try {
-    await postJson("/api/messages", { message, planOnly: el.planOnly.checked, attachments });
+    const result = await postJson("/api/messages", { message, planOnly: el.planOnly.checked, attachments, mode });
+    if (result.queued) pushEvent("Queued next task");
+    if (result.steered) pushEvent("Steer sent");
     clearAttachments();
   } catch (err) {
     el.messageInput.value = message;

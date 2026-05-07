@@ -16,3 +16,5 @@ Recent resumable sessions:
   btbk  看一下现在的ui设计请优化一下wrb版本
   kxdt  Empty web session
 Resume with: /resume <short-id> or /resume <full-session-id>
+Session saved: session-20260505-144556-ka3y
+Resume later with: /resume ka3y or /resume session-20260505-144556-ka3y

@@ -47,10 +47,14 @@ describe('Skills trigger system', () => {
         '/workspace/project/Agents/skills',
         '/workspace/project/agents/skills',
         '/workspace/project/.skills',
+        '/workspace/project/.claude/skills',
+        '/workspace/project/.superpowers/skills',
         '/workspace/project/.piecode/skills',
       ]));
       expect(roots.some((root) => root.endsWith('/.agents/skills'))).toBe(true);
       expect(roots.some((root) => root.endsWith('/.codex/skills'))).toBe(true);
+      expect(roots.some((root) => root.endsWith('/.claude/skills'))).toBe(true);
+      expect(roots.some((root) => root.endsWith('/.superpowers/skills'))).toBe(true);
     });
 
     test('keeps configured roots and resolves relative paths against workspace', () => {
@@ -166,6 +170,25 @@ triggers:
 
 ## Other section`;
       expect(extractTriggers(frontmatter, body)).toEqual(['frontend development', 'ui design']);
+    });
+
+    test('extracts Claude/Superpower-style trigger metadata', () => {
+      const frontmatter = {
+        when_to_use: 'debugging, test-driven development',
+        keywords: ['tdd', 'red-green-refactor'],
+        activation: { keyword: 'complex task' },
+      };
+      const body = `## When to Use
+- systematic debugging
+- tdd`;
+      expect(extractTriggers(frontmatter, body)).toEqual([
+        'debugging',
+        'test-driven development',
+        'complex task',
+        'tdd',
+        'red-green-refactor',
+        'systematic debugging',
+      ]);
     });
 
     test('extracts triggers from "Triggers" section', () => {
