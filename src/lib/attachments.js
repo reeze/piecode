@@ -80,17 +80,47 @@ async function readClipboardImageMac() {
 }
 
 async function readClipboardImageLinux() {
-  const attempts = [
-    ["png", ["-selection", "clipboard", "-t", "image/png", "-o"]],
-    ["png", ["-selection", "clipboard", "-t", "image/jpeg", "-o"]],
+  const runners = [
+    {
+      command: "wl-paste",
+      attempts: [
+        ["--no-newline", "--type", "image/png"],
+        ["--no-newline", "--type", "image/jpeg"],
+        ["--no-newline", "--type", "image/gif"],
+        ["--no-newline", "--type", "image/webp"],
+      ],
+    },
+    {
+      command: "xclip",
+      attempts: [
+        ["-selection", "clipboard", "-t", "image/png", "-o"],
+        ["-selection", "clipboard", "-t", "image/jpeg", "-o"],
+        ["-selection", "clipboard", "-t", "image/gif", "-o"],
+        ["-selection", "clipboard", "-t", "image/webp", "-o"],
+      ],
+    },
+    {
+      command: "xsel",
+      attempts: [
+        ["--clipboard", "--output", "--mime-type", "image/png"],
+        ["--clipboard", "--output", "--mime-type", "image/jpeg"],
+        ["--clipboard", "--output", "--mime-type", "image/gif"],
+        ["--clipboard", "--output", "--mime-type", "image/webp"],
+      ],
+    },
   ];
   let lastErr = null;
-  for (const [, args] of attempts) {
-    try {
-      return await runClipboardCommand("xclip", args);
-    } catch (err) {
-      lastErr = err;
+  for (const runner of runners) {
+    for (const args of runner.attempts) {
+      try {
+        return await runClipboardCommand(runner.command, args);
+      } catch (err) {
+        lastErr = err;
+      }
     }
+  }
+  if (lastErr && String(lastErr?.code || "") === "ENOENT") {
+    throw new Error("No supported clipboard image command found on Linux (tried wl-paste, xclip, xsel).");
   }
   throw lastErr || new Error("Clipboard does not contain an image.");
 }

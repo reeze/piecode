@@ -28,6 +28,12 @@ import {
   saveResumableSession,
   shortSessionId,
 } from "../lib/resumableSessions.js";
+import {
+  buildGoalContinuationPrompt,
+  buildGoalPrompt,
+  createGoalRun,
+  parseGoalStatus,
+} from "../lib/goalMode.js";
 import { getSessionDiff, parseToolResultDetails } from "./core.js";
 
 const DEFAULT_PORT = 3737;
@@ -46,6 +52,7 @@ const WEB_SLASH_COMMANDS = [
   { name: "/btw", description: "Run a background strict-read-only side question" },
   { name: "/detail", description: "Toggle expanded tool details" },
   { name: "/plan", description: "Show or change plan mode" },
+  { name: "/goal", description: "Run a goal loop until completion, blockage, or the turn limit" },
   { name: "/approve", description: "Toggle shell auto-approval" },
   { name: "/model", description: "Show active provider/model" },
   { name: "/skills", description: "Show active skills" },
@@ -479,7 +486,7 @@ export class ClarificationBroker {
   }
 }
 
-class WebAgentSession {
+export class WebAgentSession {
   constructor({ workspaceDir, settings, settingsFile }) {
     this.workspaceDir = workspaceDir;
     this.settings = settings;
@@ -1072,6 +1079,7 @@ class WebAgentSession {
       this.messages = [];
       this.timeline = [];
       this.todos = [];
+      this.pendingSteers = [];
       this.agent.clearHistory();
       this.publish("todos", { todos: [] });
       this.publish("snapshot", this.snapshot());
@@ -1099,6 +1107,21 @@ class WebAgentSession {
       this.planOnly = enabled;
       this.publish("snapshot", this.snapshot());
       return { handled: true, patch: { planOnly: enabled }, message: `Plan mode ${enabled ? "enabled" : "disabled"}.` };
+    }
+    if (lower === "/goal" || lower.startsWith("/goal ")) {
+      const goal = raw.replace(/^\/goal(?:\s+|$)/i, "").trim();
+      if (!goal) {
+        return {
+          handled: true,
+          message: "Usage: `/goal <task>`. Goal mode loops until acceptance is complete, blocked, or the max turn limit is reached.",
+        };
+      }
+      return {
+        handled: false,
+        input: buildGoalPrompt(goal),
+        displayInput: raw,
+        goal,
+      };
     }
     if (lower.startsWith("/approve")) {
       const arg = argAfter("/approve");
@@ -1183,7 +1206,7 @@ class WebAgentSession {
     if (text.startsWith("/")) {
       const slash = await this.handleSlashCommand(text);
       if (slash.handled) return this.addAssistantMessage(slash.message);
-      options = { ...options, displayInput: slash.displayInput || text };
+      options = { ...options, displayInput: slash.displayInput || text, ...(slash.goal ? { goal: slash.goal } : {}) };
       content = slash.input || text;
     }
 
@@ -1206,7 +1229,33 @@ class WebAgentSession {
     this.publish("task.start", { input: text });
 
     try {
-      const result = await this.agent.runTurn(modelContent, { planOnly: Boolean(options.planOnly), attachments });
+      const goalRun = options.goal ? createGoalRun(options.goal, { env: process.env }) : null;
+      if (goalRun) {
+        this.publish("log", { line: `[goal] loop started (max ${goalRun.maxIterations} turns)` });
+        if (options.planOnly || this.planOnly) {
+          this.publish("log", { line: "[goal] executing with plan mode off for this goal loop" });
+        }
+      }
+      let turnInput = modelContent;
+      let result = "";
+      while (true) {
+        result = await this.agent.runTurn(turnInput, {
+          planOnly: goalRun ? goalRun.planOnly : Boolean(options.planOnly ?? this.planOnly),
+          attachments: goalRun && goalRun.iteration > 1 ? [] : attachments,
+        });
+        if (!goalRun) break;
+        const contentOut = typeof result === "string" ? result : JSON.stringify(result, null, 2);
+        goalRun.lastOutput = contentOut;
+        goalRun.status = parseGoalStatus(contentOut);
+        this.publish("log", { line: `[goal] status=${goalRun.status} turn=${goalRun.iteration}/${goalRun.maxIterations}` });
+        if (goalRun.status === "complete" || goalRun.status === "blocked") break;
+        if (goalRun.iteration >= goalRun.maxIterations) {
+          this.publish("log", { line: "[goal] max goal turns reached; stopping for user review" });
+          break;
+        }
+        goalRun.iteration += 1;
+        turnInput = buildGoalContinuationPrompt(goalRun.goal, goalRun.iteration, goalRun.lastOutput);
+      }
       const contentOut = typeof result === "string" ? result : JSON.stringify(result, null, 2);
       const assistantMessage = { id: makeId("msg"), role: "assistant", content: contentOut, at: new Date().toISOString() };
       this.messages.push(assistantMessage);

@@ -28,9 +28,24 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-function Line({ children, dim = false, bold = false }) {
-  const line = cleanLine(children);
-  return h(Text, { wrap: "truncate", dimColor: dim, bold }, line === "" ? " " : line);
+function stripAnsi(text) {
+  return String(text || "").replace(/\x1b(?:\[[0-9;?]*[ -/]*[@-~]|[%()][ -~])/g, "");
+}
+
+function visibleWidth(text) {
+  return stripAnsi(text).length;
+}
+
+function padLine(line, width) {
+  const text = cleanLine(line);
+  const maxWidth = Math.max(1, Number(width) || 1);
+  const clipped = visibleWidth(text) > maxWidth ? text.slice(0, maxWidth) : text;
+  const pad = Math.max(0, maxWidth - visibleWidth(clipped));
+  return `${clipped}${" ".repeat(pad)}`;
+}
+
+function Line({ children, width = 1, dim = false, bold = false }) {
+  return h(Text, { wrap: "truncate", dimColor: dim, bold }, padLine(children, width));
 }
 
 function resolveRawCursor(frame, width, rows) {
@@ -74,12 +89,22 @@ function visibleWorkspaceLines(workspaceLines, rows, bottomRows) {
   return workspaceLines.slice(workspaceLines.length - budget);
 }
 
+function padFrameRows(elements, rows, keyPrefix, width) {
+  const out = Array.isArray(elements) ? [...elements] : [];
+  const targetRows = Math.max(1, Math.floor(Number(rows) || 1));
+  while (out.length < targetRows) {
+    out.push(h(Line, { key: `${keyPrefix}-clear-${out.length}`, width }, ""));
+  }
+  return out.slice(0, targetRows);
+}
+
 function InkRawFrame({ frame, width, rows }) {
   const { visible } = resolveRawCursor(frame, width, rows);
+  const elements = visible.map((line, index) => h(Line, { key: `raw-${index}`, width }, line));
   return h(
     Box,
-    { flexDirection: "column", width, overflow: "hidden" },
-    ...visible.map((line, index) => h(Line, { key: `raw-${index}` }, line))
+    { flexDirection: "column", width, height: rows, overflow: "hidden" },
+    ...padFrameRows(elements, rows, "raw", width)
   );
 }
 
@@ -87,16 +112,25 @@ function InkStructuredFrame({ frame, width, rows }) {
   const { visibleWorkspace, inputLines, statusLine, hintLines } = resolveStructuredCursor(frame, width, rows);
   const separatorGlyph = String(frame?.separatorGlyph || "-").slice(0, 1) || "-";
   const separator = separatorLine(separatorGlyph, width);
+  const elements = [];
+
+  visibleWorkspace.forEach((line, index) => {
+    elements.push(h(Line, { key: `w-${index}`, width }, line));
+  });
+  elements.push(h(Line, { key: "sep-top", width, dim: true }, separator));
+  inputLines.forEach((line, index) => {
+    elements.push(h(Line, { key: `i-${index}`, width, bold: index === 0 }, line));
+  });
+  elements.push(h(Line, { key: "sep-bottom", width, dim: true }, separator));
+  if (statusLine) elements.push(h(Line, { key: "status", width, dim: true }, statusLine));
+  hintLines.forEach((line, index) => {
+    elements.push(h(Line, { key: `h-${index}`, width, dim: true }, line));
+  });
 
   return h(
     Box,
-    { flexDirection: "column", width, overflow: "hidden" },
-    ...visibleWorkspace.map((line, index) => h(Line, { key: `w-${index}` }, line)),
-    h(Line, { key: "sep-top", dim: true }, separator),
-    ...inputLines.map((line, index) => h(Line, { key: `i-${index}`, bold: index === 0 }, line)),
-    h(Line, { key: "sep-bottom", dim: true }, separator),
-    statusLine ? h(Line, { key: "status", dim: true }, statusLine) : null,
-    ...hintLines.map((line, index) => h(Line, { key: `h-${index}`, dim: true }, line))
+    { flexDirection: "column", width, height: rows, overflow: "hidden" },
+    ...padFrameRows(elements, rows, "structured", width)
   );
 }
 
@@ -117,6 +151,7 @@ export class InkTuiLayout {
     this.instance = null;
     this.renderVersion = 0;
     this.cursorTarget = { row: 1, col: 1 };
+    this.inAlternateScreen = false;
     this.frame = {
       workspaceLines: [],
       inputLines: [""],
@@ -141,6 +176,8 @@ export class InkTuiLayout {
     this.cursorTarget = this.resolveCursorTarget(this.frame);
     const tree = h(InkTuiApp, { frame: this.frame });
     if (!this.instance) {
+      this.output.write("\x1b[?1049h\x1b[2J\x1b[H");
+      this.inAlternateScreen = true;
       this.instance = render(tree, {
         stdin: this.input,
         stdout: this.output,
@@ -203,6 +240,10 @@ export class InkTuiLayout {
     } finally {
       this.instance = null;
       try {
+        if (this.inAlternateScreen) {
+          this.output.write("\x1b[?1049l");
+          this.inAlternateScreen = false;
+        }
         this.output.write("\x1b[?25h");
       } catch {
         // best effort

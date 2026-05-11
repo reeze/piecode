@@ -175,6 +175,7 @@ DOCKER_HOST=unix:///Users/$USER/.orbstack/run/docker.sock ./scripts/run-terminal
 - `/exit` quit
 - `/clear` clear conversation memory
 - `/plan on|off` toggle plan mode (generate plans, allow safe read-only tools, no file changes)
+- `/goal <task>` run a goal-driven loop that keeps planning, executing, and verifying until completion, blockage, or the turn limit
 - `/approve on|off` toggle shell auto approval
 - `/model` show active provider/model
 - `/mcp` show MCP status/usage
@@ -213,7 +214,7 @@ You can also mention `$skill-name` in a prompt to auto-enable that skill for the
   - `list_mcp_resource_templates`
   - `read_mcp_resource`
 - Provider selection order is: CLI args -> `~/.piecode/settings.json` -> env vars -> Codex CLI session -> Codex auth file.
-- Clipboard image attachments are supported in interactive mode via `/attach image` (macOS, Windows, and Linux with `xclip`). They are sent to vision-capable native-tool providers with the next prompt.
+- Clipboard image attachments are supported in interactive mode via `/attach image` (macOS, Windows, and Linux with `wl-paste`, `xclip`, or `xsel`). They are sent to vision-capable native-tool providers with the next prompt.
 - `seed` provider is OpenAI-compatible and can be selected with `"provider": "seed"` (or `--provider seed`).
 - Codex OAuth tokens may not include all API scopes; if needed, set `OPENAI_API_KEY`.
 - Interactive prompt history is persisted to `~/.piecode_history` by default.
@@ -222,6 +223,7 @@ You can also mention `$skill-name` in a prompt to auto-enable that skill for the
 - Set `PIECODE_SETTINGS_FILE` to override the settings file location.
 - Set `PIECODE_ENABLE_PLANNER=1` to enable the experimental task planner (disabled by default).
 - Set `PIECODE_PLAN_MODE=1` to start in plan mode (safe read-only tools allowed, no file changes).
+- Set `PIECODE_GOAL_MAX_TURNS` to tune `/goal` loop length (default `50`, range `1-200`).
 - Set `PIECODE_SKILLS_DIR` to override/extend skill root directories (comma-separated).
 - Set `PIECODE_PLAN_FIRST=1` to enable lightweight pre-plan (disabled by default).
 - Set `PIECODE_TOOL_BUDGET` to set initial planning budget guidance (default `6`, range `1-12`).

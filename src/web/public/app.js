@@ -13,6 +13,7 @@ const state = {
   timeline: [],
   approvals: [],
   clarifications: [],
+  clarificationSelections: {},
   todos: [],
   slashCommands: [],
   selectedSuggestion: 0,
@@ -63,6 +64,7 @@ const el = {
   mobileAbortBtn: document.getElementById("mobileAbortBtn"),
   mobileCloseMenuBtn: document.getElementById("mobileCloseMenuBtn"),
   sidebarBackdrop: document.getElementById("sidebarBackdrop"),
+  mobileActionSheet: document.getElementById("mobileActionSheet"),
   mobileApprovalPanel: document.getElementById("mobileApprovalPanel"),
   mobileApprovalList: document.getElementById("mobileApprovalList"),
   contextUsage: document.getElementById("contextUsage"),
@@ -139,12 +141,12 @@ function renderStatus(snapshot = {}) {
   if (el.detailMode) el.detailMode.checked = Boolean(snapshot.detailMode);
   if (el.abortBtn) el.abortBtn.disabled = !state.running;
   if (el.mobileAbortBtn) el.mobileAbortBtn.hidden = !state.running;
-  if (el.sendBtn) el.sendBtn.disabled = false;
   if (el.messageInput) {
     el.messageInput.placeholder = state.running
       ? "Steer the running task, or attach an image to queue next..."
       : "Ask PieCode to inspect files, edit code, run tests, explain behavior, or review a diff...";
   }
+  syncComposerState();
   renderContextUsage(snapshot.contextUsage);
 }
 
@@ -273,11 +275,23 @@ function renderTimelineItem(item) {
 }
 
 function renderMessages() {
+  const shouldStick = isMessagesNearBottom();
   if (!state.timeline.length) {
     el.messages.innerHTML = `<div class="empty-state"><div><h3>Ready</h3><p>Ask PieCode to inspect the workspace, make a focused edit, or run verification.</p></div></div>`;
     return;
   }
   el.messages.innerHTML = state.timeline.map(renderTimelineItem).join("");
+  if (shouldStick) scrollMessagesToBottom();
+}
+
+function isMessagesNearBottom() {
+  if (!el.messages) return true;
+  const remaining = el.messages.scrollHeight - el.messages.scrollTop - el.messages.clientHeight;
+  return remaining < 96;
+}
+
+function scrollMessagesToBottom() {
+  if (!el.messages) return;
   el.messages.scrollTop = el.messages.scrollHeight;
 }
 
@@ -314,18 +328,50 @@ function approvalReason(item) {
   return details.classification?.reason || details.reason || details.question || "Review this action before PieCode continues.";
 }
 
+function getClarificationSelection(id) {
+  return new Set(state.clarificationSelections[String(id || "")] || []);
+}
+
+function setClarificationSelection(id, values) {
+  const key = String(id || "");
+  if (!key) return;
+  state.clarificationSelections[key] = [...new Set((Array.isArray(values) ? values : []).map((value) => Number(value)).filter((value) => Number.isInteger(value) && value >= 0))];
+}
+
+function clearClarificationSelection(id) {
+  delete state.clarificationSelections[String(id || "")];
+}
+
 function renderClarifications() {
   const clarificationHtml = state.clarifications
-    .map((item) => `<div class="approval-item clarification-item">
-      <strong>${escapeHtml(item.question || "Clarification needed")}</strong>
-      <div class="muted">Choose ${item.multiple ? "one or more options" : "one option"} so PieCode can continue.</div>
-      <div class="approval-actions clarification-actions">
-        ${(Array.isArray(item.options) ? item.options : []).map((option, index) => `<button class="secondary" data-clarification="${escapeHtml(item.id)}" data-option-index="${index}">
-          ${escapeHtml(option.label || option.value || `Option ${index + 1}`)}${option.description ? `<small>${escapeHtml(option.description)}</small>` : ""}
-        </button>`).join("")}
-        ${item.required ? "" : `<button class="danger" data-clarification="${escapeHtml(item.id)}" data-option-index="">Skip</button>`}
-      </div>
-    </div>`)
+    .map((item) => {
+      const options = Array.isArray(item.options) ? item.options : [];
+      const selected = getClarificationSelection(item.id);
+      const selectionLabel = item.multiple
+        ? (selected.size > 0 ? `${selected.size} selected` : "Choose one or more")
+        : (selected.size > 0 ? "1 selected" : "Choose one");
+      return `<div class="approval-item clarification-item">
+        <strong>${escapeHtml(item.question || "Clarification needed")}</strong>
+        <div class="muted">${escapeHtml(selectionLabel)} so PieCode can continue.</div>
+        <div class="clarification-options">
+          ${options.map((option, index) => {
+            const isSelected = selected.has(index);
+            const indicator = item.multiple ? (isSelected ? "☑" : "☐") : (isSelected ? "◉" : "○");
+            return `<button type="button" class="secondary clarification-option ${isSelected ? "selected" : ""}" data-clarification="${escapeHtml(item.id)}" data-clarification-toggle="${escapeHtml(item.id)}" data-option-index="${index}">
+              <span class="clarification-indicator">${indicator}</span>
+              <span class="clarification-copy">
+                <span class="clarification-label">${escapeHtml(option.label || option.value || `Option ${index + 1}`)}</span>
+                ${option.description ? `<small>${escapeHtml(option.description)}</small>` : ""}
+              </span>
+            </button>`;
+          }).join("")}
+        </div>
+        <div class="approval-actions clarification-actions">
+          ${!item.required ? `<button class="ghost" data-clarification="${escapeHtml(item.id)}" data-clarification-skip="${escapeHtml(item.id)}">Skip</button>` : `<span class="clarification-spacer"></span>`}
+          <button class="good" data-clarification="${escapeHtml(item.id)}" data-clarification-submit="${escapeHtml(item.id)}" ${item.required && selected.size === 0 ? "disabled" : ""}>Continue</button>
+        </div>
+      </div>`;
+    })
     .join("");
 
   document.body.classList.toggle("has-clarifications", state.clarifications.length > 0);
@@ -450,6 +496,7 @@ function applySuggestion(commandText) {
   el.messageInput.value = text;
   el.messageInput.focus();
   el.messageInput.setSelectionRange(text.length, text.length);
+  syncComposerState();
   renderSlashSuggestions();
 }
 
@@ -510,6 +557,7 @@ function renderAttachmentTray() {
   if (!state.attachments.length) {
     el.attachmentTray.hidden = true;
     el.attachmentTray.innerHTML = "";
+    syncComposerState();
     return;
   }
   el.attachmentTray.hidden = false;
@@ -522,11 +570,12 @@ function renderAttachmentTray() {
       <button type="button" data-remove-attachment="${escapeHtml(item.id)}" aria-label="Remove attachment">×</button>
     </div>`;
   }).join("");
+  syncComposerState();
 }
 
 async function addAttachmentFiles(files) {
   const list = [...(files || [])].filter((file) => ALLOWED_IMAGE_TYPES.has(file.type));
-  if (!list.length) return;
+  if (!list.length) return false;
   try {
     const next = [...state.attachments];
     for (const file of list) {
@@ -540,15 +589,85 @@ async function addAttachmentFiles(files) {
     state.attachments = next;
     renderAttachmentTray();
     pushEvent(`${list.length} image${list.length === 1 ? "" : "s"} attached`);
+    return true;
   } catch (err) {
     pushEvent(err.message);
+    return false;
   }
+}
+
+async function clipboardItemsToFiles(clipboardData) {
+  const items = [...(clipboardData?.items || [])];
+  const files = items
+    .filter((item) => ALLOWED_IMAGE_TYPES.has(String(item.type || "").toLowerCase()))
+    .map((item) => item.getAsFile?.())
+    .filter((file) => file && ALLOWED_IMAGE_TYPES.has(file.type));
+  if (files.length) return files;
+  return [...(clipboardData?.files || [])].filter((file) => ALLOWED_IMAGE_TYPES.has(file.type));
 }
 
 function clearAttachments() {
   state.attachments = [];
   if (el.imageInput) el.imageInput.value = "";
   renderAttachmentTray();
+}
+
+function resizeComposerInput() {
+  if (!el.messageInput) return;
+  el.messageInput.style.height = "auto";
+  const max = window.matchMedia("(max-width: 980px)").matches ? 180 : 220;
+  el.messageInput.style.height = `${Math.min(el.messageInput.scrollHeight, max)}px`;
+}
+
+function syncComposerState() {
+  if (!el.sendBtn || !el.messageInput) return;
+  const hasPayload = Boolean(el.messageInput.value.trim()) || state.attachments.length > 0;
+  el.sendBtn.disabled = !hasPayload;
+  document.body.classList.toggle("has-composer-payload", hasPayload);
+  resizeComposerInput();
+}
+
+function closeMobileActionSheet() {
+  if (!el.mobileActionSheet) return;
+  el.mobileActionSheet.hidden = true;
+  document.body.classList.remove("mobile-actions-open");
+  el.mobileMoreBtn?.setAttribute("aria-expanded", "false");
+}
+
+function openMobileActionSheet() {
+  if (!el.mobileActionSheet) return;
+  el.mobileActionSheet.hidden = false;
+  document.body.classList.add("mobile-actions-open");
+  el.mobileMoreBtn?.setAttribute("aria-expanded", "true");
+}
+
+function runMobileAction(action) {
+  closeMobileActionSheet();
+  if (action === "commands") {
+    applySuggestion("/");
+    return;
+  }
+  if (action === "diff") {
+    openDiffOverlay();
+    return;
+  }
+  if (action === "sessions") {
+    applySuggestion("/sessions");
+    return;
+  }
+  if (action === "skills") {
+    applySuggestion("/skills");
+    return;
+  }
+  if (action === "detail") {
+    el.detailMode.checked = !el.detailMode.checked;
+    el.detailMode.dispatchEvent(new Event("change"));
+    return;
+  }
+  if (action === "plan") {
+    el.planOnly.checked = !el.planOnly.checked;
+    el.planOnly.dispatchEvent(new Event("change"));
+  }
 }
 
 function closeDiffOverlay() {
@@ -589,7 +708,13 @@ function applySnapshot(snapshot) {
   if (Array.isArray(snapshot.timeline)) state.timeline = snapshot.timeline;
   else state.timeline = state.messages.map((msg) => ({ ...msg, type: "message" }));
   if (Array.isArray(snapshot.approvals)) state.approvals = snapshot.approvals;
-  if (Array.isArray(snapshot.clarifications)) state.clarifications = snapshot.clarifications;
+  if (Array.isArray(snapshot.clarifications)) {
+    state.clarifications = snapshot.clarifications;
+    const activeIds = new Set(state.clarifications.map((item) => String(item.id || "")));
+    Object.keys(state.clarificationSelections).forEach((id) => {
+      if (!activeIds.has(id)) delete state.clarificationSelections[id];
+    });
+  }
   if (Array.isArray(snapshot.todos)) state.todos = snapshot.todos;
   if (Array.isArray(snapshot.queue)) state.queue = snapshot.queue;
   if (Array.isArray(snapshot.slashCommands)) state.slashCommands = snapshot.slashCommands;
@@ -634,12 +759,14 @@ function handleEvent(event) {
   }
   if (type === "clarification.request") {
     state.clarifications = [payload, ...state.clarifications.filter((item) => item.id !== payload.id)];
+    if (payload.multiple) setClarificationSelection(payload.id, getClarificationSelection(payload.id));
     renderApprovals();
     pushEvent("Clarification required");
     return;
   }
   if (type === "clarification.resolved") {
     state.clarifications = state.clarifications.filter((item) => item.id !== payload.id);
+    clearClarificationSelection(payload.id);
     renderApprovals();
     pushEvent("Clarification answered");
     return;
@@ -763,6 +890,7 @@ el.composer.addEventListener("submit", async (evt) => {
   const attachments = state.attachments.map(({ type, name, mimeType, data, bytes }) => ({ type, name, mimeType, data, bytes }));
   const mode = state.running ? (attachments.length > 0 ? "queue" : "steer") : "normal";
   el.messageInput.value = "";
+  syncComposerState();
   try {
     const result = await postJson("/api/messages", { message, planOnly: el.planOnly.checked, attachments, mode });
     if (result.queued) pushEvent("Queued next task");
@@ -770,12 +898,14 @@ el.composer.addEventListener("submit", async (evt) => {
     clearAttachments();
   } catch (err) {
     el.messageInput.value = message;
+    syncComposerState();
     upsertTimeline({ id: `local-error-${Date.now()}`, type: "message", role: "error", content: err.message, at: new Date().toISOString() });
   }
 });
 
 el.messageInput.addEventListener("input", () => {
   state.selectedSuggestion = 0;
+  syncComposerState();
   renderSlashSuggestions();
 });
 
@@ -819,9 +949,11 @@ el.attachmentTray?.addEventListener("click", (evt) => {
   state.attachments = state.attachments.filter((item) => item.id !== button.dataset.removeAttachment);
   renderAttachmentTray();
 });
-el.messageInput.addEventListener("paste", (evt) => {
-  const files = [...(evt.clipboardData?.files || [])].filter((file) => ALLOWED_IMAGE_TYPES.has(file.type));
-  if (files.length) addAttachmentFiles(files);
+el.messageInput.addEventListener("paste", async (evt) => {
+  const files = await clipboardItemsToFiles(evt.clipboardData);
+  if (!files.length) return;
+  evt.preventDefault();
+  await addAttachmentFiles(files);
 });
 el.composer.addEventListener("dragover", (evt) => {
   if ([...(evt.dataTransfer?.items || [])].some((item) => String(item.type || "").startsWith("image/"))) {
@@ -855,7 +987,18 @@ el.sidebarBackdrop?.addEventListener("click", () => {
 });
 
 el.mobileMoreBtn?.addEventListener("click", () => {
-  applySuggestion("/");
+  if (el.mobileActionSheet?.hidden) openMobileActionSheet();
+  else closeMobileActionSheet();
+});
+
+el.mobileActionSheet?.addEventListener("click", (evt) => {
+  if (evt.target.closest("[data-mobile-sheet-close]")) {
+    closeMobileActionSheet();
+    return;
+  }
+  const button = evt.target.closest("button[data-mobile-action]");
+  if (!button) return;
+  runMobileAction(button.dataset.mobileAction);
 });
 
 el.mobileNewBtn?.addEventListener("click", async () => {
@@ -881,17 +1024,57 @@ el.recentSessions.addEventListener("click", async (evt) => {
 });
 
 async function handleApprovalClick(evt) {
-  const clarificationButton = evt.target.closest("button[data-clarification]");
-  if (clarificationButton) {
-    clarificationButton.disabled = true;
-    const rawIndex = clarificationButton.dataset.optionIndex;
-    const selectedIndexes = rawIndex === "" ? [] : [Number(rawIndex)];
-    const id = clarificationButton.dataset.clarification;
+  const toggleButton = evt.target.closest("button[data-clarification-toggle]");
+  if (toggleButton) {
+    const id = toggleButton.dataset.clarificationToggle;
+    const optionIndex = Number(toggleButton.dataset.optionIndex);
+    const clarification = state.clarifications.find((item) => item.id === id);
+    if (!clarification || !Number.isInteger(optionIndex)) return;
+    const current = getClarificationSelection(id);
+    if (clarification.multiple) {
+      if (current.has(optionIndex)) current.delete(optionIndex);
+      else current.add(optionIndex);
+      setClarificationSelection(id, [...current]);
+    } else {
+      setClarificationSelection(id, current.has(optionIndex) ? [] : [optionIndex]);
+    }
+    renderApprovals();
+    return;
+  }
+
+  const submitButton = evt.target.closest("button[data-clarification-submit]");
+  if (submitButton) {
+    submitButton.disabled = true;
+    const id = submitButton.dataset.clarificationSubmit;
+    const selectedIndexes = state.clarificationSelections[id] || [];
+    const existing = [...state.clarifications];
     state.clarifications = state.clarifications.filter((item) => item.id !== id);
+    clearClarificationSelection(id);
     renderApprovals();
     try {
       await postJson("/api/clarifications", { id, selectedIndexes });
     } catch (err) {
+      state.clarifications = existing;
+      setClarificationSelection(id, selectedIndexes);
+      renderApprovals();
+      pushEvent(err.message);
+    }
+    return;
+  }
+
+  const skipButton = evt.target.closest("button[data-clarification-skip]");
+  if (skipButton) {
+    skipButton.disabled = true;
+    const id = skipButton.dataset.clarificationSkip;
+    const existing = [...state.clarifications];
+    state.clarifications = state.clarifications.filter((item) => item.id !== id);
+    clearClarificationSelection(id);
+    renderApprovals();
+    try {
+      await postJson("/api/clarifications", { id, selectedIndexes: [] });
+    } catch (err) {
+      state.clarifications = existing;
+      renderApprovals();
       pushEvent(err.message);
     }
     return;
@@ -955,9 +1138,11 @@ el.diffOverlay.addEventListener("click", (evt) => {
 
 document.addEventListener("keydown", (evt) => {
   if (evt.key === "Escape" && !el.diffOverlay.hidden) closeDiffOverlay();
+  if (evt.key === "Escape") closeMobileActionSheet();
   if (evt.key === "Escape") document.body.classList.remove("sidebar-open");
 });
 
 loadInitialState().catch(() => {});
 connectEvents();
 renderMessages();
+syncComposerState();

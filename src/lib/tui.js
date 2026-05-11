@@ -761,6 +761,13 @@ function formatCompactNumber(n) {
   return String(Math.round(value));
 }
 
+function joinStatusParts(parts = []) {
+  return (Array.isArray(parts) ? parts : [])
+    .map((part) => String(part || "").trim())
+    .filter(Boolean)
+    .join(" | ");
+}
+
 function separatorLine(width, useUnicode = true) {
   const glyph = useUnicode ? "─" : "-";
   return `\x1b[90m${glyph.repeat(Math.max(1, Number(width) || 1))}\x1b[0m`;
@@ -833,9 +840,11 @@ function padDisplayLine(line, width) {
 
 function renderFrameLines(lines, width, height = 0) {
   const paintWidth = Math.max(1, (Number(width) || 1) - 1);
-  const out = (Array.isArray(lines) ? lines : []).map((line) => padDisplayLine(line, paintWidth));
-  const minHeight = Math.max(0, Number(height) || 0);
-  while (out.length < minHeight) out.push(padDisplayLine("", paintWidth));
+  const maxHeight = Math.max(0, Number(height) || 0);
+  const source = Array.isArray(lines) ? lines : [];
+  const visible = maxHeight > 0 && source.length > maxHeight ? source.slice(source.length - maxHeight) : source;
+  const out = visible.map((line) => padDisplayLine(line, paintWidth));
+  while (out.length < maxHeight) out.push(padDisplayLine("", paintWidth));
   return out.join("\n");
 }
 
@@ -959,6 +968,13 @@ export class SimpleTui {
     this.thoughtStreamText = "";
     this.thoughtStreamVisible = false;
     this.planModeEnabled = false;
+    this.goalStatus = {
+      active: false,
+      label: "",
+      iteration: 0,
+      maxIterations: 0,
+      status: "",
+    };
     this.projectInstructionsStatus = {
       state: "unknown",
       source: "AGENTS.md",
@@ -1009,14 +1025,15 @@ export class SimpleTui {
   }
 
   event(line) {
-    if (String(line || "").startsWith("[task] ")) {
-      this.currentTaskText = String(line).slice(7).trim();
+    const rawLine = String(line || "");
+    if (rawLine.startsWith("[task] ")) {
+      this.currentTaskText = rawLine.slice(7).trim();
       this.taskStartedAt = Date.now();
       this.taskCompletedAt = 0;
       this.scrollOffset = 0;
     }
     const timestamp = new Date().toLocaleTimeString();
-    const entry = `[${timestamp}] ${line}`;
+    const entry = `[${timestamp}] ${rawLine}`;
     this.logs.push(entry);
     if (this.logs.length > this.maxLogs) {
       this.logs = this.logs.slice(this.logs.length - this.maxLogs);
@@ -1025,7 +1042,7 @@ export class SimpleTui {
     if (this.activity.length > this.maxActivity) {
       this.activity = this.activity.slice(this.activity.length - this.maxActivity);
     }
-    const timelineLines = this.formatTimelineLines(String(line || ""));
+    const timelineLines = this.formatTimelineLines(rawLine);
     const spacedTimelineLines = this.withTimelineSpacing(timelineLines);
     for (const item of spacedTimelineLines) {
       this.timeline.push(item);
@@ -1415,6 +1432,18 @@ export class SimpleTui {
     this.render();
   }
 
+  setGoalStatus(status = null) {
+    const next = status && typeof status === "object" ? status : {};
+    this.goalStatus = {
+      active: Boolean(next.active),
+      label: String(next.label || next.goal || "").trim(),
+      iteration: Math.max(0, Number(next.iteration) || 0),
+      maxIterations: Math.max(0, Number(next.maxIterations) || 0),
+      status: String(next.status || "").trim().toLowerCase(),
+    };
+    this.render();
+  }
+
   openOverlay(title, text, options = {}) {
     this.overlayVisible = true;
     this.overlayTitle = String(title || "Details");
@@ -1642,14 +1671,18 @@ export class SimpleTui {
 
   setCommandSuggestions(options, selectedIndex = 0, label = "commands") {
     const list = Array.isArray(options) ? options.map((item) => String(item || "")).filter(Boolean) : [];
-    this.commandSuggestions = list.slice(0, 8);
+    const viewportRows = Math.max(1, (this.out?.rows || 30) - 6);
+    const limit = Math.max(1, Math.min(8, viewportRows));
+    const requestedIndex = Math.max(0, Number(selectedIndex) || 0);
+    const start = Math.max(0, Math.min(requestedIndex, Math.max(0, list.length - limit)));
+    this.commandSuggestions = list.slice(start, start + limit);
     this.commandSuggestionLabel = String(label || "commands");
     this.commandSuggestionsVisible = this.commandSuggestions.length > 0;
     if (!this.commandSuggestionsVisible) {
       this.commandSuggestionIndex = 0;
     } else {
-      const clamped = Math.max(0, Math.min(this.commandSuggestions.length - 1, Number(selectedIndex) || 0));
-      this.commandSuggestionIndex = clamped;
+      const localIndex = Math.max(0, Math.min(this.commandSuggestions.length - 1, requestedIndex - start));
+      this.commandSuggestionIndex = localIndex;
     }
     this.render();
   }
@@ -1726,6 +1759,64 @@ export class SimpleTui {
     if (items.length === 0) return [];
     const previous = this.timeline.length > 0 ? this.timeline[this.timeline.length - 1] : "";
     return normalizeTimelineSpacing(previous ? [previous, ...items] : items).slice(previous ? 1 : 0);
+  }
+
+  setTimelineLines(lines = []) {
+    const next = Array.isArray(lines) ? lines.map((line) => String(line || "")) : [];
+    this.timeline = next.slice(Math.max(0, next.length - this.maxTimeline));
+    this.scrollOffset = 0;
+    this.render();
+  }
+
+  restoreSessionTimeline(items = [], { maxItems = this.maxTimeline } = {}) {
+    const source = Array.isArray(items) ? items : [];
+    const cap = Math.max(1, Number(maxItems) || this.maxTimeline || 2000);
+    const restored = [];
+    const pushLines = (lines) => {
+      const items = Array.isArray(lines) ? lines : [];
+      if (items.length === 0) return;
+      const previous = restored.length > 0 ? restored[restored.length - 1] : "";
+      const formatted = normalizeTimelineSpacing(previous ? [previous, ...items] : items).slice(previous ? 1 : 0);
+      for (const line of formatted) restored.push(line);
+      if (restored.length > cap) restored.splice(0, restored.length - cap);
+    };
+
+    for (const item of source.slice(Math.max(0, source.length - cap))) {
+      if (!item || typeof item !== "object") continue;
+      if (typeof item.line === "string") {
+        pushLines(this.formatTimelineLines(item.line));
+        continue;
+      }
+      const type = String(item.type || "message");
+      if (type === "message") {
+        const role = String(item.role || "assistant").toLowerCase();
+        const content = String(item.content || "").trim();
+        if (!content) continue;
+        if (role === "user") pushLines(this.formatTimelineLines(`[task] ${content}`));
+        else if (role === "assistant") pushLines(this.formatTimelineLines(`[response] ${content}`));
+        else pushLines(this.formatTimelineLines(`[result] ${content}`));
+        continue;
+      }
+      if (type === "tool") {
+        const title = String(item.title || item.tool || "tool").trim();
+        const input = item.input && typeof item.input === "object"
+          ? (item.input.path || item.input.query || item.input.pattern || item.input.command || "")
+          : "";
+        pushLines(this.formatTimelineLines(`[tool] ${title}${input ? ` (${input})` : ""}`));
+        if (item.output || item.error) pushLines(this.formatTimelineLines(`[tool-result] ${String(item.error || item.output || "")}`));
+        continue;
+      }
+      if (type === "progress") {
+        pushLines(this.formatTimelineLines(`[progress] ${item.content || item.title || ""}`));
+        continue;
+      }
+      const content = String(item.content || item.title || "").trim();
+      if (content) pushLines(this.formatTimelineLines(content));
+    }
+
+    this.timeline = restored.slice(Math.max(0, restored.length - this.maxTimeline));
+    this.scrollOffset = 0;
+    this.render();
   }
 
   formatTimelineLines(line) {
@@ -2068,7 +2159,11 @@ export class SimpleTui {
       );
     }
     if (line.startsWith("[banner-1] ")) {
-      return [color(line.slice(11), "1;82")];
+      let text = line.slice(11);
+      if (text.includes(" Pie Code")) {
+        text = text.replace(" Pie Code", color(" Pie Code", "1;30;42") + "\x1b[1;82m");
+      }
+      return [color(text, "1;82")];
     }
     if (line.startsWith("[banner-title] ")) {
       const raw = String(line.slice(15) || "");
@@ -2303,7 +2398,7 @@ export class SimpleTui {
 
     const termWidth = Math.max(40, this.out.columns || 100);
     const width = Math.max(20, termWidth - 1);
-    const height = Math.max(16, this.out.rows || 30);
+    const height = Math.max(8, this.out.rows || 30);
 
     if (this.overlayVisible) {
       const sep = separatorLine(width, this.unicodeSymbols);
@@ -2367,15 +2462,16 @@ export class SimpleTui {
         (modelSuggestionViewport.hiddenAbove > 0 ? 1 : 0) +
         (modelSuggestionViewport.hiddenBelow > 0 ? 1 : 0)
       : 0;
-    const hintLines = this.inputHint ? 1 : 0;
-    const shortcutHintLines = this.startupShortcutHint ? 1 : 0;
+    const suppressBottomHints = this.commandSuggestionsVisible;
+    const startupHintLines = !suppressBottomHints && this.startupShortcutHint ? 1 : 0;
+    const hintLines = !suppressBottomHints && this.inputHint ? 1 : 0;
     const rawTaskContextLine = this.formatTaskContextLine(width);
     const taskContextLines = rawTaskContextLine ? 2 : 0;
     const thinkingLines = this.thinking ? 1 : 0;
     const thoughtStreamLines = 0;
     const inputState = this.buildInputState(this.currentInput, bottomWidth, cursorIndex);
     const inputLineCount = Math.max(1, inputState.lines.length);
-    const bottomLines = inputLineCount + 2 + commandSuggestionLines + modelSuggestionLines + hintLines + shortcutHintLines; // input + separator + status/hints
+    const bottomLines = inputLineCount + 2 + commandSuggestionLines + modelSuggestionLines + startupHintLines + hintLines; // input + separator + status/hints
     const reservedLines =
       headerLines +
       todoBlockLines +
@@ -2409,13 +2505,45 @@ export class SimpleTui {
         : "";
     const ctxStatus =
       this.contextLimit > 0
-        ? ` | ctx:${formatCompactNumber(this.contextUsed)}/${formatCompactNumber(this.contextLimit)}(${Math.min(999, Math.round((this.contextUsed / this.contextLimit) * 100))}%)`
+        ? `ctx:${formatCompactNumber(this.contextUsed)}/${formatCompactNumber(this.contextLimit)}(${Math.min(999, Math.round((this.contextUsed / this.contextLimit) * 100))}%)`
         : "";
     const todoDone = this.todos.filter((t) => String(t?.status || "").toLowerCase() === "completed").length;
-    const todoStatus = this.todos.length > 0 ? ` | TODO(${todoDone}/${this.todos.length})` : "";
-    const planStatus = this.planModeEnabled ? " | plan:on" : "";
-    const promptStatusRaw = `${this.lastStatus || "idle"}${planStatus}${ctxStatus}${todoStatus}${scrollLabel}`;
-    const bashMode = /^\s*!/.test(this.currentInput) ? " | mode:bash" : "";
+    const todoStatus = this.todos.length > 0 ? `TODO(${todoDone}/${this.todos.length})` : "";
+    const goal = this.goalStatus && typeof this.goalStatus === "object" ? this.goalStatus : {};
+    const goalTurn =
+      goal.active && goal.maxIterations > 0 && goal.iteration > 0
+        ? `${goal.iteration}/${goal.maxIterations}`
+        : goal.active && goal.iteration > 0
+          ? `${goal.iteration}`
+          : "";
+    const goalState = goal.active
+      ? String(goal.status || "active").trim().toLowerCase() || "active"
+      : "";
+    const goalLabel = goal.active && goal.label ? truncateLine(goal.label, 20) : "";
+    const goalStatus = goal.active
+      ? `goal:${goalState}${goalTurn ? `(${goalTurn})` : ""}${goalLabel ? ` ${goalLabel}` : ""}`
+      : "";
+    const planStatus = this.planModeEnabled ? "plan:on" : "";
+    const bashMode = /^\s*!/.test(this.currentInput) ? "mode:bash" : "";
+    const verboseStatus = joinStatusParts([
+      this.lastStatus || "idle",
+      goalStatus,
+      planStatus,
+      ctxStatus,
+      todoStatus,
+      bashMode,
+      scrollLabel ? scrollLabel.replace(/^\s*\|\s*/, "") : "",
+    ]);
+    const compactStatus = joinStatusParts([
+      this.lastStatus || "idle",
+      ctxStatus,
+      goal.active ? `goal:${goalState}${goalTurn ? `(${goalTurn})` : ""}` : "",
+      todoStatus,
+      this.planModeEnabled ? "plan" : "",
+      /^\s*!/.test(this.currentInput) ? "bash" : "",
+      this.scrollOffset > 0 ? scrollLabel.replace(/^\s*\|\s*/, "") : "",
+    ]);
+    const promptStatusRaw = termWidth <= 72 ? compactStatus : verboseStatus;
     const leftStatusLabel = this.formatTransientStatusLabel() || this.formatProjectInstructionsLabel();
     let promptStatus = "";
     if (leftStatusLabel) {
@@ -2522,8 +2650,8 @@ export class SimpleTui {
       ...modelSuggestionBlock,
       sep,
       `\x1b[2m${promptStatus}\x1b[0m`,
-      ...(this.startupShortcutHint ? [`\x1b[2m${truncateLine(` ${this.startupShortcutHint}`, bottomWidth)}\x1b[0m`] : []),
-      ...(this.inputHint ? [`\x1b[2m${truncateLine(` ${this.inputHint}`, bottomWidth)}\x1b[0m`] : []),
+      ...(!suppressBottomHints && this.startupShortcutHint ? [`\x1b[2m${truncateLine(` ${this.startupShortcutHint}`, bottomWidth)}\x1b[0m`] : []),
+      ...(!suppressBottomHints && this.inputHint ? [`\x1b[2m${truncateLine(` ${this.inputHint}`, bottomWidth)}\x1b[0m`] : []),
     ];
 
     const frame = renderFrameLines(frameLines, width, height);
@@ -2545,8 +2673,8 @@ export class SimpleTui {
         statusLine: promptStatus,
         separatorGlyph: this.unicodeSymbols ? "─" : "-",
         hintLine: [
-          this.startupShortcutHint ? truncateLine(` ${this.startupShortcutHint}`, bottomWidth) : "",
-          this.inputHint ? truncateLine(` ${this.inputHint}`, bottomWidth) : "",
+          !suppressBottomHints && this.startupShortcutHint ? truncateLine(` ${this.startupShortcutHint}`, bottomWidth) : "",
+          !suppressBottomHints && this.inputHint ? truncateLine(` ${this.inputHint}`, bottomWidth) : "",
         ].filter(Boolean).join("\n"),
         cursorRowOffset: Math.max(0, inputState.cursorRowOffset),
         cursorCol: inputState.cursorCol,

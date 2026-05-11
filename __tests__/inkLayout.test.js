@@ -172,6 +172,58 @@ describe("InkTuiLayout", () => {
     layout.destroy();
   });
 
+  test("clears stale bottom rows when command suggestions disappear", async () => {
+    const input = createInput();
+    const output = new CaptureOutput({ columns: 48, rows: 14 });
+    const layout = new InkTuiLayout({ input, output, error: output });
+    const tui = new SimpleTui({
+      out: output,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "test:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+      layout,
+    });
+
+    tui.start();
+    tui.setCommandSuggestions(["/help", "/status", "/skills commands"], 1);
+    await waitForCursor(output, (candidate) => candidate.lines.some((line) => line.includes("/skills commands")));
+
+    tui.clearCommandSuggestions();
+    const cursor = await waitForCursor(output, (candidate) => !candidate.lines.some((line) => line.includes("/skills commands")));
+    expect(cursor.lines.join("\n")).not.toContain("/skills commands");
+    expect(cursor.lines.findIndex((line) => line.includes("❯") || line.includes("> "))).toBe(cursor.y);
+    layout.destroy();
+  });
+
+  test("pads shortened command suggestion lines so old text is overwritten", async () => {
+    const input = createInput();
+    const output = new CaptureOutput({ columns: 48, rows: 14 });
+    const layout = new InkTuiLayout({ input, output, error: output });
+    const tui = new SimpleTui({
+      out: output,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "test:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+      layout,
+    });
+
+    tui.start();
+    tui.setCommandSuggestions(["/very-long-command-name"], 0);
+    await waitForCursor(output, (candidate) => candidate.lines.some((line) => line.includes("/very-long-command-name")));
+
+    tui.setCommandSuggestions(["/h"], 0);
+    const cursor = await waitForCursor(output, (candidate) =>
+      candidate.lines.some((line) => line.includes("> /h")) &&
+      !candidate.lines.some((line) => line.includes("/very-long-command-name"))
+    );
+    const plain = cursor.lines.join("\n");
+    expect(plain).toContain("> /h");
+    expect(plain).not.toContain("very-long-command-name");
+    layout.destroy();
+  });
+
   test("renders the startup banner in the first frame and keeps input row stable after typing", async () => {
     const input = createInput();
     const output = new CaptureOutput({ columns: 72, rows: 18 });
@@ -188,7 +240,7 @@ describe("InkTuiLayout", () => {
     tui.event("[banner-title-inline] Pie Code let's cook");
     tui.event("[banner-meta] model: test:model");
     tui.event("[banner-meta] workspace: /tmp/work");
-    tui.setStartupShortcutHint("keys: CTRL+L logs | CTRL+T todos");
+    tui.event("[banner-hint] keys: CTRL+L logs | CTRL+T todos");
     tui.setContextUsage(0, 256000);
     tui.start();
     await new Promise((resolve) => setTimeout(resolve, 0));
@@ -237,7 +289,7 @@ describe("InkTuiLayout", () => {
     });
 
     tui.start();
-    tui.setStartupShortcutHint("keys: CTRL+L logs | CTRL+T todos");
+    tui.event("[banner-hint] keys: CTRL+L logs | CTRL+T todos");
     tui.renderInput("", 0);
     let cursor = await waitForCursor(output);
     let inputLineIndex = findPromptLineIndex(cursor.lines);
@@ -319,6 +371,38 @@ describe("InkTuiLayout", () => {
     const promptLines = frameLines.filter((line) => line.includes("继续描述你想改什么"));
     expect(promptLines).toHaveLength(1);
     expect(layout.frame.cursorRow).toBe(frameLines.findIndex((line) => line.includes("继续描述你想改什么")) + 1);
+    layout.destroy();
+  });
+
+  test("startup banner does not leave a second stale screen centered after input rerenders", async () => {
+    const input = createInput();
+    const output = new CaptureOutput({ columns: 72, rows: 18 });
+    const layout = new InkTuiLayout({ input, output, error: output });
+    const tui = new SimpleTui({
+      out: output,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "test:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+      layout,
+    });
+
+    tui.event("[banner-title-inline] Pie Code let's cook");
+    tui.event("[banner-meta] model: test:model");
+    tui.event("[banner-meta] workspace: /tmp/work");
+    tui.start();
+    tui.renderInput("fix startup ui", 14);
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    const cursor = await waitForCursor(output, (candidate) =>
+      candidate.lines.some((line) => line.includes("fix startup ui"))
+    );
+    const plain = cursor.lines.join("\n");
+    const pieCodeMatches = plain.match(/Pie Code/g) || [];
+    expect(pieCodeMatches).toHaveLength(1);
+
+    const inputLineIndex = cursor.lines.findIndex((line) => line.includes("fix startup ui"));
+    expect(cursor.y).toBe(inputLineIndex);
     layout.destroy();
   });
 });

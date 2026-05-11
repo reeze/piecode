@@ -224,8 +224,6 @@ export class TuiLineEditor {
     if (ctrl && name === "u") {
       this.line = "";
       this.cursor = 0;
-      this.historyIndex = -1;
-      this.historyScratch = "";
       return { submitted: false, value: "" };
     }
 

@@ -66,6 +66,12 @@ import {
   saveResumableSession,
   shortSessionId,
 } from "./lib/resumableSessions.js";
+import {
+  buildGoalContinuationPrompt,
+  buildGoalPrompt,
+  createGoalRun,
+  parseGoalStatus,
+} from "./lib/goalMode.js";
 
 const HISTORY_MAX = 500;
 const execAsync = promisify(execCb);
@@ -628,6 +634,7 @@ Environment:
   PIECODE_CODEX_PREFER_CLI Optional (set 1 to force Codex CLI session fallback)
   PIECODE_ENABLE_PLANNER  Optional (set 1 to enable experimental task planner)
   PIECODE_PLAN_MODE       Optional (set 1 to start in plan-only mode)
+  PIECODE_GOAL_MAX_TURNS  Optional /goal loop limit (default 50, range 1-200)
   PIECODE_PLAN_FIRST      Optional (default off; set 1 to enable lightweight pre-plan)
   PIECODE_TOOL_BUDGET     Optional (default 6, range 1-12)
   PIECODE_THINKING_EFFORT Optional model thinking/reasoning effort (alias: PIECODE_REASONING_EFFORT)
@@ -2236,25 +2243,16 @@ function abbreviateHomePath(targetPath, homeDir = os.homedir()) {
   return raw;
 }
 
-function emitStartupLogo(tui, provider, workspaceDir, terminalWidth = 100) {
-  const width = Math.max(40, Number(terminalWidth) || 100);
-  const center = (text) => {
-    const raw = String(text || "");
-    const clipped = raw.length > width ? raw.slice(0, Math.max(0, width - 3)) + "..." : raw;
-    const left = Math.max(0, Math.floor((width - clipped.length) / 2));
-    return `${" ".repeat(left)}${clipped}`;
-  };
+function emitStartupLogo(tui, provider, workspaceDir) {
   const displayWorkspace = abbreviateHomePath(workspaceDir);
   const shortWorkspace = displayWorkspace.length > 64 ? `...${displayWorkspace.slice(-61)}` : displayWorkspace;
+  const shortModel = formatProviderModel(provider);
+
+  tui.event(`[banner-title-inline]  Pie Code  let's cook`);
+  tui.event(`[banner-meta] model: ${shortModel}`);
+  tui.event(`[banner-meta] workspace: ${shortWorkspace}`);
+
   const shortcutHint = "keys: CTRL+L logs | CTRL+T todos | CTRL+O llm debug | /attach image";
-  const logoLines = [
-    `[banner-title-inline] ${center(" Pie Code  let's cook")}`,
-    `[banner-meta] ${center(`model: ${formatProviderModel(provider)}`)}`,
-    `[banner-meta] ${center(`workspace: ${shortWorkspace}`)}`,
-  ];
-  for (const line of logoLines) {
-    tui.event(line);
-  }
   if (typeof tui.setStartupShortcutHint === "function") {
     tui.setStartupShortcutHint(shortcutHint);
   }
@@ -2633,55 +2631,6 @@ async function maybeAutoEnablePlugins(input, activePluginsRef, pluginIndex, logL
     const details = sections.length > 0 ? ` (${sections.join(" | ")})` : "";
     logLine(`auto-enabled plugins: ${result.enabled.join(", ")}${details}`);
   }
-}
-
-function buildGoalPrompt(goal) {
-  const task = String(goal || "").trim();
-  return [
-    "You are running in PieCode goal mode for the following long-running user goal:",
-    task,
-    "",
-    "Goal-mode requirements:",
-    "1. Treat this as a durable, multi-turn goal loop, not a short single response.",
-    "2. Understand the goal before acting. Restate the goal, identify constraints, and infer explicit acceptance criteria.",
-    "3. If the request is blocked, unsafe, or critically ambiguous, ask exactly one clarifying question and mark the goal blocked; otherwise proceed.",
-    "4. Create and maintain a concise TODO plan for multi-step work.",
-    "5. Inspect the repository/context before editing; do not guess file contents or APIs.",
-    "6. Implement focused changes in coherent slices, then reassess global progress toward the acceptance criteria.",
-    "7. Verify acceptance with the most relevant practical tests/lint/typecheck/build or focused commands.",
-    "8. Keep driving the task until acceptance is satisfied, blocked by the user/environment, or the controller asks you to stop.",
-    "",
-    "At the end of every goal-mode response, include exactly one status line:",
-    "GOAL_STATUS: continue  # more work remains and you can keep driving it",
-    "GOAL_STATUS: complete  # acceptance criteria are satisfied and validation was attempted",
-    "GOAL_STATUS: blocked   # cannot safely continue without user input or external unblocker",
-    "",
-    "If GOAL_STATUS is complete or blocked, include a concise final summary with validation and remaining risks.",
-  ].join("\n");
-}
-
-function buildGoalContinuationPrompt(goal, iteration, previousOutput) {
-  const task = String(goal || "").trim();
-  const last = summarizeForLog(previousOutput, 1200);
-  return [
-    `Goal supervisor loop iteration ${iteration}: continue driving the long-running goal until accepted.`,
-    `Goal: ${task}`,
-    "",
-    "Use the conversation history, current TODO state, and repository state as the source of truth.",
-    "Reassess global progress, pick the next highest-value action, execute it, and verify when appropriate.",
-    "Do not repeat completed work. If acceptance is now satisfied, finish with GOAL_STATUS: complete.",
-    "If you cannot safely continue without user input or an external blocker, finish with GOAL_STATUS: blocked.",
-    "Otherwise finish with GOAL_STATUS: continue.",
-    "",
-    `Previous goal-mode response summary: ${last}`,
-  ].join("\n");
-}
-
-function parseGoalStatus(output) {
-  const text = String(output || "");
-  const matches = [...text.matchAll(/^\s*GOAL_STATUS\s*:\s*(complete|continue|blocked)\b/gim)];
-  if (matches.length === 0) return "continue";
-  return String(matches[matches.length - 1][1] || "continue").toLowerCase();
 }
 
 async function runAgentTurn(agent, input, tui, logLine, display, workspaceDir, options = {}) {
@@ -3265,6 +3214,9 @@ async function handleSlashCommand(input, ctx) {
         });
       }
       if (tui) {
+        if (typeof tui.restoreSessionTimeline === "function") {
+          tui.restoreSessionTimeline(Array.isArray(session.timeline) ? session.timeline : session.messages || []);
+        }
         refreshTuiContextUsage?.();
       }
       logLine(`resumed session ${session.sessionId} (${session.messages?.length || agent.history.length} messages)`);
@@ -3828,7 +3780,11 @@ async function handleSlashCommand(input, ctx) {
     } catch (err) {
       logLine(`attach image failed: ${String(err?.message || err)}`);
       if (process.platform === "linux") {
-        logLine("hint: install xclip and copy an image to the clipboard");
+        logLine("hint: on Linux install wl-paste, xclip, or xsel, then copy an image to the clipboard");
+      } else if (process.platform === "darwin") {
+        logLine("hint: copy an image to the macOS clipboard, then run /attach image");
+      } else if (process.platform === "win32") {
+        logLine("hint: copy an image to the Windows clipboard, then run /attach image");
       }
     }
     return { done: false, handled: true };
@@ -4808,6 +4764,10 @@ async function main() {
     if (!text) return;
     keepIdleStatusRef.value = true;
     tui.render(currentInputRef.value, text);
+  };
+  const updateGoalStatus = (status = null) => {
+    if (!tui || typeof tui.setGoalStatus !== "function") return;
+    tui.setGoalStatus(status);
   };
   let escAbortTimer = null;
   let onKeypress = null;
@@ -5835,7 +5795,7 @@ async function main() {
   if (tui) {
     contextWindowRef.value = resolveProviderContextLimit(providerRef.value);
     tui.setContextUsage(0, contextWindowRef.value);
-    emitStartupLogo(tui, providerRef.value, workspaceDir, stdout.columns || 100);
+    emitStartupLogo(tui, providerRef.value, workspaceDir);
     if (activeSkillsRef.value.length > 0) {
       tui.event(`skills: ${activeSkillsRef.value.map((s) => s.name).join(", ")}`);
     }
@@ -5850,6 +5810,9 @@ async function main() {
     }
     if (planModeRef.value) {
       tui.event("plan mode: on (safe read-only tools allowed, no file changes)");
+    }
+    if (startupResumeSession && typeof tui.restoreSessionTimeline === "function") {
+      tui.restoreSessionTimeline(Array.isArray(startupResumeSession.timeline) ? startupResumeSession.timeline : startupResumeSession.messages || []);
     }
     if (startupResumeSession) {
       tui.event(`resumed session ${startupResumeSession.sessionId} (${startupResumeSession.messages?.length || agent.history.length} messages)`);
@@ -6085,21 +6048,23 @@ async function main() {
     const commandRun = commandRunRef.value;
     commandRunRef.value = null;
     let agentInput = commandRun?.input || finalInput;
-    const goalRun = commandRun?.goal
-      ? {
-          goal: commandRun.goal,
-          iteration: 1,
-          maxIterations: Math.max(1, Number.parseInt(process.env.PIECODE_GOAL_MAX_TURNS || "12", 10) || 12),
-          lastOutput: "",
-          status: "continue",
-        }
-      : null;
+    const goalRun = commandRun?.goal ? createGoalRun(commandRun.goal, { env: process.env }) : null;
     if (commandRun) {
       startTaskTrace(taskTraceRef, { sessionBus, input: finalInput, kind: "agent" });
       const owner = commandRun.skillName || commandRun.pluginName || "";
       const goalSummary = commandRun.goal ? ` ${summarizeForLog(commandRun.goal, 180)}` : "";
       logLine(`[task] ${commandRun.displayName}${goalSummary} ${owner ? `(${owner})` : ""}`.trim());
-      if (goalRun) logLine(`[goal] loop started (max ${goalRun.maxIterations} turns)`);
+      if (goalRun) {
+        logLine(`[goal] loop started (max ${goalRun.maxIterations} turns)`);
+        updateGoalStatus({
+          active: true,
+          label: goalRun.goal,
+          iteration: goalRun.iteration,
+          maxIterations: goalRun.maxIterations,
+          status: goalRun.status,
+        });
+      }
+      if (goalRun && planModeRef.value) logLine("[goal] executing with plan mode off for this goal loop");
       if (tui) tui.setProjectInstructionsVisible(false);
     }
 
@@ -6132,7 +6097,7 @@ async function main() {
           display,
           workspaceDir,
           {
-            planOnly: planModeRef.value,
+            planOnly: goalRun ? goalRun.planOnly : planModeRef.value,
             attachments: goalRun && goalRun.iteration > 1 ? [] : turnAttachments,
           }
         );
@@ -6140,13 +6105,34 @@ async function main() {
 
         goalRun.lastOutput = turnResult.output || "";
         goalRun.status = parseGoalStatus(goalRun.lastOutput);
+        updateGoalStatus({
+          active: true,
+          label: goalRun.goal,
+          iteration: goalRun.iteration,
+          maxIterations: goalRun.maxIterations,
+          status: goalRun.status,
+        });
         logLine(`[goal] status=${goalRun.status} turn=${goalRun.iteration}/${goalRun.maxIterations}`);
         if (goalRun.status === "complete" || goalRun.status === "blocked") break;
         if (goalRun.iteration >= goalRun.maxIterations) {
+          updateGoalStatus({
+            active: true,
+            label: goalRun.goal,
+            iteration: goalRun.iteration,
+            maxIterations: goalRun.maxIterations,
+            status: "maxed",
+          });
           logLine("[goal] max goal turns reached; stopping for user review");
           break;
         }
         goalRun.iteration += 1;
+        updateGoalStatus({
+          active: true,
+          label: goalRun.goal,
+          iteration: goalRun.iteration,
+          maxIterations: goalRun.maxIterations,
+          status: "continue",
+        });
         agentInput = buildGoalContinuationPrompt(goalRun.goal, goalRun.iteration, goalRun.lastOutput);
       }
 
@@ -6157,6 +6143,21 @@ async function main() {
       });
       if (saved) logLine(`[trace] session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
     } finally {
+      if (goalRun) {
+        updateGoalStatus(
+          turnResult?.ok
+            ? {
+                active: true,
+                label: goalRun.goal,
+                iteration: goalRun.iteration,
+                maxIterations: goalRun.maxIterations,
+                status: goalRun.status || "complete",
+              }
+            : null
+        );
+      } else {
+        updateGoalStatus(null);
+      }
       clearPendingRequestTokens();
       if (tui) refreshTuiContextUsage();
       taskRunningRef.value = false;

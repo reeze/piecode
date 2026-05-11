@@ -143,6 +143,26 @@ describe("tui line editor", () => {
     rl.close();
   });
 
+  test("ctrl+u preserves the history scratch draft when leaving history navigation", async () => {
+    const source = new EventEmitter();
+    const rl = new TuiLineEditor({ keypressSource: source, history: ["second", "first"] });
+    const pending = rl.question("");
+
+    rl.write("draft text");
+    emitKey(source, "", { name: "up" });
+    expect(rl.line).toBe("second");
+
+    emitKey(source, "", { ctrl: true, name: "u" });
+    expect(rl.line).toBe("");
+
+    emitKey(source, "", { name: "down" });
+    expect(rl.line).toBe("draft text");
+    expect(rl.cursor).toBe("draft text".length);
+
+    rl.close();
+    await expect(pending).rejects.toThrow("readline was closed");
+  });
+
   test("backspace deletes across multiline boundaries", async () => {
     const source = new EventEmitter();
     const rl = new TuiLineEditor({ keypressSource: source });

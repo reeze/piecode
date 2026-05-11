@@ -82,7 +82,7 @@
             <button id="sessionDiffBtn" class="ghost compact" type="button">Review diff</button>
             <div id="connection" class="pill">offline</div>
             <button id="mobileAbortBtn" class="mobile-stop mobile-only" type="button" hidden>Stop</button>
-            <button id="mobileMoreBtn" class="icon-btn mobile-only" type="button" aria-label="More actions">⋮</button>
+            <button id="mobileMoreBtn" class="icon-btn mobile-only" type="button" aria-label="More actions" aria-expanded="false">⋮</button>
             <button id="mobileNewBtn" class="icon-btn mobile-only" type="button" aria-label="Clear conversation">⊞</button>
           </div>
         </header>
@@ -113,6 +113,22 @@
           <div class="hint">Shift+Enter for newline · type / for commands</div>
         </section>
       </main>
+    </div>
+
+    <div id="mobileActionSheet" class="mobile-action-sheet mobile-only" hidden>
+      <button class="sheet-backdrop" type="button" data-mobile-sheet-close aria-label="Close actions"></button>
+      <section class="sheet-panel" role="dialog" aria-modal="true" aria-label="Mobile actions">
+        <div class="sheet-grip"></div>
+        <div class="sheet-title">Actions</div>
+        <div class="sheet-grid">
+          <button type="button" data-mobile-action="commands">Commands</button>
+          <button type="button" data-mobile-action="diff">Review diff</button>
+          <button type="button" data-mobile-action="sessions">Sessions</button>
+          <button type="button" data-mobile-action="skills">Skills</button>
+          <button type="button" data-mobile-action="detail">Detail mode</button>
+          <button type="button" data-mobile-action="plan">Plan mode</button>
+        </div>
+      </section>
     </div>
 
     <div id="diffOverlay" class="diff-overlay" hidden>

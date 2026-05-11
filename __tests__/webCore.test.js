@@ -7,6 +7,7 @@ import {
   resolveWebBindOptions,
   summarizeToolIntent,
   validateWebOrigin,
+  WebAgentSession,
 } from "../src/web/server.js";
 
 describe("web server security helpers", () => {
@@ -71,6 +72,76 @@ describe("web server security helpers", () => {
     expect(broker.resolve(events[0].payload.id, [1])).toBe(true);
     await expect(promise).resolves.toEqual({ selected: [{ label: "Safe", value: "safe" }] });
     expect(events[1]).toMatchObject({ type: "clarification.resolved", payload: { id: events[0].payload.id, selectedIndexes: [1] } });
+  });
+
+  test("web /goal without a task returns usage", async () => {
+    const session = new WebAgentSession({ workspaceDir: process.cwd(), settings: {}, settingsFile: "" });
+
+    const result = await session.handleSlashCommand("/goal");
+
+    expect(result.handled).toBe(true);
+    expect(result.message).toContain("Usage: `/goal <task>`");
+  });
+
+  test("web /goal runs a multi-turn loop outside plan-only mode", async () => {
+    const session = new WebAgentSession({ workspaceDir: process.cwd(), settings: {}, settingsFile: "" });
+    session.skillIndex = new Map();
+    session.planOnly = true;
+    const calls = [];
+    session.agent = {
+      async runTurn(input, options) {
+        calls.push({ input, options });
+        if (calls.length === 1) return "first pass\nGOAL_STATUS: continue";
+        return "done\nGOAL_STATUS: complete";
+      },
+    };
+
+    const message = await session.sendMessage("/goal make web goals work", { planOnly: true });
+
+    expect(message.content).toContain("GOAL_STATUS: complete");
+    expect(calls).toHaveLength(2);
+    expect(calls[0].input).toContain("make web goals work");
+    expect(calls[0].options.planOnly).toBe(false);
+    expect(calls[1].input).toContain("Goal supervisor loop iteration 2");
+    expect(calls[1].options.planOnly).toBe(false);
+    expect(session.planOnly).toBe(true);
+  });
+
+  test("web normal messages honor session plan mode when request options omit planOnly", async () => {
+    const session = new WebAgentSession({ workspaceDir: process.cwd(), settings: {}, settingsFile: "" });
+    session.skillIndex = new Map();
+    session.planOnly = true;
+    const calls = [];
+    session.agent = {
+      history: [],
+      async runTurn(input, options) {
+        calls.push({ input, options });
+        return "planned response";
+      },
+    };
+
+    await session.sendMessage("inspect the repo for bugs");
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].options.planOnly).toBe(true);
+  });
+
+  test("web /clear resets pending steers so stale guidance does not leak into later tasks", async () => {
+    const session = new WebAgentSession({ workspaceDir: process.cwd(), settings: {}, settingsFile: "" });
+    session.skillIndex = new Map();
+    session.pendingSteers = [{ id: "steer-1", content: "old steer", at: new Date().toISOString() }];
+    session.messages = [{ id: "m1", role: "user", content: "old", at: new Date().toISOString() }];
+    session.timeline = [{ id: "t1", type: "message", content: "old", at: new Date().toISOString() }];
+    session.todos = [{ id: "todo-1", content: "do thing", status: "pending" }];
+    session.agent = { clearHistory() {} };
+
+    const result = await session.handleSlashCommand("/clear");
+
+    expect(result.handled).toBe(true);
+    expect(session.pendingSteers).toEqual([]);
+    expect(session.messages).toEqual([]);
+    expect(session.timeline).toEqual([]);
+    expect(session.todos).toEqual([]);
   });
 });
 

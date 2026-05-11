@@ -39,4 +39,28 @@ describe("web app approval and clarification contract", () => {
     expect(handler).toContain("renderApprovals();");
     expect(handler).toContain('postJson("/api/approvals", { id, decision: button.dataset.decision })');
   });
+
+  test("slash suggestions resync composer send state after programmatic insertion", async () => {
+    const script = await fs.readFile("src/web/public/app.js", "utf8");
+    const start = script.indexOf("function applySuggestion");
+    const end = script.indexOf("function pushEvent", start);
+    const applySuggestion = script.slice(start, end);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    expect(applySuggestion).toContain("el.messageInput.value = text;");
+    expect(applySuggestion).toContain("syncComposerState();");
+  });
+
+  test("paste handler reads image clipboard items before falling back to clipboard files", async () => {
+    const script = await fs.readFile("src/web/public/app.js", "utf8");
+
+    expect(script).toContain("async function clipboardItemsToFiles(clipboardData)");
+    expect(script).toContain('.filter((item) => ALLOWED_IMAGE_TYPES.has(String(item.type || "").toLowerCase()))');
+    expect(script).toContain('.map((item) => item.getAsFile?.())');
+    expect(script).toContain('return [...(clipboardData?.files || [])].filter((file) => ALLOWED_IMAGE_TYPES.has(file.type));');
+    expect(script).toContain('el.messageInput.addEventListener("paste", async (evt) => {');
+    expect(script).toContain('const files = await clipboardItemsToFiles(evt.clipboardData);');
+    expect(script).toContain('evt.preventDefault();');
+  });
 });

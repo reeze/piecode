@@ -229,6 +229,25 @@ describe("tui usability", () => {
     expect(taskIdx).toBeLessThan(toolIdx);
   });
 
+  test("restores saved session messages into the TUI timeline", () => {
+    const tui = new SimpleTui({
+      out: createOut(100, 32),
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.restoreSessionTimeline([
+      { type: "message", role: "user", content: "previous request" },
+      { type: "message", role: "assistant", content: "previous answer" },
+    ]);
+
+    const plain = tui.timeline.map((line) => stripAnsi(line)).join("\n");
+    expect(plain).toContain("Task: previous request");
+    expect(plain).toContain("previous answer");
+  });
+
   test("timeline wraps long entries with readable continuation indentation", () => {
     const out = createOut(42, 18);
     const tui = new SimpleTui({
@@ -487,6 +506,34 @@ describe("tui usability", () => {
     expect(tui.isOverlaySearchActive()).toBe(false);
   });
 
+  test("overlay search keeps the matched line visible after terminal height shrinks", () => {
+    const out = createOut(80, 20);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    const content = [
+      ...Array.from({ length: 24 }, (_v, i) => `line-${i + 1}`),
+      "needle-target",
+      ...Array.from({ length: 20 }, (_v, i) => `tail-${i + 1}`),
+    ].join("\n");
+    tui.openOverlay("LLM Debug 1/1", content, { mode: "llm-debug" });
+    tui.startOverlaySearch();
+    tui.appendOverlaySearch("needle");
+    expect(tui.submitOverlaySearch()).toBe(true);
+
+    out.rows = 10;
+    tui.render();
+
+    const frame = latestFrame(out);
+    expect(frame).toContain("needle-target");
+  });
+
   test("cursor anchors to input row after repeated renders", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
@@ -526,6 +573,50 @@ describe("tui usability", () => {
     }
   });
 
+  test("startup banner renders as scrollable workspace content", () => {
+    const out = createOut(80, 22);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.event("[banner-title-inline] Pie Code  let's cook");
+    tui.event("[banner-meta] model: seed:model");
+    tui.event("[banner-meta] workspace: /tmp/work");
+    tui.start();
+    expect(tui.timeline.map(stripAnsi).join("\n")).toContain("Pie Code");
+    const frame = latestFrame(out);
+    expect(frame).toContain("Pie Code");
+    expect(frame).toContain("workspace: /tmp/work");
+  });
+
+  test("startup banner scrolls away with later startup activity", () => {
+    const out = createOut(80, 16);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.event("[banner-title-inline] Pie Code  let's cook");
+    tui.event("[banner-meta] model: seed:model");
+    tui.event("[banner-meta] workspace: /tmp/work");
+    for (let i = 1; i <= 24; i += 1) {
+      tui.event(`init step ${i}`);
+    }
+    tui.start();
+
+    const frame = latestFrame(out);
+    expect(frame).not.toContain("Pie Code");
+    expect(frame).toContain("init step 24");
+    expect(frame.split("\n")[0]).not.toContain("Pie Code");
+  });
+
   test("startup shortcut hint keeps cursor on typed prompt row", () => {
     const out = createOut(80, 22);
     const tui = new SimpleTui({
@@ -541,6 +632,7 @@ describe("tui usability", () => {
     tui.renderInput("abc", 3);
     const lastWrite = out.writes[out.writes.length - 1] || "";
     const plainLines = latestFrame(out).split("\n");
+    expect(latestFrame(out)).toContain("keys: CTRL+L logs | CTRL+T todos");
     const inputRow = plainLines.findIndex((line) => line.includes(`${tui.symbols.prompt} abc`)) + 1;
     expect(inputRow).toBeGreaterThan(0);
     expect(tui.lastInputRow).toBe(inputRow);
@@ -741,6 +833,31 @@ describe("tui usability", () => {
     }
   });
 
+  test("narrow terminals use a denser status summary while preserving key cues", () => {
+    const out = createOut(68, 18);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.setContextUsage(88, 100);
+    tui.setTodos([{ id: "todo-1", content: "step", status: "completed" }]);
+    tui.setGoalStatus({ active: true, label: "optimize UI design in tui", iteration: 2, maxIterations: 4, status: "continue" });
+    tui.setPlanMode(true);
+    tui.renderInput("!echo hi", 8);
+
+    const frame = latestFrame(out);
+    expect(frame).toContain("ctx:88/100(88%)");
+    expect(frame).toContain("Task completed");
+    expect(frame).not.toContain("goal:continue(2/4) optimize UI design in tui");
+    expect(frame).not.toContain("mode:bash");
+    expect(frame).not.toContain("plan:on");
+  });
+
   test("context usage is capped at 100% in the status bar", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
@@ -786,6 +903,44 @@ describe("tui usability", () => {
     tui.setTodos([]);
     frame = latestFrame(out);
     expect(frame).not.toContain("TODO(");
+  });
+
+  test("status bar shows active goal status and current goal label", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.setGoalStatus({
+      active: true,
+      label: "add goal status indicator",
+      iteration: 2,
+      maxIterations: 5,
+      status: "continue",
+    });
+    let frame = latestFrame(out);
+    expect(frame).toContain("goal:continue(2/5)");
+    expect(frame).toContain("add goal status i");
+
+    tui.setGoalStatus({
+      active: true,
+      label: "add goal status indicator",
+      iteration: 5,
+      maxIterations: 5,
+      status: "complete",
+    });
+    frame = latestFrame(out);
+    expect(frame).toContain("goal:complete(5/5)");
+    expect(frame).toContain("add goal status i");
+
+    tui.setGoalStatus(null);
+    frame = latestFrame(out);
+    expect(frame).not.toContain("goal:");
   });
 
   test("all completed todos show status-bar notice without timeline completion event", () => {
@@ -1197,6 +1352,130 @@ describe("tui usability", () => {
     expect(frame).toContain("commands");
     expect(frame).toContain("> /model");
     expect(frame).toContain("/model list");
+  });
+
+  test("command suggestions hide text below the status bar", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.setStartupShortcutHint("keys: CTRL+L logs | CTRL+T todos");
+    tui.setInputHint("Press CTRL+D again to exit.");
+    tui.setCommandSuggestions(["/model", "/model list"], 0);
+
+    const frame = latestFrame(out);
+    expect(frame).toContain("commands");
+    expect(frame).toContain("> /model");
+    expect(frame).toContain("Ready. Type /help for commands.");
+    expect(frame).not.toContain("keys: CTRL+L logs | CTRL+T todos");
+    expect(frame).not.toContain("Press CTRL+D again to exit.");
+  });
+
+  test("command suggestions are viewport-limited on short terminals to keep the prompt visible", () => {
+    const out = createOut(80, 12);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.renderInput("/", 1);
+    tui.setCommandSuggestions([
+      "/help",
+      "/model",
+      "/model list",
+      "/mcp",
+      "/skills",
+      "/plugins",
+      "/plan",
+      "/goal",
+      "/resume",
+      "/sessions",
+      "/clear",
+      "/exit",
+    ], 0);
+
+    const frame = latestFrame(out);
+    expect(tui.lastInputRow).toBeLessThanOrEqual(out.rows);
+    expect(frame).toContain(`${tui.symbols.prompt} /`);
+    expect(frame).toContain("commands");
+    expect(frame).not.toContain("/exit");
+  });
+
+  test("full-frame repaint never exceeds terminal height when bottom chrome is tall", () => {
+    const out = createOut(80, 12);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.setStartupShortcutHint("keys: CTRL+L logs | CTRL+T todos");
+    tui.setInputHint("Press CTRL+D again to exit.");
+    tui.renderInput("/", 1);
+    tui.setCommandSuggestions([
+      "/help",
+      "/model",
+      "/model list",
+      "/mcp",
+      "/skills",
+      "/plugins",
+      "/plan",
+      "/goal",
+      "/resume",
+      "/sessions",
+      "/clear",
+      "/exit",
+    ], 0);
+
+    const frame = latestFrame(out);
+    expect(frame.split("\n")).toHaveLength(out.rows);
+    expect(frame).toContain(`${tui.symbols.prompt} /`);
+    expect(out.writes[out.writes.length - 1]).toContain(`\x1b[${tui.lastInputRow};5H`);
+  });
+
+  test("command suggestions keep the selected item visible when the chosen index exceeds the first viewport", () => {
+    const out = createOut(80, 12);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.renderInput("/", 1);
+    tui.setCommandSuggestions([
+      "/help",
+      "/model",
+      "/model list",
+      "/mcp",
+      "/skills",
+      "/plugins",
+      "/plan",
+      "/goal",
+      "/resume",
+      "/sessions",
+      "/clear",
+      "/exit",
+    ], 10);
+
+    const frame = latestFrame(out);
+    expect(frame).toContain("> /clear");
+    expect(frame).not.toContain("> /help");
   });
 
   test("wide character input leaves a safety column when wrapping", () => {
