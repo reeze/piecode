@@ -865,7 +865,8 @@ describe("tui usability", () => {
     const frame = latestFrame(out);
     expect(frame).toContain("ctx:88/100(88%)");
     expect(frame).toContain("Task completed");
-    expect(frame).not.toContain("goal:continue(2/4) optimize UI design in tui");
+    expect(frame).toContain("Goal: Running · optimize UI design in tui · 2/4");
+    expect(frame).not.toContain("goal:continue");
     expect(frame).not.toContain("mode:bash");
     expect(frame).not.toContain("plan:on");
   });
@@ -917,7 +918,7 @@ describe("tui usability", () => {
     expect(frame).not.toContain("TODO(");
   });
 
-  test("status bar shows active goal status and current goal label", () => {
+  test("active goal renders before input instead of in the status bar", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
       out,
@@ -936,8 +937,13 @@ describe("tui usability", () => {
       status: "continue",
     });
     let frame = latestFrame(out);
-    expect(frame).toContain("goal:continue(2/5)");
-    expect(frame).toContain("add goal status i");
+    expect(frame).toContain("Goal: Running · add goal status indicator · 2/5");
+    expect(frame).not.toContain("goal:continue");
+
+    tui.onThinking("turn");
+    frame = latestFrame(out);
+    expect(frame.indexOf("thinking")).toBeLessThan(frame.indexOf("Goal: Running · add goal status indicator"));
+    tui.onThinkingDone();
 
     tui.setGoalStatus({
       active: true,
@@ -947,11 +953,12 @@ describe("tui usability", () => {
       status: "complete",
     });
     frame = latestFrame(out);
-    expect(frame).toContain("goal:complete(5/5)");
-    expect(frame).toContain("add goal status i");
+    expect(frame).toContain("Goal: Done · add goal status indicator · 5/5");
+    expect(frame).not.toContain("goal:complete");
 
     tui.setGoalStatus(null);
     frame = latestFrame(out);
+    expect(frame).not.toContain("Goal:");
     expect(frame).not.toContain("goal:");
   });
 
@@ -1170,6 +1177,9 @@ describe("tui usability", () => {
     const frame = latestFrame(out);
     expect(frame).toContain("Task: inspect repo");
     expect(frame).toContain("thinking");
+    const workspaceLines = frame.split("\n").filter((line) => line.includes("thinking") || line.includes("Task: inspect repo"));
+    expect(workspaceLines[0]).toContain("thinking");
+    expect(workspaceLines[1]).toContain("Task: inspect repo");
     expect(frame).not.toContain("↳ | ");
     expect(frame).not.toContain(" | tok ↑0 ↓0");
     tui.onThinkingDone();

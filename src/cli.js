@@ -6090,7 +6090,9 @@ async function main() {
       startTaskTrace(taskTraceRef, { sessionBus, input: finalInput, kind: "agent" });
       const owner = commandRun.skillName || commandRun.pluginName || "";
       const goalSummary = commandRun.goal ? ` ${summarizeForLog(commandRun.goal, 180)}` : "";
-      logLine(`[task] ${commandRun.displayName}${goalSummary} ${owner ? `(${owner})` : ""}`.trim());
+      if (!goalRun) {
+        logLine(`[task] ${commandRun.displayName}${goalSummary} ${owner ? `(${owner})` : ""}`.trim());
+      }
       if (goalRun) {
         logLine(`[goal] loop started (max ${goalRun.maxIterations} turns)`);
         updateGoalStatus({

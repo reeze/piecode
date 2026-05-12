@@ -1200,15 +1200,44 @@ export class SimpleTui {
     return `${(ms / 1000).toFixed(1)}s`;
   }
 
-  formatTaskContextLine(width) {
-    const task = String(this.currentTaskText || "").replace(/\s+/g, " ").trim();
-    if (!task) return "";
+  formatContextBannerLine({ label, status = "", body, suffix = "", width }) {
+    const normalizedBody = String(body || "").replace(/\s+/g, " ").trim();
+    if (!normalizedBody) return "";
     const elapsed = this.formatElapsedSinceTurnStart();
+    const prefix = `${this.symbols.task} ${label}: ${status ? `${status} · ` : ""}`;
+    const trailing = `${suffix || ""} · ${elapsed}`;
+    const fixedBudget = stringDisplayWidth(prefix) + stringDisplayWidth(trailing) + 4;
+    const text = truncateLine(normalizedBody, Math.max(16, width - fixedBudget));
+    return colorFullLine(` ${prefix}${text}${trailing} `, "1;37;48;5;236", width);
+  }
+
+  formatTaskContextLine(width) {
     const status = this.taskCompletedAt ? (this.modelState === "error" ? "Failed" : "Done") : "";
-    const prefix = `${this.symbols.task} Task: ${status ? `${status} · ` : ""}`;
-    const fixedBudget = stringDisplayWidth(prefix) + stringDisplayWidth(elapsed) + 6;
-    const body = truncateLine(task, Math.max(16, width - fixedBudget));
-    return colorFullLine(` ${prefix}${body} · ${elapsed} `, "1;37;48;5;236", width);
+    return this.formatContextBannerLine({
+      label: "Task",
+      status,
+      body: this.currentTaskText,
+      width,
+    });
+  }
+
+  formatGoalContextLine(width) {
+    const goal = this.goalStatus && typeof this.goalStatus === "object" ? this.goalStatus : {};
+    if (!goal.active || !goal.label) return "";
+    const status = String(goal.status || "active").trim().toLowerCase();
+    const displayStatus = status === "complete" ? "Done" : status === "blocked" ? "Blocked" : status === "maxed" ? "Maxed" : "Running";
+    const iteration = goal.maxIterations > 0 && goal.iteration > 0
+      ? ` · ${goal.iteration}/${goal.maxIterations}`
+      : goal.iteration > 0
+        ? ` · ${goal.iteration}`
+        : "";
+    return this.formatContextBannerLine({
+      label: "Goal",
+      status: displayStatus,
+      body: goal.label,
+      suffix: iteration,
+      width,
+    });
   }
 
   visibleTimelineHasCurrentTask(lines = []) {
@@ -2538,8 +2567,9 @@ export class SimpleTui {
     const suppressBottomHints = this.commandSuggestionsVisible;
     const startupHintLines = !suppressBottomHints && this.startupShortcutHint ? 1 : 0;
     const hintLines = !suppressBottomHints && this.inputHint ? 1 : 0;
-    const rawTaskContextLine = this.formatTaskContextLine(width);
-    const taskContextLines = rawTaskContextLine ? 2 : 0;
+    const rawGoalContextLine = this.formatGoalContextLine(width);
+    const rawTaskContextLine = rawGoalContextLine ? "" : this.formatTaskContextLine(width);
+    const contextLines = (rawGoalContextLine || rawTaskContextLine) ? 2 : 0;
     const thinkingLines = this.thinking ? 1 : 0;
     const thoughtStreamLines = 0;
     const inputState = this.buildInputState(this.currentInput, bottomWidth, cursorIndex);
@@ -2550,7 +2580,7 @@ export class SimpleTui {
       todoBlockLines +
       approvalLines +
       clarificationLines +
-      taskContextLines +
+      contextLines +
       thinkingLines +
       thoughtStreamLines +
       bottomLines;
@@ -2566,6 +2596,7 @@ export class SimpleTui {
     const start = Math.max(0, sourceLines.length - maxLogLines - this.scrollOffset);
     const visibleLogs = sourceLines.slice(start, start + maxLogLines);
     const taskContextLine = this.visibleTimelineHasCurrentTask(visibleLogs) ? "" : rawTaskContextLine;
+    const goalContextLine = rawGoalContextLine;
     const visibleStart = sourceLines.length === 0 ? 0 : start + 1;
     const visibleEnd = Math.min(sourceLines.length, start + visibleLogs.length);
     const viewName = this.showRawLogs ? "raw" : "timeline";
@@ -2580,25 +2611,10 @@ export class SimpleTui {
         : "";
     const todoDone = this.todos.filter((t) => String(t?.status || "").toLowerCase() === "completed").length;
     const todoStatus = this.todos.length > 0 ? `TODO(${todoDone}/${this.todos.length})` : "";
-    const goal = this.goalStatus && typeof this.goalStatus === "object" ? this.goalStatus : {};
-    const goalTurn =
-      goal.active && goal.maxIterations > 0 && goal.iteration > 0
-        ? `${goal.iteration}/${goal.maxIterations}`
-        : goal.active && goal.iteration > 0
-          ? `${goal.iteration}`
-          : "";
-    const goalState = goal.active
-      ? String(goal.status || "active").trim().toLowerCase() || "active"
-      : "";
-    const goalLabel = goal.active && goal.label ? truncateLine(goal.label, 20) : "";
-    const goalStatus = goal.active
-      ? `goal:${goalState}${goalTurn ? `(${goalTurn})` : ""}${goalLabel ? ` ${goalLabel}` : ""}`
-      : "";
     const planStatus = this.planModeEnabled ? "plan:on" : "";
     const bashMode = /^\s*!/.test(this.currentInput) ? "mode:bash" : "";
     const verboseStatus = joinStatusParts([
       this.lastStatus || "idle",
-      goalStatus,
       planStatus,
       ctxStatus,
       todoStatus,
@@ -2608,7 +2624,6 @@ export class SimpleTui {
     const compactStatus = joinStatusParts([
       this.lastStatus || "idle",
       ctxStatus,
-      goal.active ? `goal:${goalState}${goalTurn ? `(${goalTurn})` : ""}` : "",
       todoStatus,
       this.planModeEnabled ? "plan" : "",
       /^\s*!/.test(this.currentInput) ? "bash" : "",
@@ -2633,7 +2648,8 @@ export class SimpleTui {
     }
     const approvalBlock = this.approvalPrompt ? [sep, ...approvalContentLines] : [];
     const clarificationBlock = this.clarificationPrompt ? [sep, ...clarificationContentLines] : [];
-    const taskContextBlock = taskContextLine ? ["", taskContextLine] : [];
+    const contextLine = goalContextLine || taskContextLine;
+    const contextBlock = contextLine ? ["", contextLine] : [];
     const thinkingColors = ["82", "118", "154", "190", "201"];
     const thinkingColor = thinkingColors[this.thinkingTick % thinkingColors.length];
     const spinFrames = this.unicodeSymbols ? ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] : ["-", "\\", "|", "/"];
@@ -2665,7 +2681,7 @@ export class SimpleTui {
       todoLinesBlock.length > 0 ||
       approvalBlock.length > 0 ||
       clarificationBlock.length > 0 ||
-      taskContextBlock.length > 0 ||
+      contextBlock.length > 0 ||
       thinkingBlock.length > 0 ||
       thoughtStreamBlock.length > 0;
 
@@ -2704,12 +2720,12 @@ export class SimpleTui {
 
     const beforeInputLines = [
       ...(errorLine ? [`\x1b[31m${errorLine}\x1b[0m`] : []),
+      ...thinkingBlock,
       ...visibleLogs,
       ...todoLinesBlock,
       ...approvalBlock,
       ...clarificationBlock,
-      ...taskContextBlock,
-      ...thinkingBlock,
+      ...contextBlock,
       ...thoughtStreamBlock,
       ...(hasWorkspaceContent ? [""] : []),
       sep,
