@@ -310,7 +310,25 @@ function highlightCodeLine(line, lang = "") {
 }
 
 function stripMarkdownForTableCell(value) {
-  return stripAnsi(renderInlineMarkdown(String(value || "").trim()));
+  return stripAnsi(renderInlineMarkdown(String(value || "").trim().replace(/\\\|/g, "|")));
+}
+
+function truncateDisplayText(text, maxWidth) {
+  const source = String(text || "");
+  const limit = Math.max(1, Number(maxWidth) || 1);
+  if (stringDisplayWidth(source) <= limit) return source;
+  const ellipsis = limit > 1 ? "…" : "";
+  const target = Math.max(0, limit - stringDisplayWidth(ellipsis));
+  let out = "";
+  let used = 0;
+  for (const segment of graphemeSegmenter ? graphemeSegmenter.segment(source) : source) {
+    const textSegment = typeof segment === "string" ? segment : segment.segment;
+    const width = stringDisplayWidth(textSegment);
+    if (used + width > target) break;
+    out += textSegment;
+    used += width;
+  }
+  return `${out}${ellipsis}`;
 }
 
 function splitMarkdownTableRow(line) {
@@ -367,7 +385,7 @@ function padTableCell(text, width, align = "left") {
   return `${value}${" ".repeat(pad)}`;
 }
 
-function renderMarkdownTable(lines, startIndex) {
+function renderMarkdownTable(lines, startIndex, { maxWidth = 100 } = {}) {
   const header = splitMarkdownTableRow(lines[startIndex]);
   const aligns = parseMarkdownTableSeparator(lines[startIndex + 1]);
   if (!header || !aligns) return null;
@@ -385,18 +403,34 @@ function renderMarkdownTable(lines, startIndex) {
   const normalize = (row) => Array.from({ length: columnCount }, (_v, idx) => stripMarkdownForTableCell(row[idx] || ""));
   const normalizedHeader = normalize(header);
   const normalizedRows = rows.map(normalize);
-  const widths = Array.from({ length: columnCount }, (_v, idx) =>
-    Math.min(
-      40,
-      Math.max(
-        stringDisplayWidth(normalizedHeader[idx] || ""),
-        ...normalizedRows.map((row) => stringDisplayWidth(row[idx] || "")),
-        3
+  const allRows = [normalizedHeader, ...normalizedRows];
+  const minCellWidth = 3;
+  const maxCellWidth = 40;
+  const borderWidth = columnCount > 0 ? (columnCount * 3) + 1 : 0;
+  const availableCellsWidth = Math.max(
+    columnCount * minCellWidth,
+    Math.max(20, Number(maxWidth) || 100) - borderWidth
+  );
+  const rawWidths = Array.from({ length: columnCount }, (_v, idx) =>
+    Math.max(
+      minCellWidth,
+      Math.min(
+        maxCellWidth,
+        Math.max(...allRows.map((row) => stringDisplayWidth(row[idx] || "")), minCellWidth)
       )
     )
   );
+  const widths = [...rawWidths];
+  while (widths.reduce((sum, width) => sum + width, 0) > availableCellsWidth) {
+    let widestIndex = 0;
+    for (let idx = 1; idx < widths.length; idx += 1) {
+      if (widths[idx] > widths[widestIndex]) widestIndex = idx;
+    }
+    if (widths[widestIndex] <= minCellWidth) break;
+    widths[widestIndex] -= 1;
+  }
   const renderRow = (row, style = "") => {
-    const cells = row.map((cell, idx) => padTableCell(cell, widths[idx], aligns[idx] || "left"));
+    const cells = row.map((cell, idx) => padTableCell(truncateDisplayText(cell, widths[idx]), widths[idx], aligns[idx] || "left"));
     const text = `│ ${cells.join(" │ ")} │`;
     return style ? color(text, style) : text;
   };
@@ -407,8 +441,9 @@ function renderMarkdownTable(lines, startIndex) {
   };
 }
 
-function parseMarkdownBlocks(text) {
+function parseMarkdownBlocks(text, options = {}) {
   const lines = String(text || "").replace(/\r/g, "").split("\n");
+  const maxTableWidth = Math.max(20, Number(options.maxTableWidth) || 100);
   const blocks = [];
   let paragraph = [];
 
@@ -440,7 +475,7 @@ function parseMarkdownBlocks(text) {
       continue;
     }
 
-    const table = i + 1 < lines.length ? renderMarkdownTable(lines, i) : null;
+    const table = i + 1 < lines.length ? renderMarkdownTable(lines, i, { maxWidth: maxTableWidth }) : null;
     if (table) {
       flushParagraph();
       blocks.push({ type: "table", rendered: table.rendered });
@@ -541,15 +576,17 @@ function normalizeTimelineSpacing(lines) {
     return "content";
   };
 
+  const shouldSeparateGroups = (previous, current) => {
+    if (!previous || previous === "blank" || current === "blank" || previous === current) return false;
+    if (current === "tool-result" && previous === "tool") return false;
+    return true;
+  };
+
   for (const line of Array.isArray(lines) ? lines : []) {
     const group = classify(line);
-    const shouldSeparate =
-      result.length > 0 &&
-      group !== "blank" &&
-      previousGroup &&
-      previousGroup !== "blank" &&
-      previousGroup !== group;
-    if (shouldSeparate && result[result.length - 1] !== "") result.push("");
+    if (result.length > 0 && shouldSeparateGroups(previousGroup, group) && result[result.length - 1] !== "") {
+      result.push("");
+    }
     result.push(line);
     previousGroup = group;
   }
@@ -599,8 +636,8 @@ function renderMarkdownBlock(block) {
   }
 }
 
-function renderMarkdownLines(text) {
-  return parseMarkdownBlocks(text).flatMap((block) => renderMarkdownBlock(block));
+function renderMarkdownLines(text, options = {}) {
+  return parseMarkdownBlocks(text, options).flatMap((block) => renderMarkdownBlock(block));
 }
 
 function highlightOverlaySectionLine(line) {
@@ -965,6 +1002,8 @@ export class SimpleTui {
     this.scrollOffset = 0;
     this.lastScrollMax = 0;
     this.lastScrollSourceLength = 0;
+    this.wrappedTimelineCache = { source: null, length: -1, width: -1, lines: [] };
+    this.wrappedLogsCache = { source: null, length: -1, width: -1, lines: [] };
     this.thoughtStreamText = "";
     this.thoughtStreamVisible = false;
     this.planModeEnabled = false;
@@ -1761,6 +1800,40 @@ export class SimpleTui {
     return normalizeTimelineSpacing(previous ? [previous, ...items] : items).slice(previous ? 1 : 0);
   }
 
+  getWrappedSourceLines(source, width, cache, wrapLine) {
+    const lines = Array.isArray(source) ? source : [];
+    const targetWidth = Math.max(1, Number(width) || 1);
+    if (
+      cache &&
+      cache.source === lines &&
+      cache.length === lines.length &&
+      cache.width === targetWidth &&
+      Array.isArray(cache.lines)
+    ) {
+      return cache.lines;
+    }
+    const wrapped = [];
+    for (const line of lines) {
+      const chunks = wrapLine(line, targetWidth);
+      if (Array.isArray(chunks) && chunks.length > 0) wrapped.push(...chunks);
+    }
+    if (cache) {
+      cache.source = lines;
+      cache.length = lines.length;
+      cache.width = targetWidth;
+      cache.lines = wrapped;
+    }
+    return wrapped;
+  }
+
+  getWrappedTimelineLines(width) {
+    return this.getWrappedSourceLines(this.timeline, width, this.wrappedTimelineCache, wrapTimelineLine);
+  }
+
+  getWrappedLogLines(width) {
+    return this.getWrappedSourceLines(this.logs, width, this.wrappedLogsCache, wrapText);
+  }
+
   setTimelineLines(lines = []) {
     const next = Array.isArray(lines) ? lines.map((line) => String(line || "")) : [];
     this.timeline = next.slice(Math.max(0, next.length - this.maxTimeline));
@@ -2077,14 +2150,13 @@ export class SimpleTui {
     }
     if (line.startsWith("[thinking] ")) {
       // Raw request/response payload traces are noisy; the visible thinking row
-      // is driven by [thought] entries and the transient spinner/status line.
+      // is driven by [progress] entries and the transient spinner/status line.
       return [];
     }
     if (line.startsWith("[thought] ")) {
-      // Thought updates are already surfaced through the transient thinking
-      // status/running line. Do not append them to the persistent timeline,
-      // otherwise streaming/tool thoughts can appear repeatedly in workspace.
-      return [];
+      const body = trimWorkspaceText(line.slice(10).trim(), 800).text;
+      if (!body) return [];
+      return timelineItem(this.symbols.response, color(body, "35"), "1;35");
     }
     if (line.startsWith("[progress] ")) {
       const body = trimWorkspaceText(line.slice(11).trim(), 800).text;
@@ -2137,7 +2209,8 @@ export class SimpleTui {
     if (line.startsWith("[response] ")) {
       const text = trimWorkspaceText(line.slice(11).trim(), 8000).text;
       if (!text) return responseBlock(this.symbols.response, "<empty>");
-      const chunks = renderMarkdownLines(text).filter((chunk) => chunk !== undefined);
+      const markdownWidth = Math.max(20, (this.out?.columns || 100) - 8);
+      const chunks = renderMarkdownLines(text, { maxTableWidth: markdownWidth }).filter((chunk) => chunk !== undefined);
       if (chunks.length === 0) return responseBlock(this.symbols.response, "<empty>");
       return responseBlock(this.symbols.response, chunks, "1;32");
     }
@@ -2481,9 +2554,7 @@ export class SimpleTui {
       thinkingLines +
       thoughtStreamLines +
       bottomLines;
-    const wrappedLogs = this.logs.flatMap((line) => wrapText(line, width));
-    const wrappedTimeline = this.timeline.flatMap((line) => wrapTimelineLine(line, width));
-    const sourceLines = this.showRawLogs ? wrappedLogs : wrappedTimeline;
+    const sourceLines = this.showRawLogs ? this.getWrappedLogLines(width) : this.getWrappedTimelineLines(width);
     // Keep layout in natural flow (not sticky), but adapt visible workspace lines
     // to the actual terminal space left after input/status blocks.
     const viewportLogBudget = Math.max(1, height - reservedLines);

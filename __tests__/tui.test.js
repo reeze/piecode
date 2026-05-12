@@ -19,6 +19,13 @@ function latestFrame(out) {
   return stripAnsi(out.writes[out.writes.length - 1] || "");
 }
 
+function printableWidth(line) {
+  return Array.from(String(line || "")).reduce((sum, ch) => {
+    const cp = ch.codePointAt(0);
+    return sum + (cp >= 0x2e80 && cp <= 0xa4cf ? 2 : 1);
+  }, 0);
+}
+
 function withEnv(name, value, fn) {
   const prev = process.env[name];
   if (value == null) delete process.env[name];
@@ -223,7 +230,7 @@ describe("tui usability", () => {
     const resultIdx = plain.findIndex((line) => line.includes("1 file changed"));
     const responseIdx = plain.findIndex((line) => line.includes("Done"));
     expect(plain[toolIdx - 1]).toBe("");
-    expect(plain[resultIdx - 1]).toBe("");
+    expect(plain[resultIdx - 1]).not.toBe("");
     expect(plain[responseIdx - 1]).toBe("");
     expect(plain[resultIdx]).toMatch(/^\S/);
     expect(taskIdx).toBeLessThan(toolIdx);
@@ -351,7 +358,7 @@ describe("tui usability", () => {
     expect(latestFrame(out)).not.toContain("keys: CTRL+L logs | CTRL+T todos");
     expect(tui.formatTimelineLines("[thinking] internal details")).toEqual([]);
     expect(tui.formatTimelineLines("[thinking] request:turn payload-here")).toEqual([]);
-    expect(tui.formatTimelineLines("[thought] I should inspect files first")).toEqual([]);
+    expect(stripAnsi(tui.formatTimelineLines("[thought] I should inspect files first")[0])).toContain("I should inspect files first");
     expect(stripAnsi(tui.formatTimelineLines("[agent] start subagent-1: inspect providers")[0])).toContain("Agent start subagent-1");
     const markdownResponse = stripAnsi(
       tui.formatTimelineLines("[response] ## Title\n- **bold** and `code`")[1]
@@ -421,6 +428,15 @@ describe("tui usability", () => {
     expect(richMarkdown).not.toContain("• •");
     expect(richMarkdown).toContain("│ Name");
     expect(richMarkdown).toContain("alpha");
+    const narrowTableLines = tui.formatTimelineLines([
+      "[response] | Very long column heading | Count | Description |",
+      "| --- | ---: | --- |",
+      "| alpha beta gamma delta epsilon zeta | 12 | A long sentence that should not overflow the timeline width |",
+    ].join("\n")).map((line) => stripAnsi(line));
+    expect(narrowTableLines.join("\n")).toContain("…");
+    for (const line of narrowTableLines.filter((line) => line.includes("│"))) {
+      expect(printableWidth(line)).toBeLessThanOrEqual(out.columns - 2);
+    }
     expect(richMarkdown).toContain("│ quoted note");
     expect(richMarkdown).toContain("││ nested quote");
     expect(richMarkdown).toContain("indented code");
@@ -825,11 +841,7 @@ describe("tui usability", () => {
     const frame = stripAnsi(out.writes[out.writes.length - 1] || "");
     const width = out.columns - 1;
     for (const line of frame.split("\n")) {
-      const printableWidth = Array.from(line).reduce((sum, ch) => {
-        const cp = ch.codePointAt(0);
-        return sum + (cp >= 0x2e80 && cp <= 0xa4cf ? 2 : 1);
-      }, 0);
-      expect(printableWidth).toBeLessThanOrEqual(width);
+      expect(printableWidth(line)).toBeLessThanOrEqual(width);
     }
   });
 
@@ -1262,7 +1274,7 @@ describe("tui usability", () => {
     expect(lastWrite).toContain(`\x1b[${tui.lastInputRow};10H`);
   });
 
-  test("live thought content is rendered only in transient status, not workspace timeline", () => {
+  test("live thought content is transient while progress entries persist in timeline", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
       out,
@@ -1280,13 +1292,14 @@ describe("tui usability", () => {
     expect(frame).toContain("inspect files first");
     expect(tui.timeline.map(stripAnsi).join("\n")).not.toContain("inspect files first");
     expect(tui.thoughtStreamVisible).toBe(false);
-    tui.event("[thought] inspect files first");
+    tui.event("[progress] inspect files first");
     frame = latestFrame(out);
-    expect(tui.timeline.map(stripAnsi).join("\n")).not.toContain("inspect files first");
-    expect((frame.match(/inspect files first/g) || []).length).toBe(1);
+    expect(tui.timeline.map(stripAnsi).join("\n")).toContain("inspect files first");
+    expect(frame).toContain("inspect files first");
     tui.clearLiveThought();
     frame = latestFrame(out);
     expect(tui.thoughtStreamVisible).toBe(false);
+    expect(tui.timeline.map(stripAnsi).join("\n")).toContain("inspect files first");
     tui.stop();
   });
 
@@ -1613,5 +1626,36 @@ describe("tui usability", () => {
     expect(tui.scrollOffset).toBe(0);
     const bottom = latestFrame(out);
     expect(bottom).toContain("line-30");
+  });
+
+  test("scroll renders reuse wrapped timeline cache until content or width changes", () => {
+    const out = createOut(80, 16);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed/model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    for (let i = 1; i <= 80; i += 1) {
+      tui.event(`line-${i} ${"wrapped ".repeat(20)}`);
+    }
+    tui.render("");
+    const initialCache = tui.wrappedTimelineCache.lines;
+    expect(initialCache.length).toBeGreaterThan(tui.timeline.length);
+
+    tui.scrollLines(1);
+    expect(tui.wrappedTimelineCache.lines).toBe(initialCache);
+
+    out.columns = 72;
+    tui.scrollLines(1);
+    const resizedCache = tui.wrappedTimelineCache.lines;
+    expect(resizedCache).not.toBe(initialCache);
+
+    tui.event("new-line after cache");
+    tui.render("");
+    expect(tui.wrappedTimelineCache.lines).not.toBe(resizedCache);
   });
 });

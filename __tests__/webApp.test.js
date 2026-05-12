@@ -52,6 +52,18 @@ describe("web app approval and clarification contract", () => {
     expect(applySuggestion).toContain("syncComposerState();");
   });
 
+  test("frontend exposes plugin commands in fallback suggestions and status metadata", async () => {
+    const script = await fs.readFile("src/web/public/app.js", "utf8");
+    const html = await fs.readFile("src/web/public/index.html", "utf8");
+
+    expect(html).toContain('id="pluginsLabel"');
+    expect(script).toContain('pluginsLabel: document.getElementById("pluginsLabel")');
+    expect(script).toContain('snapshot.plugins.map((plugin) => plugin.name).join(", ")');
+    expect(script).toContain('{ name: "/plugins", description: "Show active plugins" }');
+    expect(script).toContain('"/plugins use"');
+    expect(script).toContain('command.pluginName || command.skillName');
+  });
+
   test("paste handler reads image clipboard items before falling back to clipboard files", async () => {
     const script = await fs.readFile("src/web/public/app.js", "utf8");
 

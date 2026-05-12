@@ -33,6 +33,7 @@ const el = {
   modelInlineLabel: document.getElementById("modelInlineLabel"),
   workspaceLabel: document.getElementById("workspaceLabel"),
   mcpLabel: document.getElementById("mcpLabel"),
+  pluginsLabel: document.getElementById("pluginsLabel"),
   connection: document.getElementById("connection"),
   messages: document.getElementById("messages"),
   composer: document.getElementById("composer"),
@@ -136,6 +137,7 @@ function renderStatus(snapshot = {}) {
   if (el.modelInlineLabel) el.modelInlineLabel.textContent = `Model: ${modelText}`;
   if (el.workspaceLabel) el.workspaceLabel.textContent = shortPath(snapshot.workspaceDir);
   if (el.mcpLabel) el.mcpLabel.textContent = Array.isArray(snapshot.mcpServers) && snapshot.mcpServers.length ? snapshot.mcpServers.join(", ") : "none";
+  if (el.pluginsLabel) el.pluginsLabel.textContent = Array.isArray(snapshot.plugins) && snapshot.plugins.length ? snapshot.plugins.map((plugin) => plugin.name).join(", ") : "none";
   if (el.autoApprove) el.autoApprove.checked = Boolean(snapshot.autoApprove);
   if (el.planOnly) el.planOnly.checked = Boolean(snapshot.planOnly);
   if (el.detailMode) el.detailMode.checked = Boolean(snapshot.detailMode);
@@ -450,7 +452,7 @@ function renderTodos() {
 function commandInsertText(command) {
   const name = String(command?.name || command || "").trim();
   if (!name) return "";
-  if (["/skills use", "/skills off", "/use", "/plan", "/approve", "/detail", "/btw"].includes(name)) return `${name} `;
+  if (["/skills use", "/skills off", "/use", "/plugins use", "/plugins off", "/plugin use", "/plugin off", "/plugins install", "/plugins update", "/plugin install", "/plugin update", "/plan", "/approve", "/detail", "/btw"].includes(name)) return `${name} `;
   return name;
 }
 
@@ -473,6 +475,7 @@ function renderSlashSuggestions() {
     { name: "/help", description: "Show web slash commands" },
     { name: "/plan", description: "Show or change plan mode" },
     { name: "/skills", description: "Show active skills" },
+    { name: "/plugins", description: "Show active plugins" },
   ];
   const hits = commands
     .filter((command) => String(command.name || "").toLowerCase().startsWith(query))
@@ -486,7 +489,7 @@ function renderSlashSuggestions() {
   el.slashSuggestions.hidden = false;
   el.slashSuggestions.innerHTML = hits.map((command, index) => `<button type="button" class="suggestion ${index === state.selectedSuggestion ? "active" : ""}" data-command="${escapeHtml(commandInsertText(command))}">
     <span>${escapeHtml(command.name)}</span>
-    <small>${escapeHtml(command.description || command.skillName || "")}</small>
+    <small>${escapeHtml(command.description || command.pluginName || command.skillName || "")}</small>
   </button>`).join("");
 }
 
@@ -657,6 +660,10 @@ function runMobileAction(action) {
   }
   if (action === "skills") {
     applySuggestion("/skills");
+    return;
+  }
+  if (action === "plugins") {
+    applySuggestion("/plugins");
     return;
   }
   if (action === "detail") {

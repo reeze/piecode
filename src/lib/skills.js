@@ -265,42 +265,75 @@ export function extractTriggers(frontmatter, body) {
     });
 }
 
+function getSkillDiscoveryConcurrency() {
+  const configured = Number.parseInt(process.env.PIECODE_SKILL_DISCOVERY_CONCURRENCY || "32", 10);
+  return Math.max(1, Math.min(64, Number.isFinite(configured) ? configured : 32));
+}
+
+async function mapLimit(items, limit, mapper) {
+  const list = Array.isArray(items) ? items : [];
+  const concurrency = Math.max(1, Math.min(Number(limit) || 1, list.length || 1));
+  const results = new Array(list.length);
+  let nextIndex = 0;
+  const workers = Array.from({ length: concurrency }, async () => {
+    while (nextIndex < list.length) {
+      const index = nextIndex;
+      nextIndex += 1;
+      results[index] = await mapper(list[index], index);
+    }
+  });
+  await Promise.all(workers);
+  return results;
+}
+
 export async function discoverSkills(skillRoots) {
   const index = new Map();
-  for (const root of skillRoots) {
-    const files = await walkForSkillFiles(root);
+  const roots = Array.isArray(skillRoots) ? skillRoots : [];
+  const filesByRoot = await Promise.all(roots.map((root) => walkForSkillFiles(root)));
+  const candidates = [];
+  const seen = new Set();
+
+  for (const files of filesByRoot) {
     for (const skillFile of files) {
       const name = skillNameFromPath(skillFile);
-      if (!name || index.has(name)) continue;
-
-      let description = "";
-      let content = "";
-      let frontmatter = {};
-      let triggers = [];
-      
-      try {
-        content = await fs.readFile(skillFile, "utf8");
-        const parsed = parseFrontmatter(content);
-        frontmatter = parsed.frontmatter;
-        
-        // Use description from frontmatter or extract from body
-        description = frontmatter.description || extractDescription(parsed.body);
-        
-        // Extract triggers
-        triggers = extractTriggers(frontmatter, parsed.body);
-      } catch {
-        description = "";
-      }
-
-      index.set(name, {
-        name,
-        path: skillFile,
-        description,
-        content,
-        frontmatter,
-        triggers,
-      });
+      if (!name || seen.has(name)) continue;
+      seen.add(name);
+      candidates.push({ name, skillFile });
     }
+  }
+
+  const metas = await mapLimit(candidates, getSkillDiscoveryConcurrency(), async ({ name, skillFile }) => {
+    let description = "";
+    let content = "";
+    let frontmatter = {};
+    let triggers = [];
+
+    try {
+      content = await fs.readFile(skillFile, "utf8");
+      const parsed = parseFrontmatter(content);
+      frontmatter = parsed.frontmatter;
+
+      // Use description from frontmatter or extract from body
+      description = frontmatter.description || extractDescription(parsed.body);
+
+      // Extract triggers
+      triggers = extractTriggers(frontmatter, parsed.body);
+    } catch {
+      description = "";
+    }
+
+    return {
+      name,
+      path: skillFile,
+      description,
+      content,
+      frontmatter,
+      triggers,
+    };
+  });
+
+  for (const meta of metas) {
+    if (meta?.name && !index.has(meta.name)) index.set(meta.name, meta);
   }
   return index;
 }

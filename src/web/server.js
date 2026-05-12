@@ -18,6 +18,19 @@ import {
   resolveSkillCommand,
   resolveSkillRoots,
 } from "../lib/skills.js";
+import {
+  addPluginByName,
+  autoEnablePlugins,
+  discoverPluginCommands,
+  discoverPlugins,
+  getDefaultPluginNames,
+  loadActivePlugins,
+  removePluginByName,
+  resolvePluginCommand,
+  resolvePluginRoots,
+  resolveRequestedPlugins,
+} from "../lib/plugins.js";
+import { installPlugin, updatePlugin } from "../lib/pluginInstaller.js";
 import { McpHub, mergeCommonMcpServers } from "../lib/mcp.js";
 import { buildFileMentionContext } from "../lib/fileMentionContext.js";
 import {
@@ -62,6 +75,15 @@ const WEB_SLASH_COMMANDS = [
   { name: "/skills off", description: "Disable a skill" },
   { name: "/skills clear", description: "Disable all skills" },
   { name: "/use", description: "Alias for /skills use" },
+  { name: "/plugins", description: "Show active plugins" },
+  { name: "/plugins list", description: "List discovered plugins" },
+  { name: "/plugins commands", description: "List slash commands exposed by plugins" },
+  { name: "/plugins install", description: "Install plugin from local directory or git URL" },
+  { name: "/plugins update", description: "Update git-backed plugin(s)" },
+  { name: "/plugins use", description: "Enable a plugin" },
+  { name: "/plugins off", description: "Disable a plugin" },
+  { name: "/plugins clear", description: "Disable all plugins" },
+  { name: "/plugin", description: "Alias for /plugins" },
   { name: "/mcp", description: "Show MCP server status" },
   { name: "/abort", description: "Abort current task" },
 ];
@@ -135,6 +157,83 @@ function normalizeBoolean(value) {
   if (["on", "true", "yes", "1", "enable", "enabled"].includes(text)) return true;
   if (["off", "false", "no", "0", "disable", "disabled"].includes(text)) return false;
   return null;
+}
+
+function splitCommandArgs(input) {
+  const src = String(input || "").trim();
+  if (!src) return { args: [], error: "" };
+  const args = [];
+  let current = "";
+  let quote = "";
+  let escaped = false;
+  const pushCurrent = () => {
+    if (current.length === 0) return;
+    args.push(current);
+    current = "";
+  };
+  for (let i = 0; i < src.length; i += 1) {
+    const ch = src[i];
+    if (quote) {
+      if (escaped) {
+        current += ch;
+        escaped = false;
+        continue;
+      }
+      if (ch === "\\") {
+        escaped = true;
+        continue;
+      }
+      if (ch === quote) {
+        quote = "";
+        continue;
+      }
+      current += ch;
+      continue;
+    }
+    if (ch === "\"" || ch === "'") {
+      quote = ch;
+      continue;
+    }
+    if (ch === "\\") {
+      const next = src[i + 1];
+      if (next) {
+        current += next;
+        i += 1;
+      } else {
+        current += "\\";
+      }
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      pushCurrent();
+      continue;
+    }
+    current += ch;
+  }
+  if (quote) return { args, error: "unclosed quote in command" };
+  pushCurrent();
+  return { args, error: "" };
+}
+
+function parsePluginInstallArgs(input) {
+  const parsed = splitCommandArgs(input);
+  if (parsed.error) return { error: parsed.error };
+  const out = { source: "", name: "", project: false, error: "" };
+  for (let i = 0; i < parsed.args.length; i += 1) {
+    const item = parsed.args[i];
+    if (item === "--project") {
+      out.project = true;
+      continue;
+    }
+    if (item === "--name") {
+      out.name = parsed.args[i + 1] || "";
+      i += 1;
+      continue;
+    }
+    if (!out.source) out.source = item;
+  }
+  if (!out.source) out.error = "missing plugin source";
+  return out;
 }
 
 function toPositiveInteger(value) {
@@ -487,10 +586,12 @@ export class ClarificationBroker {
 }
 
 export class WebAgentSession {
-  constructor({ workspaceDir, settings, settingsFile }) {
+  constructor({ workspaceDir, settings, settingsFile, providerFactory = getProvider }) {
     this.workspaceDir = workspaceDir;
     this.settings = settings;
     this.settingsFile = settingsFile;
+    this.providerFactory = typeof providerFactory === "function" ? providerFactory : getProvider;
+    this.providerOptions = resolveProviderOptions(this.settings);
     this.sessionId = makeSessionId();
     this.createdAt = new Date().toISOString();
     this.recentSessions = [];
@@ -516,6 +617,8 @@ export class WebAgentSession {
     this.contextWindowRef = { value: 0 };
     this.shellPermissionRef = { value: { allowAllSession: false, rememberedCommands: new Set() } };
     this.activeSkillsRef = { value: [] };
+    this.activePluginsRef = { value: [] };
+    this.pluginIndex = new Map();
     this.projectInstructionsRef = { value: null };
     this.mcpHub = null;
     this.approvals = new ApprovalBroker({ publish: (type, payload) => this.publish(type, payload) });
@@ -524,17 +627,25 @@ export class WebAgentSession {
 
   async init() {
     this.recentSessions = await listResumableSessions(this.workspaceDir, 3);
-    const skillRoots = resolveSkillRoots(this.settings);
+    const skillRoots = resolveSkillRoots(this.settings, this.workspaceDir);
     this.skillIndex = await discoverSkills(skillRoots);
+    const pluginRoots = resolvePluginRoots(this.settings, this.workspaceDir);
+    this.pluginIndex = await discoverPlugins(pluginRoots);
     const requestedSkills = resolveRequestedSkills([], this.settings);
     const loaded = await loadActiveSkills(this.skillIndex, requestedSkills);
     this.activeSkillsRef.value = loaded.active;
+    const requestedPlugins = [
+      ...resolveRequestedPlugins([], this.settings),
+      ...getDefaultPluginNames(this.pluginIndex, this.settings),
+    ];
+    const loadedPlugins = await loadActivePlugins(this.pluginIndex, requestedPlugins);
+    this.activePluginsRef.value = loadedPlugins.active;
     this.projectInstructionsRef.value = await loadProjectInstructions(this.workspaceDir);
     await autoLoadSkillsFromInstructions(this.projectInstructionsRef.value, this.activeSkillsRef, this.skillIndex);
 
-    const providerOptions = resolveProviderOptions(this.settings);
-    this.provider = getProvider(providerOptions);
-    this.contextWindowRef.value = resolveConfiguredContextWindow(this.settings, providerOptions);
+    this.providerOptions = resolveProviderOptions(this.settings);
+    this.provider = this.providerFactory(this.providerOptions);
+    this.contextWindowRef.value = resolveConfiguredContextWindow(this.settings, this.providerOptions);
     const mergedMcpSettings = await mergeCommonMcpServers(this.settings, {
       workspaceDir: this.workspaceDir,
       onLog: (line) => this.publish("log", { line }),
@@ -554,6 +665,7 @@ export class WebAgentSession {
       askApproval: (kind, details) => this.askApproval(kind, details),
       askClarification: (prompt) => this.askClarification(prompt),
       activeSkillsRef: this.activeSkillsRef,
+      activePluginsRef: this.activePluginsRef,
       projectInstructionsRef: this.projectInstructionsRef,
       mcpHub: this.mcpHub,
       getSteers: () => this.consumeSteers(),
@@ -640,8 +752,15 @@ export class WebAgentSession {
         skillName: command.skillName,
       }))
       .sort((a, b) => a.name.localeCompare(b.name));
+    const pluginCommands = [...discoverPluginCommands(this.pluginIndex).values()]
+      .map((command) => ({
+        name: command.slash,
+        description: command.description || `Use ${command.pluginName} plugin`,
+        pluginName: command.pluginName,
+      }))
+      .sort((a, b) => a.name.localeCompare(b.name));
     const seen = new Set();
-    return [...WEB_SLASH_COMMANDS, ...skillCommands].filter((command) => {
+    return [...WEB_SLASH_COMMANDS, ...pluginCommands, ...skillCommands].filter((command) => {
       if (!command.name || seen.has(command.name)) return false;
       seen.add(command.name);
       return true;
@@ -689,6 +808,21 @@ export class WebAgentSession {
     const items = this.pendingSteers;
     this.pendingSteers = [];
     return items;
+  }
+
+  refreshProvider() {
+    const nextOptions = resolveProviderOptions(this.settings);
+    const nextProvider = this.providerFactory(nextOptions);
+    this.providerOptions = nextOptions;
+    this.provider = nextProvider;
+    if (this.agent) this.agent.provider = nextProvider;
+    this.contextWindowRef.value = resolveConfiguredContextWindow(this.settings, nextOptions);
+    this.publish("provider.update", {
+      provider: nextProvider?.kind || "",
+      model: nextProvider?.model || "",
+      providerLabel: formatProviderModel(nextProvider),
+    });
+    return nextProvider;
   }
 
   async processQueue() {
@@ -760,6 +894,10 @@ export class WebAgentSession {
       availableSkills: [...this.skillIndex.values()]
         .map((skill) => ({ name: skill.name, description: skill.description || "" }))
         .sort((a, b) => a.name.localeCompare(b.name)),
+      plugins: this.activePluginsRef.value.map((plugin) => ({ name: plugin.name, description: plugin.description || "", version: plugin.version || "" })),
+      availablePlugins: [...this.pluginIndex.values()]
+        .map((plugin) => ({ name: plugin.name, description: plugin.description || "", version: plugin.version || "" }))
+        .sort((a, b) => a.name.localeCompare(b.name)),
       slashCommands: this.getSlashCommands(),
       mcpServers: this.mcpHub?.hasServers?.() ? this.mcpHub.getServerNames() : [],
       todos: this.todos,
@@ -800,6 +938,39 @@ export class WebAgentSession {
     this.recentSessions = await listResumableSessions(this.workspaceDir, 3);
     this.publish("snapshot", this.snapshot());
     return loaded;
+  }
+
+  async refreshPluginIndex() {
+    const pluginRoots = resolvePluginRoots(this.settings, this.workspaceDir);
+    this.pluginIndex = await discoverPlugins(pluginRoots);
+    return this.pluginIndex;
+  }
+
+  formatPluginList() {
+    const plugins = [...this.pluginIndex.values()].sort((a, b) => a.name.localeCompare(b.name));
+    if (plugins.length === 0) return "No plugins discovered.";
+    const commandIndex = discoverPluginCommands(this.pluginIndex);
+    return makeAssistantContent([
+      "## Plugins",
+      ...plugins.map((plugin) => {
+        const commands = [...commandIndex.values()]
+          .filter((command) => command.pluginName === plugin.name)
+          .map((command) => command.slash)
+          .sort((a, b) => a.localeCompare(b));
+        const commandText = commands.length > 0 ? ` (commands: ${commands.join(", ")})` : "";
+        const versionText = plugin.version ? ` v${plugin.version}` : "";
+        return `- **${plugin.name}**${versionText}${plugin.description ? `: ${plugin.description}` : ""}${commandText}`;
+      }),
+    ]);
+  }
+
+  formatPluginCommandList() {
+    const commands = [...discoverPluginCommands(this.pluginIndex).values()].sort((a, b) => a.name.localeCompare(b.name));
+    if (commands.length === 0) return "No plugin commands discovered.";
+    return makeAssistantContent([
+      "## Plugin Commands",
+      ...commands.map((command) => `- \`${command.slash}\` → ${command.pluginName}${command.description ? `: ${command.description}` : ""}`),
+    ]);
   }
 
   startBtwTask(input) {
@@ -1162,6 +1333,73 @@ export class WebAgentSession {
       this.publish("snapshot", this.snapshot());
       return { handled: true, message: "All skills disabled." };
     }
+    if (lower === "/plugins" || lower === "/plugin") {
+      const names = this.activePluginsRef.value.map((plugin) => plugin.name);
+      return { handled: true, message: names.length ? `Active plugins: ${names.join(", ")}` : "Active plugins: none." };
+    }
+    if (lower === "/plugins list" || lower === "/plugin list") {
+      return { handled: true, message: this.formatPluginList() };
+    }
+    if (lower === "/plugins commands" || lower === "/plugin commands") {
+      return { handled: true, message: this.formatPluginCommandList() };
+    }
+    if (lower === "/plugins clear" || lower === "/plugin clear") {
+      this.activePluginsRef.value = [];
+      this.publish("snapshot", this.snapshot());
+      return { handled: true, message: "All plugins disabled." };
+    }
+    if (lower.startsWith("/plugins install ") || lower.startsWith("/plugin install ")) {
+      const payload = raw.replace(/^\/plugins?\s+install\s+/i, "").trim();
+      const parsed = parsePluginInstallArgs(payload);
+      if (parsed.error) return { handled: true, message: `Usage: \`/plugins install <source> [--name <name>] [--project]\` (${parsed.error}).` };
+      try {
+        const result = await installPlugin({
+          source: parsed.source,
+          name: parsed.name,
+          project: parsed.project,
+          workspaceDir: this.workspaceDir,
+        });
+        await this.refreshPluginIndex();
+        this.publish("snapshot", this.snapshot());
+        return { handled: true, message: `Installed plugin: ${result.name}. Enable with \`/plugins use ${result.name}\`.` };
+      } catch (err) {
+        return { handled: true, message: `Plugin install failed: ${String(err?.message || err)}` };
+      }
+    }
+    if (lower.startsWith("/plugins update") || lower.startsWith("/plugin update")) {
+      const target = raw.replace(/^\/plugins?\s+update\s*/i, "").trim() || "all";
+      const targets = target.toLowerCase() === "all" ? [...this.pluginIndex.values()] : [this.pluginIndex.get(target)].filter(Boolean);
+      if (targets.length === 0) return { handled: true, message: `Plugin not found: ${target}` };
+      const lines = [];
+      for (const plugin of targets) {
+        try {
+          const result = await updatePlugin({ plugin });
+          lines.push(result.ok ? `Updated plugin: ${plugin.name}` : `Plugin update skipped: ${plugin.name} (${result.reason})`);
+        } catch (err) {
+          lines.push(`Plugin update failed: ${plugin.name}: ${String(err?.message || err)}`);
+        }
+      }
+      await this.refreshPluginIndex();
+      this.publish("snapshot", this.snapshot());
+      return { handled: true, message: makeAssistantContent(lines) };
+    }
+    if (lower.startsWith("/plugins use ") || lower.startsWith("/plugin use ")) {
+      const name = raw.replace(/^\/plugins?\s+use\s+/i, "").trim();
+      const result = await addPluginByName(this.activePluginsRef.value, this.pluginIndex, name);
+      this.activePluginsRef.value = result.active;
+      if (result.added) {
+        this.publish("snapshot", this.snapshot());
+        return { handled: true, message: `Enabled plugin: ${name}` };
+      }
+      return { handled: true, message: result.reason === "already-enabled" ? `Plugin already enabled: ${name}` : `Unable to enable plugin: ${name} (${result.reason})` };
+    }
+    if (lower.startsWith("/plugins off ") || lower.startsWith("/plugin off ")) {
+      const name = raw.replace(/^\/plugins?\s+off\s+/i, "").trim();
+      const result = removePluginByName(this.activePluginsRef.value, name);
+      this.activePluginsRef.value = result.active;
+      this.publish("snapshot", this.snapshot());
+      return { handled: true, message: result.removed ? `Disabled plugin: ${name}` : `Plugin not active: ${name}` };
+    }
     if (lower.startsWith("/skills use ") || lower.startsWith("/use ")) {
       const name = lower.startsWith("/use ") ? argAfter("/use ") : argAfter("/skills use ");
       const result = await addSkillByName(this.activeSkillsRef.value, this.skillIndex, name);
@@ -1178,6 +1416,23 @@ export class WebAgentSession {
       this.activeSkillsRef.value = result.active;
       this.publish("snapshot", this.snapshot());
       return { handled: true, message: result.removed ? `Disabled skill: ${name}` : `Skill not active: ${name}` };
+    }
+
+    const pluginCommand = resolvePluginCommand(raw, this.pluginIndex);
+    if (pluginCommand) {
+      const result = await addPluginByName(this.activePluginsRef.value, this.pluginIndex, pluginCommand.pluginName);
+      if (result.added) {
+        this.activePluginsRef.value = result.active;
+        this.publish("snapshot", this.snapshot());
+      }
+      if (result.reason === "not-found" || result.reason === "unreadable") {
+        if (!pluginCommand.plugin) {
+          return { handled: true, message: `Plugin command unavailable: ${pluginCommand.slash} (${result.reason})` };
+        }
+        this.activePluginsRef.value = [...this.activePluginsRef.value, pluginCommand.plugin];
+        this.publish("snapshot", this.snapshot());
+      }
+      return { handled: false, input: pluginCommand.prompt, displayInput: raw };
     }
 
     const skillCommand = resolveSkillCommand(raw, this.skillIndex);
@@ -1210,7 +1465,9 @@ export class WebAgentSession {
       content = slash.input || text;
     }
 
+    this.refreshProvider();
     await autoEnableSkills(content, this.activeSkillsRef, this.skillIndex);
+    await autoEnablePlugins(content, this.activePluginsRef, this.pluginIndex);
     const mentionContext = await buildFileMentionContext(content, { cwd: this.workspaceDir });
     const modelContent = mentionContext.prompt;
     const attachedMentions = mentionContext.mentions.filter((item) => item.status === "inline" || item.status === "preview");

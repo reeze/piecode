@@ -1,3 +1,6 @@
+import { promises as fs } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { clipDiffText, getSessionDiff, parseToolResultDetails } from "../src/web/core.js";
 import {
   ClarificationBroker,
@@ -84,8 +87,14 @@ describe("web server security helpers", () => {
   });
 
   test("web /goal runs a multi-turn loop outside plan-only mode", async () => {
-    const session = new WebAgentSession({ workspaceDir: process.cwd(), settings: {}, settingsFile: "" });
+    const session = new WebAgentSession({
+      workspaceDir: process.cwd(),
+      settings: {},
+      settingsFile: "",
+      providerFactory: () => ({ kind: "test", model: "test-model", supportsNativeTools: true }),
+    });
     session.skillIndex = new Map();
+    session.pluginIndex = new Map();
     session.planOnly = true;
     const calls = [];
     session.agent = {
@@ -108,8 +117,14 @@ describe("web server security helpers", () => {
   });
 
   test("web normal messages honor session plan mode when request options omit planOnly", async () => {
-    const session = new WebAgentSession({ workspaceDir: process.cwd(), settings: {}, settingsFile: "" });
+    const session = new WebAgentSession({
+      workspaceDir: process.cwd(),
+      settings: {},
+      settingsFile: "",
+      providerFactory: () => ({ kind: "test", model: "test-model", supportsNativeTools: true }),
+    });
     session.skillIndex = new Map();
+    session.pluginIndex = new Map();
     session.planOnly = true;
     const calls = [];
     session.agent = {
@@ -124,6 +139,92 @@ describe("web server security helpers", () => {
 
     expect(calls).toHaveLength(1);
     expect(calls[0].options.planOnly).toBe(true);
+  });
+
+  test("web refreshes provider before each model turn so Codex auth changes are picked up", async () => {
+    const providers = [
+      { kind: "codex-auth-token", model: "gpt-5.3-codex", supportsNativeTools: true },
+      { kind: "codex-auth-key", model: "gpt-5.3-codex", supportsNativeTools: true },
+    ];
+    const providerCalls = [];
+    const providerFactory = (options) => {
+      providerCalls.push(options);
+      return providers[Math.min(providerCalls.length - 1, providers.length - 1)];
+    };
+    const session = new WebAgentSession({ workspaceDir: process.cwd(), settings: { provider: "codex" }, settingsFile: "", providerFactory });
+    session.skillIndex = new Map();
+    session.pluginIndex = new Map();
+    session.provider = providers[0];
+    const seenProviders = [];
+    session.agent = {
+      history: [],
+      provider: providers[0],
+      async runTurn() {
+        seenProviders.push(this.provider);
+        return "ok";
+      },
+    };
+
+    await session.sendMessage("first turn");
+    await session.sendMessage("second turn");
+
+    expect(providerCalls).toHaveLength(2);
+    expect(seenProviders).toEqual(providers);
+    expect(session.provider).toBe(providers[1]);
+    expect(session.snapshot().provider).toBe("codex-auth-key");
+  });
+
+  test("web plugin slash commands are discovered, suggested, and executable", async () => {
+    const session = new WebAgentSession({ workspaceDir: process.cwd(), settings: {}, settingsFile: "" });
+    session.skillIndex = new Map();
+    session.pluginIndex = new Map([
+      ["demo", {
+        name: "demo",
+        description: "Demo plugin",
+        version: "1.0.0",
+        path: "/tmp/demo/PLUGIN.md",
+        frontmatter: { command: "demo", commandDescription: "Run demo" },
+        commandFiles: [],
+        skills: [],
+      }],
+    ]);
+
+    const command = session.getSlashCommands().find((item) => item.name === "/demo");
+    expect(command).toMatchObject({ pluginName: "demo", description: "Run demo" });
+
+    const result = await session.handleSlashCommand("/demo hello");
+
+    expect(result.handled).toBe(false);
+    expect(result.input).toContain("Plugin command /demo invoked.");
+    expect(result.input).toContain("User request / arguments:\nhello");
+    expect(session.activePluginsRef.value.map((plugin) => plugin.name)).toEqual(["demo"]);
+  });
+
+  test("web plugin management commands mirror CLI basics", async () => {
+    const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-web-plugin-"));
+    const pluginDir = path.join(tempDir, "demo");
+    await fs.mkdir(pluginDir, { recursive: true });
+    const pluginPath = path.join(pluginDir, "PLUGIN.md");
+    await fs.writeFile(pluginPath, "---\nname: demo\nversion: 1.0.0\n---\nDemo plugin\n", "utf8");
+    const session = new WebAgentSession({ workspaceDir: process.cwd(), settings: {}, settingsFile: "" });
+    session.skillIndex = new Map();
+    session.pluginIndex = new Map([
+      ["demo", {
+        name: "demo",
+        description: "Demo plugin",
+        version: "1.0.0",
+        path: pluginPath,
+        frontmatter: {},
+        commandFiles: [],
+        skills: [],
+      }],
+    ]);
+
+    await expect(session.handleSlashCommand("/plugins list")).resolves.toMatchObject({ handled: true, message: expect.stringContaining("Demo plugin") });
+    await expect(session.handleSlashCommand("/plugins commands")).resolves.toMatchObject({ handled: true, message: expect.stringContaining("No plugin commands") });
+    await expect(session.handleSlashCommand("/plugins use demo")).resolves.toMatchObject({ handled: true, message: "Enabled plugin: demo" });
+    expect(session.snapshot().plugins).toEqual([expect.objectContaining({ name: "demo" })]);
+    await expect(session.handleSlashCommand("/plugins off demo")).resolves.toMatchObject({ handled: true, message: "Disabled plugin: demo" });
   });
 
   test("web /clear resets pending steers so stale guidance does not leak into later tasks", async () => {

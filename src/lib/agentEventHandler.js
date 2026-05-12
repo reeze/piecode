@@ -1,3 +1,33 @@
+function normalizeProgressText(value, maxLen = 220) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  if (text.length <= maxLen) return text;
+  return `${text.slice(0, Math.max(0, maxLen - 3))}...`;
+}
+
+function progressIntentFromTool(tool, input = {}, fallbackLine = "") {
+  const name = String(tool || "tool");
+  const safe = input && typeof input === "object" ? input : {};
+  if (name === "read_file" && safe.path) return `I am about to read ${safe.path}.`;
+  if (name === "read_files" && Array.isArray(safe.paths)) {
+    const shown = safe.paths.slice(0, 3).join(", ");
+    const more = safe.paths.length > 3 ? ` +${safe.paths.length - 3}` : "";
+    return `I am about to read ${shown}${more}.`;
+  }
+  if (name === "rg" || name === "grep" || name === "search_files") {
+    const query = safe.pattern || safe.regex || safe.query || "workspace";
+    const scope = safe.path || safe.glob || safe.file_pattern || "workspace";
+    return `I am about to search ${scope} for ${query}.`;
+  }
+  if (name === "edit_file" || name === "write_file") return `I am about to update ${safe.path || "a file"}.`;
+  if (name === "replace_in_files") return `I am about to ${safe.apply ? "apply" : "preview"} replacements in ${safe.path || "the workspace"}.`;
+  if (name === "run_tests") return `I am about to run ${safe.command || "tests"}.`;
+  if (name === "shell") return `I am about to run ${safe.command || "a shell command"}.`;
+  if (name === "subagent") return `I am about to delegate: ${safe.task || "subagent task"}.`;
+  const line = String(fallbackLine || "").replace(/^\[run\]\s*/i, "").trim();
+  return line ? `I am about to ${line}.` : `I am about to use ${name}.`;
+}
+
 export function createAgentEventHandler(deps = {}) {
   const {
     sessionBus,
@@ -46,6 +76,18 @@ export function createAgentEventHandler(deps = {}) {
     formatToolResultLinesForTimeline,
     advanceTodosOnToolStart,
   } = deps;
+
+  const progressState = { last: "", lastAt: 0 };
+  const emitProgress = (message, { force = false } = {}) => {
+    const text = normalizeProgressText(message, 260);
+    if (!text) return;
+    const now = Date.now();
+    if (!force && text === progressState.last) return;
+    if (!force && now - progressState.lastAt < 700 && text.startsWith(progressState.last)) return;
+    progressState.last = text;
+    progressState.lastAt = now;
+    logLine?.(`[progress] ${text}`);
+  };
 
   return (evt = {}) => {
     if (evt && typeof evt === "object") {
@@ -194,7 +236,10 @@ export function createAgentEventHandler(deps = {}) {
       if (tui && evt.stage === "turn" && typeof extractReadableThinkingPreview === "function") {
         const source = llmStreamRef.value?.turn || evt.delta || "";
         const preview = extractReadableThinkingPreview(source);
-        if (preview) tui.setLiveThought(preview);
+        if (preview) {
+          tui.setLiveThought(preview);
+          emitProgress(preview);
+        }
       }
     }
     if (evt.type === "llm_response") {
@@ -252,7 +297,11 @@ export function createAgentEventHandler(deps = {}) {
       }
       if (tui && evt.stage === "turn") {
         const preview = extractThinkingFromFinalModelPayload(llmStreamRef.value.turn);
-        if (preview) tui.setLiveThought(formatStageUpdate(preview));
+        if (preview) {
+          const update = formatStageUpdate(preview);
+          tui.setLiveThought(update);
+          emitProgress(update, { force: true });
+        }
       }
       const pendingSent = consumePendingRequestTokens(evt.stage);
       let sentTokens = normalizedUsage?.input_tokens ?? null;
@@ -281,7 +330,7 @@ export function createAgentEventHandler(deps = {}) {
       const update = formatStageUpdate(evt.content);
       if (tui && update) tui.setLiveThought(update);
       if (display && update) display.onThought(update);
-      if (update) logLine?.(`[progress] ${update}`);
+      if (update) emitProgress(update, { force: true });
     }
     if (evt.type === "tool_batch_start") {
       recordTaskEvent?.(taskTraceRef, evt);
@@ -297,7 +346,7 @@ export function createAgentEventHandler(deps = {}) {
       if (tui) tui.onToolUse(evt.tool);
       if (tui && visibleThought) tui.setLiveThought(visibleThought);
       if (display && !evt.parallel) display.onToolUse(evt.tool, evt.input, evt.reason || evt.thought);
-      if (visibleThought && !evt.parallel && !isTodoTool) logLine?.(`[progress] ${visibleThought}`);
+      if (visibleThought && !evt.parallel && !isTodoTool) emitProgress(visibleThought, { force: true });
       if (isTodoTool) {
         // keep todo activity in status bar only
       } else if (evt.parallel) {
@@ -319,7 +368,11 @@ export function createAgentEventHandler(deps = {}) {
         logLine?.(`[trace] tool_start name=${evt.tool}`);
       }
       if (display) display.onToolStart(evt.tool, evt.input);
-      logLine?.(formatReadableToolRunLine(evt.tool, evt.input || {}));
+      const readableRunLine = formatReadableToolRunLine(evt.tool, evt.input || {});
+      if (evt.tool !== "todo_write" && evt.tool !== "todowrite") {
+        emitProgress(progressIntentFromTool(evt.tool, evt.input || {}, readableRunLine), { force: true });
+      }
+      logLine?.(readableRunLine);
       if (todoAutoTrackRef.value && evt.tool !== "todo_write" && evt.tool !== "todowrite") {
         const advanced = advanceTodosOnToolStart(todosRef.value);
         if (advanced.length > 0) {

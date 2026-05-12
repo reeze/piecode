@@ -604,7 +604,7 @@ Options:
   --plugin-install-project Install plugin into .piecode/plugins instead of ~/.piecode/plugins
   --list-skills        List discovered skills and exit
   --list-plugins       List discovered plugins and exit
-  --tui                Start simple full-screen TUI mode
+  --tui                Start simple full-screen TUI mode (default for interactive use)
   --web                Start browser-based Web UI
   --tmux-subagents     Open a tmux window for each subagent event stream
   --disable-codex      Disable Codex CLI fallback (equivalent to PIECODE_DISABLE_CODEX_CLI=1)
@@ -4367,6 +4367,14 @@ function inferEndpointForProvider(providerOptions, provider) {
 }
 
 async function main() {
+  const startupStartedAt = Date.now();
+  const startupTraceEnabled = process.env.PIECODE_STARTUP_TRACE === "1";
+  const startupMark = (name) => {
+    if (!startupTraceEnabled) return;
+    const elapsed = Date.now() - startupStartedAt;
+    console.error(`[startup] ${name} ${elapsed}ms`);
+  };
+  startupMark("main");
   const args = parseArgs(process.argv.slice(2));
   if (args.help) {
     printHelp();
@@ -4402,31 +4410,48 @@ async function main() {
   const modelContextWindowsRef = { value: new Map() };
   const modelContextMetadataRef = { value: new Set() };
   const skillRoots = resolveSkillRoots(settings, workspaceDir);
-  let skillIndex = await discoverSkills(skillRoots);
+  const pluginRoots = resolvePluginRoots(settings, workspaceDir);
+  const historyFile = getHistoryFilePath();
+  const requestedResumeId = String(args.resume || "").trim();
+  if (args.resume !== null && !requestedResumeId) {
+    throw new Error("--resume requires a session id or short id");
+  }
+
+  const startupLoads = {
+    skills: discoverSkills(skillRoots),
+    plugins: discoverPlugins(pluginRoots),
+    projectInstructions: loadProjectInstructions(workspaceDir),
+    memory: loadMemory({ workspaceDir }),
+    agentDefinitions: loadAgentDefinitions({ workspaceDir }),
+    history: loadHistory(historyFile),
+    resumeSession: requestedResumeId
+      ? resolveResumableSessionId(workspaceDir, requestedResumeId).then((id) => loadResumableSession(workspaceDir, id))
+      : Promise.resolve(null),
+  };
+
+  let [skillIndex, pluginIndex] = await Promise.all([startupLoads.skills, startupLoads.plugins]);
+  startupMark("indexes-ready");
   const refreshSkillIndex = async () => {
     skillIndex = await discoverSkills(skillRoots);
   };
-  const pluginRoots = resolvePluginRoots(settings, workspaceDir);
-  let pluginIndex = await discoverPlugins(pluginRoots);
   const refreshPluginIndex = async () => {
     pluginIndex = await discoverPlugins(pluginRoots);
     return pluginIndex;
   };
   const requestedSkills = resolveRequestedSkills(args.skills, settings);
-  const { active: activeSkillsInitial, missing: missingSkills } = await loadActiveSkills(
-    skillIndex,
-    requestedSkills
-  );
-  const activeSkillsRef = { value: activeSkillsInitial };
   const requestedPlugins = [
     ...resolveRequestedPlugins(args.plugins, settings),
     ...getDefaultPluginNames(pluginIndex, settings),
   ];
-  const { active: activePluginsInitial, missing: missingPlugins } = await loadActivePlugins(
-    pluginIndex,
-    requestedPlugins
-  );
+  const [loadedSkills, loadedPlugins] = await Promise.all([
+    loadActiveSkills(skillIndex, requestedSkills),
+    loadActivePlugins(pluginIndex, requestedPlugins),
+  ]);
+  const { active: activeSkillsInitial, missing: missingSkills } = loadedSkills;
+  const { active: activePluginsInitial, missing: missingPlugins } = loadedPlugins;
+  const activeSkillsRef = { value: activeSkillsInitial };
   const activePluginsRef = { value: activePluginsInitial };
+  startupMark("extensions-ready");
 
   if (missingSkills.length > 0) {
     console.error(`warning: missing skills: ${missingSkills.join(", ")}`);
@@ -4470,16 +4495,21 @@ async function main() {
   const providerOptionsRef = { value: resolveProviderOptions(args, settings) };
   const providerRef = { value: getProvider(providerOptionsRef.value) };
   const contextWindowRef = { value: 0 };
-  const projectInstructionsLoaded = await loadProjectInstructions(workspaceDir);
+  const [projectInstructionsLoaded, loadedMemory, loadedAgentDefinitions] = await Promise.all([
+    startupLoads.projectInstructions,
+    startupLoads.memory,
+    startupLoads.agentDefinitions,
+  ]);
   const projectInstructionsRef = { value: projectInstructionsLoaded.instructions };
   const projectInstructionsStatusRef = { value: projectInstructionsLoaded.status };
-  const memoryRef = { value: await loadMemory({ workspaceDir }) };
-  const agentDefinitionsRef = { value: await loadAgentDefinitions({ workspaceDir }) };
+  const memoryRef = { value: loadedMemory };
+  const agentDefinitionsRef = { value: loadedAgentDefinitions };
   const startupAutoSkills = await autoLoadSkillsFromInstructions(
     projectInstructionsRef.value,
     activeSkillsRef,
     skillIndex
   );
+  startupMark("context-ready");
   const autoApproveRef = { value: false };
   const shellPermissionRef = { value: { allowAllSession: false, rememberedCommands: new Set() } };
   const oneShotPromptMode = args.prompt !== null;
@@ -4487,9 +4517,8 @@ async function main() {
     // One-shot mode has no interactive approval channel; auto-approve tool prompts.
     autoApproveRef.value = true;
   }
-  const historyFile = getHistoryFilePath();
-  const initialHistory = await loadHistory(historyFile);
-  const useTui = args.tui || process.env.PIECODE_TUI === "1";
+  const initialHistory = await startupLoads.history;
+  const useTui = !oneShotPromptMode && !args.web && (process.env.PIECODE_TUI !== "0" || args.tui);
   const display = useTui ? null : new Display();
   const llmLastRef = { value: { request: null, response: null } };
   const llmHistoryRef = { value: { entries: [], seq: 0, index: -1 } };
@@ -4498,13 +4527,7 @@ async function main() {
   const llmStreamRef = { value: { turn: "", planning: "", replanning: "" } };
   const llmPendingRequestTokensRef = { value: new Map() };
   const traceStateRef = { value: { turnId: 0, turnStartedAt: 0, llmStageStart: {}, toolStartByName: {} } };
-  if (args.resume !== null && !String(args.resume || "").trim()) {
-    throw new Error("--resume requires a session id or short id");
-  }
-  const requestedResumeId = String(args.resume || "").trim();
-  const startupResumeSession = requestedResumeId
-    ? await loadResumableSession(workspaceDir, await resolveResumableSessionId(workspaceDir, requestedResumeId))
-    : null;
+  const startupResumeSession = await startupLoads.resumeSession;
   const taskTraceRef = {
     seq: 0,
     current: null,
@@ -4659,7 +4682,6 @@ async function main() {
       fileMentionIndexRef.loading = false;
     }
   };
-  refreshFileMentionIndex().catch(() => {});
 
   let tui = null;
   let onResize = null;
@@ -5564,16 +5586,18 @@ async function main() {
     logLine(`[mcp] configured servers: ${names.join(", ")}`);
   };
 
-  const mergedMcpSettings = await mergeCommonMcpServers(settings, {
-    workspaceDir,
-    onLog: (line) => logLine(line),
-  });
-  mcpHubRef.value = new McpHub({
-    workspaceDir,
-    settings: mergedMcpSettings,
-    onLog: (line) => logLine(line),
-  });
-  logMcpConfiguredServers(mcpHubRef.value);
+  if (oneShotPromptMode) {
+    const mergedMcpSettings = await mergeCommonMcpServers(settings, {
+      workspaceDir,
+      onLog: (line) => logLine(line),
+    });
+    mcpHubRef.value = new McpHub({
+      workspaceDir,
+      settings: mergedMcpSettings,
+      onLog: (line) => logLine(line),
+    });
+    logMcpConfiguredServers(mcpHubRef.value);
+  }
 
   const agent = new Agent({
     provider: providerRef.value,
@@ -5702,6 +5726,13 @@ async function main() {
     return nextHub;
   };
 
+  const startupMcpReady = oneShotPromptMode
+    ? Promise.resolve(mcpHubRef.value)
+    : refreshMcpHub({ announce: true }).catch((err) => {
+        logLine(`[mcp] startup load failed: ${String(err?.message || err)}`);
+        return null;
+      });
+
   let shutdownComplete = false;
   const shutdown = async ({ announceSession = false, savedSession = null } = {}) => {
     if (shutdownComplete) return;
@@ -5820,6 +5851,10 @@ async function main() {
     }
     tui.start();
     tui.render(currentInputRef.value, "Type /help for commands");
+    startupMark("first-render");
+    setImmediate(() => {
+      refreshFileMentionIndex().catch(() => {});
+    });
   } else {
     console.log(`Pie Code (${formatProviderModel(providerRef.value)})`);
     const providerWarning = formatProviderWarning(providerRef.value);
@@ -5853,6 +5888,8 @@ async function main() {
       refreshTuiContextUsage?.();
     }
     console.log("Type /help for commands.");
+    startupMark("first-text");
+    refreshFileMentionIndex().catch(() => {});
   }
 
   while (true) {
@@ -6068,6 +6105,7 @@ async function main() {
       if (tui) tui.setProjectInstructionsVisible(false);
     }
 
+    await startupMcpReady;
     const localTask = maybeHandleLocalInfoTask(agentInput, { logLine, tui, display, mcpHub: mcpHubRef.value });
     if (localTask.handled) {
       const saved = await finishTaskTrace(taskTraceRef, workspaceDir, { status: "done", sessionBus });
@@ -6077,8 +6115,10 @@ async function main() {
       continue;
     }
 
-    await maybeAutoEnableSkills(agentInput, activeSkillsRef, skillIndex, logLine);
-    await maybeAutoEnablePlugins(agentInput, activePluginsRef, pluginIndex, logLine);
+    await Promise.all([
+      maybeAutoEnableSkills(agentInput, activeSkillsRef, skillIndex, logLine),
+      maybeAutoEnablePlugins(agentInput, activePluginsRef, pluginIndex, logLine),
+    ]);
     const turnAttachments = Array.isArray(pendingAttachmentsRef.value) ? pendingAttachmentsRef.value : [];
     pendingAttachmentsRef.value = [];
     if (turnAttachments.length > 0) {
