@@ -340,6 +340,8 @@ describe("InkTuiLayout", () => {
     );
     const inputLineIndex = findPromptLineIndex(cursor.lines);
     expect(cursor.y).toBe(inputLineIndex);
+    expect(cursor.lines[cursor.y - 3] || "").toContain("thinking:turn");
+    expect(cursor.lines[cursor.y - 2] || "").toBe("");
     expect(cursor.lines[cursor.y - 1] || "").toMatch(/[-─]{8,}/);
     expect(cursor.lines[cursor.y + 1] || "").toMatch(/[-─]{8,}/);
     expect(cursor.lines[cursor.y] || "").toMatch(/\s(?:>|❯)\s/);

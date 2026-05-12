@@ -399,7 +399,7 @@ describe("tui usability", () => {
     const spacedResponse = stripAnsi(
       tui.formatTimelineLines("[response] 第一段\n\n1. 第一个选项\n\n2. 第二个选项").join("\n")
     );
-    expect(spacedResponse).toContain(`${tui.symbols.response} 第一段\n\n1. 第一个选项\n\n2. 第二个选项`);
+    expect(spacedResponse).toContain(`${tui.symbols.response} 第一段\n1. 第一个选项\n2. 第二个选项`);
     expect(spacedResponse).not.toContain("    1. 第一个选项");
     const plainResponse = stripAnsi(tui.formatTimelineLines("[response] hello world")[0]);
     expect(plainResponse.trim()).toBe(`${tui.symbols.response} hello world`);
@@ -407,12 +407,19 @@ describe("tui usability", () => {
     const boldResponse = stripAnsi(tui.formatTimelineLines("[response] this is **BOLD** text")[0]);
     expect(boldResponse).toContain("this is BOLD text");
     expect(boldResponse).not.toContain("**BOLD**");
+    const highlightedResponseRaw = tui.formatTimelineLines("[response] this is ==highlighted **BOLD** text==").join("\n");
+    const highlightedResponse = stripAnsi(highlightedResponseRaw);
+    expect(highlightedResponse).toContain("this is highlighted BOLD text");
+    expect(highlightedResponse).not.toContain("==");
+    expect(highlightedResponseRaw).toContain("\x1b[30;43mhighlighted ");
+    expect(highlightedResponseRaw).toContain("\x1b[30;43;1mBOLD");
     const richMarkdown = stripAnsi(
       tui.formatTimelineLines([
         "[response] ### Details",
         "- [x] done item",
         "  - nested item",
         "1. ordered item",
+        "",
         "| Name | Count |",
         "| --- | ---: |",
         "| alpha | 12 |",
@@ -423,7 +430,7 @@ describe("tui usability", () => {
     );
     expect(richMarkdown).toContain("› Details");
     expect(richMarkdown).toContain("[x] done item");
-    expect(richMarkdown).toContain("◦ nested item");
+    expect(richMarkdown).toContain("  ◦ nested item");
     expect(richMarkdown).toContain("1. ordered item");
     expect(richMarkdown).not.toContain("• •");
     expect(richMarkdown).toContain("│ Name");
@@ -437,6 +444,36 @@ describe("tui usability", () => {
     for (const line of narrowTableLines.filter((line) => line.includes("│"))) {
       expect(printableWidth(line)).toBeLessThanOrEqual(out.columns - 2);
     }
+    const nestedListMarkdown = stripAnsi(
+      tui.formatTimelineLines([
+        "[response] - level one",
+        "  - level two",
+        "    - level three",
+        "      1. ordered level four",
+        "        - [x] task level five",
+      ].join("\n")).join("\n")
+    );
+    expect(nestedListMarkdown).toContain("• level one");
+    expect(nestedListMarkdown).toContain("  ◦ level two");
+    expect(nestedListMarkdown).toContain("    ▪ level three");
+    expect(nestedListMarkdown).toContain("      1. ordered level four");
+    expect(nestedListMarkdown).toContain("      [x] task level five");
+    const nestedListWithOneSpaceIndent = stripAnsi(
+      tui.formatTimelineLines([
+        "[response] - Fruits",
+        "  - Apples",
+        "    - Granny Smith",
+        "    - Honeycrisp",
+        "- Vegetables",
+        "  - Leafy greens",
+      ].join("\n")).join("\n")
+    );
+    expect(nestedListWithOneSpaceIndent).toContain("• Fruits");
+    expect(nestedListWithOneSpaceIndent).toContain(" ◦ Apples");
+    expect(nestedListWithOneSpaceIndent).toContain("   ▪ Granny Smith");
+    expect(nestedListWithOneSpaceIndent).toContain("   ▪ Honeycrisp");
+    expect(nestedListWithOneSpaceIndent).toContain("• Vegetables");
+    expect(nestedListWithOneSpaceIndent).toContain(" ◦ Leafy greens");
     expect(richMarkdown).toContain("│ quoted note");
     expect(richMarkdown).toContain("││ nested quote");
     expect(richMarkdown).toContain("indented code");

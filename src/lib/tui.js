@@ -1,7 +1,52 @@
+import MarkdownIt from "markdown-it";
+import markdownItTaskLists from "markdown-it-task-lists";
 import { DEFAULT_INPUT_HINTS, sanitizeInputHints } from "./inputHints.js";
 
 const ANSI_PATTERN = /\x1b(?:\[[0-9;?]*[ -/]*[@-~]|[%()][ -~])/g;
 const TERMINAL_PAINT_PREFIX = "\x1b[?25l\x1b%G\x1b(B\x1b[0m\x1b[2J\x1b[H";
+function markdownItHighlight(md) {
+  md.inline.ruler.before("emphasis", "piecode_highlight", (state, silent) => {
+    const start = state.pos;
+    const marker = state.src.slice(start, start + 2);
+    if (marker !== "==") return false;
+    if (state.src[start + 2] === "=") return false;
+
+    let end = start + 2;
+    while ((end = state.src.indexOf("==", end)) >= 0) {
+      if (state.src[end - 1] === "\\" || state.src[end + 2] === "=") {
+        end += 2;
+        continue;
+      }
+      break;
+    }
+    if (end < 0 || end === start + 2) return false;
+    if (silent) return true;
+
+    const oldMax = state.max;
+    state.pos = start + 2;
+    state.max = end;
+    const oldSrc = state.src;
+    state.src = oldSrc.slice(0, end);
+    const open = state.push("mark_open", "mark", 1);
+    open.markup = "==";
+    state.md.inline.tokenize(state);
+    const close = state.push("mark_close", "mark", -1);
+    close.markup = "==";
+    state.src = oldSrc;
+    state.pos = end + 2;
+    state.max = oldMax;
+    return true;
+  });
+}
+
+const markdownParser = new MarkdownIt({
+  html: false,
+  linkify: true,
+  typographer: false,
+})
+  .enable("table")
+  .use(markdownItTaskLists)
+  .use(markdownItHighlight);
 
 function stripAnsi(text) {
   return String(text || "").replace(ANSI_PATTERN, "");
@@ -309,10 +354,6 @@ function highlightCodeLine(line, lang = "") {
   return color(line || " ", "36");
 }
 
-function stripMarkdownForTableCell(value) {
-  return stripAnsi(renderInlineMarkdown(String(value || "").trim().replace(/\\\|/g, "|")));
-}
-
 function truncateDisplayText(text, maxWidth) {
   const source = String(text || "");
   const limit = Math.max(1, Number(maxWidth) || 1);
@@ -331,49 +372,6 @@ function truncateDisplayText(text, maxWidth) {
   return `${out}${ellipsis}`;
 }
 
-function splitMarkdownTableRow(line) {
-  const trimmed = String(line || "").trim();
-  if (!trimmed.includes("|")) return null;
-  const inner = trimmed.replace(/^\|/, "").replace(/\|$/, "");
-  const cells = [];
-  let current = "";
-  let escaped = false;
-  for (const ch of inner) {
-    if (escaped) {
-      current += ch;
-      escaped = false;
-      continue;
-    }
-    if (ch === "\\") {
-      escaped = true;
-      current += ch;
-      continue;
-    }
-    if (ch === "|") {
-      cells.push(current.trim());
-      current = "";
-      continue;
-    }
-    current += ch;
-  }
-  cells.push(current.trim());
-  return cells.length >= 2 ? cells : null;
-}
-
-function parseMarkdownTableSeparator(line) {
-  const cells = splitMarkdownTableRow(line);
-  if (!cells) return null;
-  const aligns = [];
-  for (const cell of cells) {
-    const value = String(cell || "").trim();
-    if (!/^:?-{3,}:?$/.test(value)) return null;
-    const left = value.startsWith(":");
-    const right = value.endsWith(":");
-    aligns.push(left && right ? "center" : right ? "right" : "left");
-  }
-  return aligns;
-}
-
 function padTableCell(text, width, align = "left") {
   const value = String(text || "");
   const pad = Math.max(0, width - stringDisplayWidth(value));
@@ -385,42 +383,138 @@ function padTableCell(text, width, align = "left") {
   return `${value}${" ".repeat(pad)}`;
 }
 
-function renderMarkdownTable(lines, startIndex, { maxWidth = 100 } = {}) {
-  const header = splitMarkdownTableRow(lines[startIndex]);
-  const aligns = parseMarkdownTableSeparator(lines[startIndex + 1]);
-  if (!header || !aligns) return null;
+function renderInlineTokens(tokens = []) {
+  const items = Array.isArray(tokens) ? tokens : [];
+  let out = "";
+  const marks = [];
+  const style = () => marks.filter(Boolean).join(";");
+  const apply = (text) => {
+    const value = String(text || "");
+    const code = style();
+    return code ? color(value, code) : value;
+  };
 
+  for (const token of items) {
+    switch (token.type) {
+      case "text":
+      case "code_inline":
+        out += token.type === "code_inline" ? color(token.content, "34") : apply(token.content);
+        break;
+      case "softbreak":
+      case "hardbreak":
+        out += "\n";
+        break;
+      case "strong_open":
+        marks.push("1");
+        break;
+      case "strong_close":
+        marks.pop();
+        break;
+      case "em_open":
+        marks.push("3");
+        break;
+      case "em_close":
+        marks.pop();
+        break;
+      case "s_open":
+        marks.push("9;2");
+        break;
+      case "s_close":
+        marks.pop();
+        break;
+      case "mark_open":
+        marks.push("30;43");
+        break;
+      case "mark_close":
+        marks.pop();
+        break;
+      case "link_open": {
+        const href = token.attrGet?.("href") || "";
+        marks.push("4;34");
+        if (href) token._piecodeHref = href;
+        break;
+      }
+      case "link_close": {
+        marks.pop();
+        break;
+      }
+      case "image": {
+        const src = token.attrGet?.("src") || "";
+        const alt = token.content || token.attrGet?.("alt") || "";
+        out += `${color("image", "1;35")}${alt ? color(` ${alt}`, "35") : ""}${src ? color(` (${src})`, "2;37") : ""}`;
+        break;
+      }
+      case "html_inline": {
+        const html = String(token.content || "");
+        if (/task-list-item-checkbox/i.test(html)) {
+          out += /checked/i.test(html) ? color("[x]", "1;32") : color("[ ]", "2;37");
+        } else {
+          out += apply(token.content);
+        }
+        break;
+      }
+      default:
+        if (token.content) out += apply(token.content);
+        break;
+    }
+    if (token.type === "link_close") {
+      const open = [...items].reverse().find((item) => item.type === "link_open" && item._piecodeHref);
+      if (open?._piecodeHref) out += color(` (${open._piecodeHref})`, "2;37");
+    }
+  }
+  return out;
+}
+
+function renderInlineToken(token) {
+  if (!token) return "";
+  if (Array.isArray(token.children)) return renderInlineTokens(token.children);
+  return renderInlineMarkdown(token.content || "");
+}
+
+function renderMarkdownTableFromTokens(tokens, startIndex, { maxWidth = 100 } = {}) {
   const rows = [];
-  let i = startIndex + 2;
-  while (i < lines.length) {
-    const row = splitMarkdownTableRow(lines[i]);
-    if (!row) break;
-    rows.push(row);
-    i += 1;
+  const aligns = [];
+  let currentRow = null;
+  let currentCell = null;
+  let inHeader = false;
+  let i = startIndex;
+
+  for (; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    if (token.type === "table_close") break;
+    if (token.type === "thead_open") inHeader = true;
+    if (token.type === "thead_close") inHeader = false;
+    if (token.type === "tr_open") currentRow = { header: inHeader, cells: [] };
+    if ((token.type === "th_open" || token.type === "td_open") && currentRow) {
+      currentCell = "";
+      if (token.type === "th_open") aligns.push(token.attrGet?.("style")?.includes("right") ? "right" : token.attrGet?.("style")?.includes("center") ? "center" : "left");
+    }
+    if (token.type === "inline" && currentCell != null) currentCell += stripAnsi(renderInlineToken(token));
+    if ((token.type === "th_close" || token.type === "td_close") && currentRow && currentCell != null) {
+      currentRow.cells.push(currentCell.trim());
+      currentCell = null;
+    }
+    if (token.type === "tr_close" && currentRow) {
+      rows.push(currentRow.cells);
+      currentRow = null;
+    }
   }
 
-  const columnCount = Math.max(header.length, aligns.length, ...rows.map((row) => row.length));
-  const normalize = (row) => Array.from({ length: columnCount }, (_v, idx) => stripMarkdownForTableCell(row[idx] || ""));
+  const header = rows[0] || [];
+  const bodyRows = rows.slice(1);
+  const columnCount = Math.max(header.length, aligns.length, ...bodyRows.map((row) => row.length), 0);
+  if (columnCount === 0) return { nextIndex: i, rendered: [] };
+  const normalize = (row) => Array.from({ length: columnCount }, (_v, idx) => row[idx] || "");
   const normalizedHeader = normalize(header);
-  const normalizedRows = rows.map(normalize);
+  const normalizedRows = bodyRows.map(normalize);
   const allRows = [normalizedHeader, ...normalizedRows];
   const minCellWidth = 3;
   const maxCellWidth = 40;
   const borderWidth = columnCount > 0 ? (columnCount * 3) + 1 : 0;
-  const availableCellsWidth = Math.max(
-    columnCount * minCellWidth,
-    Math.max(20, Number(maxWidth) || 100) - borderWidth
+  const availableCellsWidth = Math.max(columnCount * minCellWidth, Math.max(20, Number(maxWidth) || 100) - borderWidth);
+  const widths = Array.from({ length: columnCount }, (_v, idx) =>
+    Math.max(minCellWidth, Math.min(maxCellWidth, Math.max(...allRows.map((row) => stringDisplayWidth(row[idx] || "")), minCellWidth)))
   );
-  const rawWidths = Array.from({ length: columnCount }, (_v, idx) =>
-    Math.max(
-      minCellWidth,
-      Math.min(
-        maxCellWidth,
-        Math.max(...allRows.map((row) => stringDisplayWidth(row[idx] || "")), minCellWidth)
-      )
-    )
-  );
-  const widths = [...rawWidths];
   while (widths.reduce((sum, width) => sum + width, 0) > availableCellsWidth) {
     let widestIndex = 0;
     for (let idx = 1; idx < widths.length; idx += 1) {
@@ -435,130 +529,122 @@ function renderMarkdownTable(lines, startIndex, { maxWidth = 100 } = {}) {
     return style ? color(text, style) : text;
   };
   const sep = color(`├${widths.map((w) => "─".repeat(w + 2)).join("┼")}┤`, "2;37");
-  return {
-    nextIndex: i,
-    rendered: [renderRow(normalizedHeader, "1"), sep, ...normalizedRows.map((row) => renderRow(row))],
-  };
+  return { nextIndex: i, rendered: [renderRow(normalizedHeader, "1"), sep, ...normalizedRows.map((row) => renderRow(row))] };
 }
 
-function parseMarkdownBlocks(text, options = {}) {
-  const lines = String(text || "").replace(/\r/g, "").split("\n");
-  const maxTableWidth = Math.max(20, Number(options.maxTableWidth) || 100);
-  const blocks = [];
-  let paragraph = [];
+function listIndent(level) {
+  return "  ".repeat(Math.max(0, Number(level) || 0));
+}
 
-  const flushParagraph = () => {
-    if (paragraph.length === 0) return;
-    blocks.push({ type: "paragraph", lines: paragraph });
-    paragraph = [];
+function listGlyph(level) {
+  if (level <= 0) return "•";
+  if (level === 1) return "◦";
+  return "▪";
+}
+
+function renderMarkdownLines(text, options = {}) {
+  const tokens = markdownParser.parse(String(text || "").replace(/\r/g, ""), {});
+  const maxTableWidth = Math.max(20, Number(options.maxTableWidth) || 100);
+  const lines = [];
+  const listStack = [];
+  const listTightStack = [];
+  let quoteDepth = 0;
+  let pendingListItem = null;
+
+  const appendInline = (token) => {
+    const rendered = renderInlineToken(token);
+    for (let part of String(rendered || "").split("\n")) {
+      if (!part) continue;
+      if (pendingListItem) {
+        const taskMatch = stripAnsi(part).match(/^\s*(\[[x ]\])\s+/i);
+        const marker = taskMatch
+          ? ""
+          : pendingListItem.type === "ordered"
+            ? color(`${pendingListItem.number}.`, "2;37")
+            : color(listGlyph(pendingListItem.level), "2;37");
+        if (taskMatch) part = part.replace(/^\s+/, "");
+        lines.push(`${listIndent(pendingListItem.level)}${marker}${marker ? " " : ""}${part}`);
+        pendingListItem = null;
+      } else if (quoteDepth > 0) {
+        lines.push(`${color("│".repeat(Math.min(3, quoteDepth)), "2;37")} ${color(part, "3;37")}`);
+      } else {
+        lines.push(part);
+      }
+    }
   };
 
-  for (let i = 0; i < lines.length; i += 1) {
-    const line = lines[i];
-    const fence = line.match(/^\s*```\s*([\w.+-]*)\s*$/);
-    if (fence) {
-      flushParagraph();
-      const lang = String(fence[1] || "").trim();
-      const codeLines = [];
-      i += 1;
-      while (i < lines.length && !/^\s*```\s*$/.test(lines[i])) {
-        codeLines.push(lines[i]);
-        i += 1;
+  for (let i = 0; i < tokens.length; i += 1) {
+    const token = tokens[i];
+    switch (token.type) {
+      case "bullet_list_open":
+        listStack.push({ type: "bullet", next: 1 });
+        listTightStack.push(Boolean(token.hidden));
+        break;
+      case "ordered_list_open":
+        listStack.push({ type: "ordered", next: Math.max(1, Number(token.attrGet?.("start") || token.info) || 1) });
+        listTightStack.push(Boolean(token.hidden));
+        break;
+      case "bullet_list_close":
+      case "ordered_list_close":
+        listStack.pop();
+        listTightStack.pop();
+        break;
+      case "list_item_open": {
+        const list = listStack[listStack.length - 1] || { type: "bullet", next: 1 };
+        const level = Math.max(0, listStack.length - 1);
+        pendingListItem = { type: list.type, level, number: list.next };
+        list.next += 1;
+        break;
       }
-      blocks.push({ type: "code", lang, lines: codeLines, closed: i < lines.length });
-      continue;
-    }
-
-    if (!line.trim()) {
-      flushParagraph();
-      blocks.push({ type: "blank" });
-      continue;
-    }
-
-    const table = i + 1 < lines.length ? renderMarkdownTable(lines, i, { maxWidth: maxTableWidth }) : null;
-    if (table) {
-      flushParagraph();
-      blocks.push({ type: "table", rendered: table.rendered });
-      i = table.nextIndex - 1;
-      continue;
-    }
-
-    const header = line.match(/^(#{1,6})\s+(.+)$/);
-    if (header) {
-      flushParagraph();
-      blocks.push({ type: "heading", level: header[1].length, text: header[2] });
-      continue;
-    }
-
-    if (/^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) {
-      flushParagraph();
-      blocks.push({ type: "hr" });
-      continue;
-    }
-
-    const quoteMatch = line.match(/^(>+)\s?(.*)$/);
-    if (quoteMatch) {
-      flushParagraph();
-      const quoteLines = [];
-      let maxDepth = 1;
-      while (i < lines.length) {
-        const q = lines[i].match(/^(>+)\s?(.*)$/);
-        if (!q) break;
-        maxDepth = Math.max(maxDepth, q[1].length);
-        quoteLines.push({ depth: q[1].length, text: q[2] });
-        i += 1;
+      case "list_item_close":
+        pendingListItem = null;
+        break;
+      case "heading_open": {
+        const inline = tokens[i + 1]?.type === "inline" ? tokens[i + 1] : null;
+        const level = Number(token.tag?.replace(/^h/, "")) || 1;
+        const prefix = level <= 2 ? "◆" : level <= 4 ? "›" : "·";
+        const rendered = renderInlineToken(inline);
+        lines.push(level <= 2 ? color(`${prefix} ${rendered}`, "1;36") : color(`${prefix} ${rendered}`, "1"));
+        if (inline) i += 2;
+        break;
       }
-      i -= 1;
-      blocks.push({ type: "quote", lines: quoteLines, depth: maxDepth });
-      continue;
-    }
-
-    const task = line.match(/^(\s*)[-*+]\s+\[([ xX~-])\]\s+(.+)$/);
-    if (task) {
-      flushParagraph();
-      blocks.push({
-        type: "task",
-        indent: task[1],
-        state: String(task[2] || " "),
-        text: task[3],
-      });
-      continue;
-    }
-
-    const bullet = line.match(/^(\s*)[-*+]\s+(.+)$/);
-    if (bullet) {
-      flushParagraph();
-      blocks.push({ type: "bullet", indent: bullet[1], text: bullet[2] });
-      continue;
-    }
-
-    const ordered = line.match(/^(\s*)(\d+)[.)]\s+(.+)$/);
-    if (ordered) {
-      flushParagraph();
-      blocks.push({ type: "ordered", indent: ordered[1], number: ordered[2], text: ordered[3] });
-      continue;
-    }
-
-    const indentedCode = line.match(/^( {4}|\t)(.*)$/);
-    if (indentedCode) {
-      flushParagraph();
-      const codeLines = [];
-      while (i < lines.length) {
-        const c = lines[i].match(/^( {4}|\t)(.*)$/);
-        if (!c) break;
-        codeLines.push(c[2]);
-        i += 1;
+      case "paragraph_open":
+        if (pendingListItem && listTightStack[listTightStack.length - 1]) {
+          let offset = i + 1;
+          if (tokens[offset]?.type === "inline") offset += 1;
+          if (tokens[offset]?.type === "paragraph_close") i = offset;
+        }
+        break;
+      case "paragraph_close":
+        break;
+      case "inline":
+        appendInline(token);
+        break;
+      case "fence":
+      case "code_block": {
+        const codeLines = String(token.content || "").replace(/\n$/, "").split("\n");
+        lines.push(...codeLines.map((line) => highlightCodeLine(line || " ", token.info || "")));
+        break;
       }
-      i -= 1;
-      blocks.push({ type: "code", lang: "", lines: codeLines, closed: true, indented: true });
-      continue;
+      case "blockquote_open":
+        quoteDepth += 1;
+        break;
+      case "blockquote_close":
+        quoteDepth = Math.max(0, quoteDepth - 1);
+        break;
+      case "hr":
+        break;
+      case "table_open": {
+        const table = renderMarkdownTableFromTokens(tokens, i, { maxWidth: maxTableWidth });
+        lines.push(...table.rendered);
+        i = table.nextIndex;
+        break;
+      }
+      default:
+        break;
     }
-
-    paragraph.push(line);
   }
-
-  flushParagraph();
-  return blocks;
+  return lines;
 }
 
 function normalizeTimelineSpacing(lines) {
@@ -592,52 +678,6 @@ function normalizeTimelineSpacing(lines) {
   }
 
   return result;
-}
-
-function renderMarkdownBlock(block) {
-  if (!block || typeof block !== "object") return [];
-  switch (block.type) {
-    case "blank":
-      return [""];
-    case "code":
-      return block.lines.map((line) => highlightCodeLine(line || " ", block.lang || ""));
-    case "table":
-      return Array.isArray(block.rendered) ? block.rendered : [];
-    case "heading": {
-      const level = Number(block.level) || 1;
-      const prefix = level <= 2 ? "◆" : level <= 4 ? "›" : "·";
-      const rendered = renderInlineMarkdown(block.text);
-      return [level <= 2 ? color(`${prefix} ${rendered}`, "1;36") : color(`${prefix} ${rendered}`, "1")];
-    }
-    case "hr":
-      return [];
-    case "quote":
-      return (Array.isArray(block.lines) ? block.lines : []).map((item) => {
-        const depth = Math.max(1, Number(item.depth) || 1);
-        const bars = color("│".repeat(Math.min(3, depth)), "2;37");
-        return `${bars} ${color(renderInlineMarkdown(item.text), "3;37")}`;
-      });
-    case "task": {
-      const state = String(block.state || " ");
-      const marker = /x/i.test(state) ? color("[x]", "1;32") : /[~-]/.test(state) ? color("[~]", "1;33") : color("[ ]", "2;37");
-      return [`${block.indent || ""}${marker} ${renderInlineMarkdown(block.text)}`];
-    }
-    case "bullet": {
-      const depth = Math.floor(String(block.indent || "").replace(/\t/g, "  ").length / 2);
-      const glyph = depth <= 0 ? "•" : depth === 1 ? "◦" : "▪";
-      return [`${block.indent || ""}${color(glyph, "2;37")} ${renderInlineMarkdown(block.text)}`];
-    }
-    case "ordered":
-      return [`${block.indent || ""}${color(`${block.number}.`, "2;37")} ${renderInlineMarkdown(block.text)}`];
-    case "paragraph":
-      return (Array.isArray(block.lines) ? block.lines : [block.text]).map((line) => renderInlineMarkdown(line));
-    default:
-      return [renderInlineMarkdown(block.text || "")];
-  }
-}
-
-function renderMarkdownLines(text, options = {}) {
-  return parseMarkdownBlocks(text, options).flatMap((block) => renderMarkdownBlock(block));
 }
 
 function highlightOverlaySectionLine(line) {
@@ -2657,7 +2697,7 @@ export class SimpleTui {
     const thought = String(this.thoughtStreamText || "").trim();
     const thoughtSuffix = thought ? ` · ${truncateLine(thought.replace(/^Thinking:\s*/i, ""), Math.max(20, width - 46))}` : "";
     const runningLine = ` ${spin} thinking${this.thinkingStage ? `:${this.thinkingStage}` : ""} · ${this.formatElapsedSinceTurnStart()}${thoughtSuffix}`;
-    const thinkingBlock = this.thinking ? [color(runningLine, `1;${thinkingColor}`)] : [];
+    const runningBlock = this.thinking ? [color(runningLine, `1;${thinkingColor}`)] : [];
     const thoughtStreamBlock = [];
 
     const todoMark = (status) =>
@@ -2682,7 +2722,7 @@ export class SimpleTui {
       approvalBlock.length > 0 ||
       clarificationBlock.length > 0 ||
       contextBlock.length > 0 ||
-      thinkingBlock.length > 0 ||
+      runningBlock.length > 0 ||
       thoughtStreamBlock.length > 0;
 
     const commandSuggestionBlock = this.commandSuggestionsVisible
@@ -2720,7 +2760,7 @@ export class SimpleTui {
 
     const beforeInputLines = [
       ...(errorLine ? [`\x1b[31m${errorLine}\x1b[0m`] : []),
-      ...thinkingBlock,
+      ...runningBlock,
       ...visibleLogs,
       ...todoLinesBlock,
       ...approvalBlock,
