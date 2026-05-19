@@ -28,6 +28,16 @@ function truncateLine(line, maxLen = 120) {
   return `${line.slice(0, maxLen - 3)}...`;
 }
 
+function formatDiffPreview(text, { maxLines = 80, maxLineLength = 160 } = {}) {
+  const lines = String(text || "").replace(/\r/g, "").split("\n");
+  const limit = Math.max(1, Number(maxLines) || 80);
+  const preview = lines.slice(0, limit).map((line) => `    ${c(COLORS.dim, truncateLine(line, maxLineLength))}`);
+  if (lines.length > limit) {
+    preview.push(`    ${c(COLORS.dim, `... (${lines.length - limit} more diff lines)`)}`);
+  }
+  return preview.join("\n");
+}
+
 function summarizeToolInput(tool, input, maxLen = 80) {
   const safe = input && typeof input === "object" ? input : {};
   let text = "";
@@ -583,9 +593,10 @@ export class Display {
       case "replace_in_files":
       case "write_file":
       case "git_status":
-      case "git_diff":
       case "run_tests":
         return `    ${dim(text)}`;
+      case "git_diff":
+        return formatDiffPreview(text, { maxLines: 80 });
       case "list_files": {
         const entries = text.split("\n").filter(Boolean);
         const preview = entries.slice(0, 8).map((l) => `    ${dim(l)}`);

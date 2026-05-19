@@ -4,6 +4,7 @@ import {
   createGoalRun,
   parseGoalStatus,
   resolveGoalMaxTurns,
+  summarizeGoalOutput,
 } from "../src/lib/goalMode.js";
 
 describe("goal mode helpers", () => {
@@ -18,12 +19,38 @@ describe("goal mode helpers", () => {
   });
 
   test("continuation prompt carries the prior status without unbounded output growth", () => {
-    const prompt = buildGoalContinuationPrompt("ship the feature", 7, "x".repeat(3000));
+    const prompt = buildGoalContinuationPrompt("ship the feature", 7, "x".repeat(3000), { maxIterations: 9 });
 
-    expect(prompt).toContain("Goal supervisor loop iteration 7");
+    expect(prompt).toContain("Goal supervisor loop iteration 7/9");
     expect(prompt).toContain("Goal: ship the feature");
-    expect(prompt.length).toBeLessThan(2200);
-    expect(prompt).toContain("Previous goal-mode response summary:");
+    expect(prompt.length).toBeLessThan(1900);
+    expect(prompt).toContain("Previous goal-mode checkpoint:");
+    expect(prompt).toContain("status: continue");
+  });
+
+  test("goal output summary keeps high-value evidence and status compact", () => {
+    const summary = summarizeGoalOutput([
+      "Long narrative ".repeat(300),
+      "Changed files: src/lib/goalMode.js, src/lib/tui.js",
+      "Validation: npm test -- --runTestsByPath __tests__/goalMode.test.js",
+      "GOAL_STATUS: complete",
+    ].join("\n"));
+
+    expect(summary).toContain("status: complete");
+    expect(summary).toContain("Changed files: src/lib/goalMode.js");
+    expect(summary).toContain("Validation: npm test");
+    expect(summary.length).toBeLessThan(1100);
+  });
+
+  test("continuation prompt can reuse a precomputed checkpoint", () => {
+    const prompt = buildGoalContinuationPrompt("ship the feature", 2, "raw output that should be ignored", {
+      maxIterations: 5,
+      checkpoint: "status: continue\nsummary: cached checkpoint",
+    });
+
+    expect(prompt).toContain("Goal supervisor loop iteration 2/5");
+    expect(prompt).toContain("summary: cached checkpoint");
+    expect(prompt).not.toContain("raw output that should be ignored");
   });
 
   test("parses the last explicit status line", () => {
@@ -52,6 +79,7 @@ describe("goal mode helpers", () => {
       goal: "fix the repo",
       iteration: 1,
       maxIterations: 9,
+      lastCheckpoint: "",
       status: "continue",
       planOnly: false,
     });

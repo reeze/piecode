@@ -46,6 +46,7 @@ import {
   buildGoalPrompt,
   createGoalRun,
   parseGoalStatus,
+  summarizeGoalOutput,
 } from "../lib/goalMode.js";
 import { getSessionDiff, parseToolResultDetails } from "./core.js";
 
@@ -1228,7 +1229,16 @@ export class WebAgentSession {
     const argAfter = (prefix) => normalized.slice(prefix.length).trim();
 
     if (lower === "/help") {
-      const lines = ["## Web Slash Commands", ...this.getSlashCommands().map((command) => `- \`${command.name}\`${command.description ? ` — ${command.description}` : ""}`)];
+      const pluginCommandCount = discoverPluginCommands(this.pluginIndex).size;
+      const skillCommandCount = discoverSkillCommands(this.skillIndex).size;
+      const lines = [
+        "## Web Slash Commands",
+        ...WEB_SLASH_COMMANDS.map((command) => `- \`${command.name}\`${command.description ? ` — ${command.description}` : ""}`),
+      ];
+      if (pluginCommandCount || skillCommandCount) {
+        lines.push("");
+        lines.push(`Discovered ${pluginCommandCount} plugin command(s) and ${skillCommandCount} skill command(s). Use \`/plugins commands\` or \`/skills commands\` to list them.`);
+      }
       return { handled: true, message: makeAssistantContent(lines) };
     }
     if (lower === "/sessions" || lower === "/session list" || lower === "/resume") {
@@ -1504,6 +1514,7 @@ export class WebAgentSession {
         const contentOut = typeof result === "string" ? result : JSON.stringify(result, null, 2);
         goalRun.lastOutput = contentOut;
         goalRun.status = parseGoalStatus(contentOut);
+        goalRun.lastCheckpoint = summarizeGoalOutput(contentOut);
         this.publish("log", { line: `[goal] status=${goalRun.status} turn=${goalRun.iteration}/${goalRun.maxIterations}` });
         if (goalRun.status === "complete" || goalRun.status === "blocked") break;
         if (goalRun.iteration >= goalRun.maxIterations) {
@@ -1511,7 +1522,10 @@ export class WebAgentSession {
           break;
         }
         goalRun.iteration += 1;
-        turnInput = buildGoalContinuationPrompt(goalRun.goal, goalRun.iteration, goalRun.lastOutput);
+        turnInput = buildGoalContinuationPrompt(goalRun.goal, goalRun.iteration, goalRun.lastOutput, {
+          maxIterations: goalRun.maxIterations,
+          checkpoint: goalRun.lastCheckpoint,
+        });
       }
       const contentOut = typeof result === "string" ? result : JSON.stringify(result, null, 2);
       const assistantMessage = { id: makeId("msg"), role: "assistant", content: contentOut, at: new Date().toISOString() };

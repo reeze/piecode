@@ -1,6 +1,6 @@
 const DEFAULT_GOAL_MAX_TURNS = 50;
 const MAX_GOAL_MAX_TURNS = 200;
-const PREVIOUS_OUTPUT_SUMMARY_CHARS = 1200;
+const PREVIOUS_OUTPUT_SUMMARY_CHARS = 900;
 
 function clampInteger(value, { min, max, fallback }) {
   const parsed = Number.parseInt(String(value ?? ""), 10);
@@ -12,6 +12,22 @@ function summarizeText(value, maxChars = PREVIOUS_OUTPUT_SUMMARY_CHARS) {
   const text = String(value || "").replace(/\s+/g, " ").trim();
   if (text.length <= maxChars) return text;
   return `${text.slice(0, Math.max(0, maxChars - 3))}...`;
+}
+
+export function summarizeGoalOutput(output, maxChars = PREVIOUS_OUTPUT_SUMMARY_CHARS) {
+  const text = String(output || "").replace(/\r/g, "").trim();
+  const status = parseGoalStatus(text);
+  const lines = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter(Boolean)
+    .filter((line) => !/^\s*GOAL_STATUS\s*:/i.test(line));
+  const evidenceLines = lines.filter((line) =>
+    /^(?:[-*]\s*)?(?:changed files?|files?|validation|verified|tests?|lint|build|smoke|evidence|blockers?|remaining risks?|risks?|next step|checklist|summary)\s*:/i.test(line)
+  );
+  const source = evidenceLines.length > 0 ? evidenceLines.slice(0, 14).join(" ") : lines.join(" ");
+  const summary = summarizeText(source, maxChars);
+  return [`status: ${status}`, `summary: ${summary || "<empty>"}`].join("\n");
 }
 
 export function resolveGoalMaxTurns(env = process.env) {
@@ -52,11 +68,13 @@ export function buildGoalPrompt(goal) {
   ].join("\n");
 }
 
-export function buildGoalContinuationPrompt(goal, iteration, previousOutput) {
+export function buildGoalContinuationPrompt(goal, iteration, previousOutput, options = {}) {
   const task = String(goal || "").trim();
-  const last = summarizeText(previousOutput, PREVIOUS_OUTPUT_SUMMARY_CHARS);
+  const maxIterations = Math.max(0, Number(options?.maxIterations) || 0);
+  const iterationLabel = maxIterations > 0 ? `${iteration}/${maxIterations}` : String(iteration);
+  const checkpoint = String(options?.checkpoint || "").trim() || summarizeGoalOutput(previousOutput, PREVIOUS_OUTPUT_SUMMARY_CHARS);
   return [
-    `Goal supervisor loop iteration ${iteration}: continue driving the long-running goal until accepted.`,
+    `Goal supervisor loop iteration ${iterationLabel}: continue driving the long-running goal until accepted.`,
     `Goal: ${task}`,
     "",
     "Use the conversation history, current TODO state, compact working state, and repository state as the source of truth.",
@@ -66,7 +84,8 @@ export function buildGoalContinuationPrompt(goal, iteration, previousOutput) {
     "If you cannot safely continue without user input or an external blocker, finish with GOAL_STATUS: blocked.",
     "Otherwise finish with GOAL_STATUS: continue.",
     "",
-    `Previous goal-mode response summary: ${last}`,
+    "Previous goal-mode checkpoint:",
+    checkpoint,
   ].join("\n");
 }
 
@@ -83,6 +102,7 @@ export function createGoalRun(goal, { env = process.env } = {}) {
     iteration: 1,
     maxIterations: resolveGoalMaxTurns(env),
     lastOutput: "",
+    lastCheckpoint: "",
     status: "continue",
     planOnly: false,
   };

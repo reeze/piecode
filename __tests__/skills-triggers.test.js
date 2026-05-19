@@ -43,6 +43,9 @@ describe('Skills trigger system', () => {
       const roots = resolveSkillRoots({}, '/workspace/project');
 
       expect(roots).toEqual(expect.arrayContaining([
+        '/workspace/project/.AGENTS/skills',
+        '/workspace/project/.Agents/skills',
+        '/workspace/project/.agents/skills',
         '/workspace/project/AGENTS/skills',
         '/workspace/project/Agents/skills',
         '/workspace/project/agents/skills',

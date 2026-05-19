@@ -652,13 +652,15 @@ function normalizeTimelineSpacing(lines) {
   let previousGroup = "";
 
   const classify = (line) => {
-    const plain = stripAnsi(String(line || "")).trimStart();
+    const stripped = stripAnsi(String(line || ""));
+    const plain = stripped.trimStart();
     if (!plain) return "blank";
-    if (/^(?:◆|\*)\s+Task:/i.test(plain)) return "task";
+    if (/^(?:◆|\*|❯)\s+(?:Task:\s*)?/i.test(plain)) return "task";
     if (/^(?:↳|->)\s+/.test(plain)) return "tool-result";
     if (/^(?:›|>)\s+/.test(plain)) return "tool";
+    if (/^(?:✓|\[ok\])\s+.*\b(?:done|completed|success|succeeded)\b/i.test(plain)) return "done-result";
     if (/^(?:•|\*|✓|×|\[ok\]|\[x\])\s+/.test(plain)) return "response";
-    if (/^\s{2,}\S/.test(String(line || ""))) return previousGroup || "continuation";
+    if (/^\s{2,}\S/.test(stripped)) return previousGroup || "continuation";
     return "content";
   };
 
@@ -670,6 +672,9 @@ function normalizeTimelineSpacing(lines) {
 
   for (const line of Array.isArray(lines) ? lines : []) {
     const group = classify(line);
+    if (result.length === 0 && group === "done-result") {
+      result.push("");
+    }
     if (result.length > 0 && shouldSeparateGroups(previousGroup, group) && result[result.length - 1] !== "") {
       result.push("");
     }
@@ -680,8 +685,31 @@ function normalizeTimelineSpacing(lines) {
   return result;
 }
 
+function highlightDiffLineForDisplay(line) {
+  const source = String(line ?? "");
+  if (source.startsWith("+") && !source.startsWith("+++")) return color(source, "32");
+  if (source.startsWith("-") && !source.startsWith("---")) return color(source, "31");
+  if (source.startsWith("@@")) return color(source, "1;36");
+  if (/^(diff --git|index |--- |\+\+\+ |# )/.test(source)) return color(source, "2;37");
+  return source;
+}
+
+function renderDiffLines(text, { maxLines = 120 } = {}) {
+  const lines = String(text || "").replace(/\r/g, "").split("\n");
+  const limit = Math.max(1, Number(maxLines) || 120);
+  const shown = lines.slice(0, limit).map((line) => highlightDiffLineForDisplay(line || " "));
+  if (lines.length > limit) {
+    shown.push(color(`... (${lines.length - limit} more diff lines)`, "2;37"));
+  }
+  return shown;
+}
+
 function highlightOverlaySectionLine(line) {
   const text = String(line || "");
+  if (text.startsWith("+") && !text.startsWith("+++")) return color(text, "32");
+  if (text.startsWith("-") && !text.startsWith("---")) return color(text, "31");
+  if (text.startsWith("@@")) return color(text, "1;36");
+  if (/^(diff --git|index |--- |\+\+\+ |# (?:Staged|Unstaged|Untracked))/i.test(text)) return color(text, "2;37");
   if (/^\s*SYSTEM:/i.test(text)) {
     return text.replace(/^\s*SYSTEM:/i, (m) => color(m.trim(), "1;30;46"));
   }
@@ -945,7 +973,7 @@ function timelineContinuationIndent(line) {
   if (!plain.trim()) return "";
   const leading = plain.match(/^\s*/)?.[0] || "";
   const trimmed = plain.slice(leading.length);
-  if (/^(?:◆|\*)\s+Task:/i.test(trimmed)) return leading;
+  if (/^(?:◆|\*|❯)\s+(?:Task:\s*)?/i.test(trimmed)) return leading;
   if (/^(?:↳|->)\s+/.test(trimmed)) return `${leading}  `;
   if (/^(?:›|>)\s+/.test(trimmed)) return `${leading}  `;
   const ordered = trimmed.match(/^(\d+[.)])\s+/);
@@ -999,6 +1027,8 @@ export class SimpleTui {
     this.lastError = "";
     this.lastTool = "";
     this.lastStatus = "Ready";
+    this.lastActivityAt = 0;
+    this.lastActivityLabel = "";
     this.taskStartedAt = 0;
     this.taskCompletedAt = 0;
     this.thinking = false;
@@ -1029,7 +1059,9 @@ export class SimpleTui {
     this.currentInput = "";
     this.thinkingTick = 0;
     this.thinkingTimer = null;
+    this.progressRefreshTimer = null;
     this.animateThinking = String(process.env.PIECODE_TUI_ANIMATION || "").trim() === "1";
+    this.progressRefreshMs = Math.max(1000, Number(process.env.PIECODE_TUI_PROGRESS_REFRESH_MS) || 5000);
     this.modelSuggestionsVisible = false;
     this.modelSuggestions = [];
     this.modelSuggestionIndex = 0;
@@ -1054,6 +1086,8 @@ export class SimpleTui {
       maxIterations: 0,
       status: "",
     };
+    this.lastGoalStatusKey = "";
+    this.lastGoalCompletionKey = "";
     this.projectInstructionsStatus = {
       state: "unknown",
       source: "AGENTS.md",
@@ -1126,9 +1160,15 @@ export class SimpleTui {
     for (const item of spacedTimelineLines) {
       this.timeline.push(item);
     }
+    if (timelineLines.length > 0) this.markActivity(timelineLines[0]);
     if (this.timeline.length > this.maxTimeline) {
       this.timeline = this.timeline.slice(this.timeline.length - this.maxTimeline);
     }
+  }
+
+  markActivity(label = "") {
+    this.lastActivityAt = Date.now();
+    this.lastActivityLabel = stripAnsi(String(label || "")).replace(/\s+/g, " ").trim();
   }
 
   scrollLines(delta) {
@@ -1164,12 +1204,15 @@ export class SimpleTui {
     this.thinking = true;
     this.thinkingStage = "model";
     this.lastStatus = "Model call in progress";
+    this.markActivity("model request");
+    this.startThinkingAnimation();
     this.render();
   }
 
   onToolUse(toolName) {
     this.lastTool = toolName || this.lastTool;
     this.lastStatus = `Using tool: ${toolName}`;
+    this.markActivity(toolName ? `tool ${toolName}` : "tool");
     this.render();
   }
 
@@ -1204,6 +1247,7 @@ export class SimpleTui {
     this.turnTokensSent = 0;
     this.turnTokensReceived = 0;
     this.turnStartedAt = Date.now();
+    this.markActivity("task started");
     this.render();
   }
 
@@ -1240,11 +1284,21 @@ export class SimpleTui {
     return `${(ms / 1000).toFixed(1)}s`;
   }
 
-  formatContextBannerLine({ label, status = "", body, suffix = "", width }) {
+  formatElapsedSinceLastActivity() {
+    if (!this.lastActivityAt) return "";
+    const ms = Math.max(0, Date.now() - this.lastActivityAt);
+    if (ms < 10000) return "";
+    const label = this.lastActivityLabel ? `: ${truncateLine(this.lastActivityLabel, 24)}` : "";
+    return ` · last update ${(ms / 1000).toFixed(1)}s ago${label}`;
+  }
+
+  formatContextBannerLine({ label, status = "", body, suffix = "", width, marker = this.symbols.task, showLabel = true }) {
     const normalizedBody = String(body || "").replace(/\s+/g, " ").trim();
     if (!normalizedBody) return "";
     const elapsed = this.formatElapsedSinceTurnStart();
-    const prefix = `${this.symbols.task} ${label}: ${status ? `${status} · ` : ""}`;
+    const labelPart = showLabel && label ? `${label}: ` : "";
+    const statusPart = status ? `${status} · ` : "";
+    const prefix = `${marker} ${labelPart}${statusPart}`;
     const trailing = `${suffix || ""} · ${elapsed}`;
     const fixedBudget = stringDisplayWidth(prefix) + stringDisplayWidth(trailing) + 4;
     const text = truncateLine(normalizedBody, Math.max(16, width - fixedBudget));
@@ -1258,35 +1312,93 @@ export class SimpleTui {
       status,
       body: this.currentTaskText,
       width,
+      marker: this.symbols.prompt,
+      showLabel: false,
     });
   }
 
   formatGoalContextLine(width) {
     const goal = this.goalStatus && typeof this.goalStatus === "object" ? this.goalStatus : {};
-    if (!goal.active || !goal.label) return "";
-    const status = String(goal.status || "active").trim().toLowerCase();
-    const displayStatus = status === "complete" ? "Done" : status === "blocked" ? "Blocked" : status === "maxed" ? "Maxed" : "Running";
-    const iteration = goal.maxIterations > 0 && goal.iteration > 0
-      ? ` · ${goal.iteration}/${goal.maxIterations}`
-      : goal.iteration > 0
-        ? ` · ${goal.iteration}`
-        : "";
+    if (!goal.active || !goal.label || this.isTerminalGoalStatus(goal.status)) return "";
     return this.formatContextBannerLine({
       label: "Goal",
-      status: displayStatus,
+      status: this.formatGoalDisplayStatus(goal.status),
       body: goal.label,
-      suffix: iteration,
+      suffix: this.formatGoalIterationSuffix(goal),
       width,
     });
+  }
+
+  isTerminalGoalStatus(status = "") {
+    const value = String(status || "").trim().toLowerCase();
+    return value === "complete" || value === "blocked" || value === "maxed";
+  }
+
+  formatGoalDisplayStatus(status = "") {
+    const value = String(status || "active").trim().toLowerCase();
+    if (value === "complete") return "Done";
+    if (value === "blocked") return "Blocked";
+    if (value === "maxed") return "Maxed";
+    return "Running";
+  }
+
+  formatGoalIterationSuffix(goal = {}) {
+    const iteration = Math.max(0, Number(goal.iteration) || 0);
+    const maxIterations = Math.max(0, Number(goal.maxIterations) || 0);
+    if (maxIterations > 0 && iteration > 0) {
+      const pct = Math.max(0, Math.min(100, Math.round((iteration / maxIterations) * 100)));
+      return ` · ${iteration}/${maxIterations} · ${pct}%`;
+    }
+    if (iteration > 0) return ` · ${iteration}`;
+    return "";
+  }
+
+  formatGoalTimelineLine(goal = {}) {
+    const label = String(goal.label || goal.goal || "").replace(/\s+/g, " ").trim();
+    if (!label) return "";
+    return `Goal: ${this.formatGoalDisplayStatus(goal.status)} · ${label}${this.formatGoalIterationSuffix(goal)}`;
   }
 
   visibleTimelineHasCurrentTask(lines = []) {
     const task = String(this.currentTaskText || "").replace(/\s+/g, " ").trim();
     if (!task || this.showRawLogs) return false;
-    return (Array.isArray(lines) ? lines : []).some((line) => {
+    const matchesTask = (value) => {
+      const plain = String(value || "")
+        .replace(/^(?:◆|\*|❯|>)\s+(?:Task:\s*)?/i, "")
+        .replace(/\.\.\./g, "")
+        .replace(/\s+/g, " ")
+        .trim();
+      if (!plain) return false;
+      if (plain.includes(task) || task.includes(plain)) return true;
+      return plain.length >= 24 && task.startsWith(plain);
+    };
+    let taskBlock = "";
+    const flush = () => {
+      const visible = matchesTask(taskBlock);
+      taskBlock = "";
+      return visible;
+    };
+    for (const line of Array.isArray(lines) ? lines : []) {
       const plain = stripAnsi(String(line || "")).replace(/\s+/g, " ").trim();
-      return /(?:Task:|Task ·)/i.test(plain) && plain.includes(task);
-    });
+      if (!plain) {
+        if (flush()) return true;
+        continue;
+      }
+      if (/^(?:◆|\*|❯|>)\s+(?:Task:\s*)?/i.test(plain)) {
+        if (flush()) return true;
+        taskBlock = plain;
+        if (matchesTask(taskBlock)) return true;
+        continue;
+      }
+      if (!taskBlock) continue;
+      if (/^(?:↳|->|›|>|•|✓|×|\[ok\]|\[x\]|\[i\])\s+/i.test(plain)) {
+        if (flush()) return true;
+        continue;
+      }
+      taskBlock = `${taskBlock} ${plain}`;
+      if (matchesTask(taskBlock)) return true;
+    }
+    return flush();
   }
 
   setLlmDebugEnabled(enabled) {
@@ -1322,8 +1434,10 @@ export class SimpleTui {
 
   setLiveThought(content) {
     const text = String(content || "").replace(/\s+/g, " ").trim();
+    const previous = this.thoughtStreamText.replace(/^Thinking:\s*/i, "");
     this.thoughtStreamVisible = false;
     this.thoughtStreamText = text ? `Thinking: ${text}` : "";
+    if (text && text !== previous) this.markActivity("model update");
     if (text) this.lastStatus = "thinking...";
     this.render();
   }
@@ -1351,19 +1465,37 @@ export class SimpleTui {
   }
 
   startThinkingAnimation() {
-    if (!this.animateThinking) return;
+    if (!this.animateThinking) {
+      this.startProgressRefresh();
+      return;
+    }
     if (this.thinkingTimer) return;
     this.thinkingTimer = setInterval(() => {
       if (!this.active || !this.thinking) return;
       this.thinkingTick = (this.thinkingTick + 1) % 5;
       this.render();
     }, 900);
+    this.thinkingTimer.unref?.();
   }
 
   stopThinkingAnimation() {
-    if (!this.thinkingTimer) return;
-    clearInterval(this.thinkingTimer);
-    this.thinkingTimer = null;
+    if (this.thinkingTimer) {
+      clearInterval(this.thinkingTimer);
+      this.thinkingTimer = null;
+    }
+    if (this.progressRefreshTimer) {
+      clearInterval(this.progressRefreshTimer);
+      this.progressRefreshTimer = null;
+    }
+  }
+
+  startProgressRefresh() {
+    if (this.progressRefreshTimer || !this.progressRefreshMs) return;
+    this.progressRefreshTimer = setInterval(() => {
+      if (!this.active || !this.thinking) return;
+      this.render();
+    }, this.progressRefreshMs);
+    this.progressRefreshTimer.unref?.();
   }
 
   setContextUsage(used, limit) {
@@ -1542,13 +1674,29 @@ export class SimpleTui {
 
   setGoalStatus(status = null) {
     const next = status && typeof status === "object" ? status : {};
-    this.goalStatus = {
+    const normalized = {
       active: Boolean(next.active),
       label: String(next.label || next.goal || "").trim(),
       iteration: Math.max(0, Number(next.iteration) || 0),
       maxIterations: Math.max(0, Number(next.maxIterations) || 0),
       status: String(next.status || "").trim().toLowerCase(),
     };
+    const statusKey = [normalized.active, normalized.label, normalized.iteration, normalized.maxIterations, normalized.status].join("\u0000");
+    if (statusKey === this.lastGoalStatusKey) return;
+    this.lastGoalStatusKey = statusKey;
+    if (normalized.active && this.isTerminalGoalStatus(normalized.status)) {
+      const completionKey = [normalized.status, normalized.label, normalized.iteration, normalized.maxIterations].join("\u0000");
+      if (completionKey !== this.lastGoalCompletionKey) {
+        const line = this.formatGoalTimelineLine(normalized);
+        if (line) this.event(`[result] ${line}`);
+        this.lastGoalCompletionKey = completionKey;
+      }
+      this.goalStatus = { ...normalized, active: false };
+    } else {
+      if (normalized.active) this.lastGoalCompletionKey = "";
+      if (!normalized.active) this.lastGoalStatusKey = "";
+      this.goalStatus = normalized;
+    }
     this.render();
   }
 
@@ -1972,7 +2120,12 @@ export class SimpleTui {
       const items = (Array.isArray(lines) ? lines : [lines]).map((item) => String(item || "")).filter(Boolean);
       if (items.length === 0) return [];
       const prefix = marker ? `${color(marker, markerColor)} ` : "";
-      return items.map((item, index) => (index === 0 ? `${prefix}${item}` : `  ${item}`));
+      return items.map((item, index) => (index === 0 ? `${prefix}${item}` : `    ${item}`));
+    };
+    const labeledTimelineItem = (marker, label, text, { markerColor = "2;37", labelColor = "1;36", textColor = "2;37" } = {}) => {
+      const body = String(text || "").trim();
+      if (!body) return [];
+      return timelineItem(marker, `${color(label, labelColor)} ${color(body, textColor)}`, markerColor);
     };
     const responseBlock = (marker, lines, markerColor = "1;32") => {
       const items = (Array.isArray(lines) ? lines : [lines]).map((item) => String(item || ""));
@@ -2043,49 +2196,53 @@ export class SimpleTui {
       }
       return trimWorkspaceText(raw.replace(/\s+/g, " "), maxLen).text;
     };
+    const toolDisplayName = (tool) => {
+      const name = String(tool || "tool");
+      switch (name) {
+        case "read_file":
+          return "Read";
+        case "read_files":
+          return "Read files";
+        case "list_files":
+          return "List";
+        case "glob_files":
+          return "Glob";
+        case "find_files":
+          return "Find";
+        case "rg":
+        case "grep":
+        case "search_files":
+          return "Search";
+        case "web_search":
+        case "search_web":
+          return "Web search";
+        case "subagent":
+          return "Subagent";
+        case "collaborate":
+          return "Agents";
+        case "git_status":
+          return "Git status";
+        case "git_diff":
+          return "Git diff";
+        case "run_tests":
+          return "Test";
+        case "edit_file":
+          return "Edit";
+        case "write_file":
+          return "Write";
+        case "apply_patch":
+          return "Patch";
+        case "replace_in_files":
+          return "Replace";
+        default:
+          return name;
+      }
+    };
     const toolLabel = (tool, details = "") => {
       const name = String(tool || "tool");
       const detail = compactToolDetail(name, details);
       const suffix = detail ? ` ${color(detail, "2;37")}` : "";
-      switch (name) {
-        case "read_file":
-          return `${color("Read", "36")}${suffix}`;
-        case "read_files":
-          return `${color("Read files", "36")}${suffix}`;
-        case "list_files":
-          return `${color("List", "36")}${suffix}`;
-        case "glob_files":
-          return `${color("Glob", "36")}${suffix}`;
-        case "find_files":
-          return `${color("Find", "36")}${suffix}`;
-        case "rg":
-        case "grep":
-        case "search_files":
-          return `${color("Search", "36")}${suffix}`;
-        case "web_search":
-        case "search_web":
-          return `${color("Web search", "36")}${suffix}`;
-        case "subagent":
-          return `${color("Subagent", "36")}${suffix}`;
-        case "collaborate":
-          return `${color("Agents", "36")}${suffix}`;
-        case "git_status":
-          return color("Git status", "36");
-        case "git_diff":
-          return `${color("Git diff", "36")}${suffix}`;
-        case "run_tests":
-          return `${color("Test", "36")}${suffix}`;
-        case "edit_file":
-          return `${color("Edit", "36")}${suffix}`;
-        case "write_file":
-          return `${color("Write", "36")}${suffix}`;
-        case "apply_patch":
-          return `${color("Patch", "36")}${suffix}`;
-        case "replace_in_files":
-          return `${color("Replace", "36")}${suffix}`;
-        default:
-          return `${color(name, "36")}${suffix}`;
-      }
+      return `${color(toolDisplayName(name), "36")}${suffix}`;
     };
     const summarizeToolBatch = (text) => {
       const body = String(text || "").trim();
@@ -2101,7 +2258,7 @@ export class SimpleTui {
         }
         const shown = names.slice(0, 3).join(", ");
         const more = names.length > 3 ? ` +${names.length - 3}` : "";
-        return `${match[1]} x${match[2]}${shown ? ` · ${shown}${more}` : ""}`;
+        return `${toolDisplayName(match[1])} x${match[2]}${shown ? ` · ${shown}${more}` : ""}`;
       }
       const first = body.split(/\s+-\s+/, 1)[0]?.trim();
       return trimWorkspaceText(first || body, 120).text.replace(/\n/g, " ");
@@ -2109,12 +2266,20 @@ export class SimpleTui {
     const summarizeToolResult = (text) => {
       const body = String(text || "").replace(/\r/g, "").trim();
       if (!body) return [];
-      if (this.showRawLogs) {
-        return body
+      const compactOutputLines = (source, { maxLines = 12 } = {}) => {
+        const lines = String(source || "")
+          .replace(/\r/g, "")
           .split("\n")
           .map((part) => part.trimEnd())
-          .filter((part) => part.trim())
-          .slice(0, 8);
+          .filter((part) => part.trim());
+        if (lines.length <= maxLines) return lines;
+        return [
+          ...lines.slice(0, maxLines),
+          `... ${lines.length - maxLines} more output lines`,
+        ];
+      };
+      if (this.showRawLogs) {
+        return compactOutputLines(body, { maxLines: 8 });
       }
       const savedMatch = body.match(/Result too long \(chars:\s*([0-9]+)\), saved to\s+(\S+)/i);
       if (savedMatch) return [`Output saved (${savedMatch[1]} chars) · ${savedMatch[2]}`];
@@ -2126,12 +2291,15 @@ export class SimpleTui {
       }
       const diffStat = body.match(/\b\d+\s+files?\s+changed\b[^\n]*/i)?.[0]
         || body.match(/\b\d+\s+insertions?\(\+\).*?\d+\s+deletions?\(-\)/i)?.[0];
+      if (/^diff --git\b|^# (?:Staged|Unstaged|Untracked) changes\b/im.test(body)) {
+        return renderDiffLines(body, { maxLines: 80 });
+      }
       if (diffStat) return [diffStat];
       const lines = body.split("\n").map((part) => part.trim()).filter(Boolean);
       if (lines.length === 1 && lines[0].length <= 120 && !/^command:|^exit_code:|^stdout:|^stderr:/i.test(lines[0])) {
         return [lines[0]];
       }
-      return [];
+      return compactOutputLines(body);
     };
     const compactJsonDetail = (text, keys = ["task", "path", "query", "pattern", "command"]) => {
       const source = String(text || "").trim();
@@ -2204,10 +2372,10 @@ export class SimpleTui {
     if (!line) return [];
     if (line.startsWith("[task] ")) {
       const width = Math.max(20, (this.out?.columns || 100) - 1);
-      const textWidth = Math.max(8, width - stringDisplayWidth(` ${this.symbols.task} Task:  `));
+      const textWidth = Math.max(8, width - stringDisplayWidth(` ${this.symbols.prompt}  `));
       const taskLines = wrapText(line.slice(7).trim(), textWidth);
       return taskLines.map((taskLine, index) => {
-        const prefix = index === 0 ? `${this.symbols.task} Task: ` : "  ";
+        const prefix = index === 0 ? `${this.symbols.prompt} ` : "  ";
         return colorFullLine(` ${prefix}${taskLine} `, "1;37;48;5;236", width);
       });
     }
@@ -2225,12 +2393,20 @@ export class SimpleTui {
     if (line.startsWith("[thought] ")) {
       const body = trimWorkspaceText(line.slice(10).trim(), 800).text;
       if (!body) return [];
-      return timelineItem(this.symbols.response, color(body, "35"), "1;35");
+      return labeledTimelineItem(this.symbols.response, "Thinking", body, {
+        markerColor: "1;35",
+        labelColor: "1;35",
+        textColor: "2;37",
+      });
     }
     if (line.startsWith("[progress] ")) {
       const body = trimWorkspaceText(line.slice(11).trim(), 800).text;
       if (!body) return [];
-      return timelineItem(this.symbols.response, color(body, "35"), "1;35");
+      return labeledTimelineItem(this.symbols.response, "Progress", body, {
+        markerColor: "1;35",
+        labelColor: "1;35",
+        textColor: "2;37",
+      });
     }
     if (line.startsWith("[run] ")) {
       const rawRun = line.slice(6).trim();
@@ -2251,8 +2427,12 @@ export class SimpleTui {
           : approval === "auto"
           ? color("[AUTO]", "2;32")
           : "";
-      const detail = safeDisplay ? ` ${color(safeDisplay, "36")}` : "";
-      return timelineItem(this.symbols.tool, `${color(run.label || "Tool", "1;36")}${detail}${tag ? ` ${tag}` : ""}`, "1;36");
+      const body = `${run.label || "Tool"}${safeDisplay ? ` ${safeDisplay}` : ""}${tag ? ` ${stripAnsi(tag)}` : ""}`;
+      return labeledTimelineItem(this.symbols.tool, "Run", body, {
+        markerColor: "1;36",
+        labelColor: "1;36",
+        textColor: "36",
+      });
     }
     if (line.startsWith("[tool] ")) {
       const body = line.slice(7).trim();
@@ -2265,15 +2445,36 @@ export class SimpleTui {
         return [];
       }
       const match = body.match(/^([a-zA-Z0-9_.-]+)\s*(.*)$/);
-      return timelineItem(this.symbols.tool, toolLabel(match?.[1] || body, match?.[2] || ""), "1;36");
+      return timelineItem(this.symbols.tool, `${color("Tool", "1;36")} ${toolLabel(match?.[1] || body, match?.[2] || "")}`, "1;36");
     }
     if (line.startsWith("[tools] ")) {
       const body = line.slice(8).trim();
       const summary = summarizeToolBatch(body);
-      return timelineItem(this.symbols.tool, `${color("Run", "1;36")}${summary ? ` ${summary}` : ""}`, "1;36");
+      return labeledTimelineItem(this.symbols.tool, "Tools", summary || "batch", {
+        markerColor: "1;36",
+        labelColor: "1;36",
+        textColor: "36",
+      });
     }
     if (line.startsWith("[agent] ")) {
       return timelineItem(this.symbols.agent, `${color("Agent", "1;35")} ${trimWorkspaceText(line.slice(8).trim(), 600).text}`, "1;35");
+    }
+    if (line.startsWith("[goal] ")) {
+      const body = line.slice(7).trim();
+      const statusMatch = body.match(/^status=([a-z]+)\s+turn=(\d+\/\d+)/i);
+      if (statusMatch) {
+        if (this.isTerminalGoalStatus(statusMatch[1])) return [];
+        return timelineItem(
+          this.symbols.task,
+          `${color("Goal", "1;36")} ${this.formatGoalDisplayStatus(statusMatch[1])} ${color(statusMatch[2], "2;37")}`,
+          "1;36"
+        );
+      }
+      const started = body.match(/^loop started\s+\(max\s+(\d+)\s+turns?\)/i);
+      if (started) {
+        return timelineItem(this.symbols.task, `${color("Goal loop started", "1;36")} ${color(`max ${started[1]} turns`, "2;37")}`, "1;36");
+      }
+      return timelineItem(this.symbols.task, `${color("Goal", "1;36")} ${color(trimWorkspaceText(body, 600).text, "2;37")}`, "1;36");
     }
     if (line.startsWith("[response] ")) {
       const text = trimWorkspaceText(line.slice(11).trim(), 8000).text;
@@ -2296,9 +2497,34 @@ export class SimpleTui {
       if (rendered.length === 0) return [];
       return timelineBlock(
         this.symbols.result,
-        rendered.map((part) => color(part.trimStart(), "2;37")),
+        rendered.map((part) => (ANSI_PATTERN.test(String(part || "")) ? String(part || "") : color(String(part || ""), "2;37"))),
         "2;37"
       );
+    }
+    if (line.startsWith("[help] ")) {
+      const body = line.slice(7).trim();
+      if (!body) return [];
+      if (body.startsWith("title:")) {
+        const title = body.slice(6).trim();
+        return timelineItem(this.symbols.subheading, color(title, "1;37"), "1;37");
+      }
+      if (body.startsWith("section:")) {
+        const section = body.slice(8).trim();
+        return section ? [`  ${color(section, "1;36")}`] : [];
+      }
+      if (body.startsWith("item:")) {
+        const item = body.slice(5).trim();
+        const [command, ...descriptionParts] = item.split(/\s+-\s+/);
+        const description = descriptionParts.join(" - ").trim();
+        return [
+          `  ${color(command.trim(), "1;32")}${description ? ` ${color(`- ${description}`, "2;37")}` : ""}`,
+        ];
+      }
+      if (body.startsWith("tip:")) {
+        const tip = body.slice(4).trim();
+        return tip ? [`  ${color(`tip: ${tip}`, "2;36")}`] : [];
+      }
+      return [`  ${color(body, "2;37")}`];
     }
     if (line.startsWith("[banner-1] ")) {
       let text = line.slice(11);
@@ -2532,6 +2758,14 @@ export class SimpleTui {
     return String(this.transientStatusNotice || "").trim();
   }
 
+  formatOverlayModeLabel() {
+    const mode = String(this.overlayMode || "").trim();
+    if (!mode) return "";
+    if (mode === "llm-debug") return "LLM debug";
+    if (mode === "help") return "Help";
+    return mode.replace(/[-_]+/g, " ");
+  }
+
   render(input = this.currentInput, status = "", cursorIndex = null) {
     if (!this.active) return;
     this.currentInput = String(input || "");
@@ -2557,7 +2791,16 @@ export class SimpleTui {
       const visible = wrapped
         .slice(this.overlayScroll, this.overlayScroll + viewport)
         .map((line) => highlightOverlaySectionLine(line));
-      const scrollLabel = ` lines ${Math.min(wrapped.length, this.overlayScroll + 1)}-${Math.min(wrapped.length, this.overlayScroll + visible.length)} / ${wrapped.length}`;
+      const modeLabel = this.formatOverlayModeLabel();
+      const aboveBelow = joinStatusParts([
+        this.overlayScroll > 0 ? "above" : "",
+        this.overlayScroll < maxStart ? "below" : "",
+      ]);
+      const scrollLabel = joinStatusParts([
+        modeLabel,
+        `lines ${Math.min(wrapped.length, this.overlayScroll + 1)}-${Math.min(wrapped.length, this.overlayScroll + visible.length)}/${wrapped.length}`,
+        aboveBelow ? `more:${aboveBelow}` : "",
+      ]);
       const statusLine = truncateLine(scrollLabel, width);
       const frameLines = [sep, `\x1b[1m${title}\x1b[0m`, sep, ...visible, sep, `\x1b[2m${statusLine}\x1b[0m`, `\x1b[2m${hint}\x1b[0m`];
       const frame = renderFrameLines(frameLines, width, height);
@@ -2609,36 +2852,47 @@ export class SimpleTui {
     const hintLines = !suppressBottomHints && this.inputHint ? 1 : 0;
     const rawGoalContextLine = this.formatGoalContextLine(width);
     const rawTaskContextLine = rawGoalContextLine ? "" : this.formatTaskContextLine(width);
-    const contextLines = (rawGoalContextLine || rawTaskContextLine) ? 2 : 0;
-    const thinkingLines = this.thinking ? 1 : 0;
-    const thoughtStreamLines = 0;
+    const runningLines = this.thinking ? 1 : 0;
     const inputState = this.buildInputState(this.currentInput, bottomWidth, cursorIndex);
     const inputLineCount = Math.max(1, inputState.lines.length);
     const bottomLines = inputLineCount + 2 + commandSuggestionLines + modelSuggestionLines + startupHintLines + hintLines; // input + separator + status/hints
-    const reservedLines =
+    const baseReservedLines =
       headerLines +
       todoBlockLines +
       approvalLines +
       clarificationLines +
-      contextLines +
-      thinkingLines +
-      thoughtStreamLines +
+      runningLines +
       bottomLines;
     const sourceLines = this.showRawLogs ? this.getWrappedLogLines(width) : this.getWrappedTimelineLines(width);
-    // Keep layout in natural flow (not sticky), but adapt visible workspace lines
-    // to the actual terminal space left after input/status blocks.
-    const viewportLogBudget = Math.max(1, height - reservedLines);
-    const maxLogLines = Math.max(1, Math.min(Math.max(1, sourceLines.length || 1), viewportLogBudget));
-    const maxScroll = Math.max(0, sourceLines.length - maxLogLines);
-    this.lastScrollMax = maxScroll;
-    this.lastScrollSourceLength = sourceLines.length;
-    this.scrollOffset = Math.min(Math.max(0, this.scrollOffset), maxScroll);
-    const start = Math.max(0, sourceLines.length - maxLogLines - this.scrollOffset);
-    const visibleLogs = sourceLines.slice(start, start + maxLogLines);
-    const taskContextLine = this.visibleTimelineHasCurrentTask(visibleLogs) ? "" : rawTaskContextLine;
     const goalContextLine = rawGoalContextLine;
-    const visibleStart = sourceLines.length === 0 ? 0 : start + 1;
-    const visibleEnd = Math.min(sourceLines.length, start + visibleLogs.length);
+    const selectLogWindow = (extraReservedLines = 0) => {
+      // Keep layout in natural flow (not sticky), but adapt visible workspace
+      // lines to the actual terminal space left after input/status blocks.
+      const viewportLogBudget = Math.max(1, height - baseReservedLines - extraReservedLines);
+      const maxLogLines = Math.max(1, Math.min(Math.max(1, sourceLines.length || 1), viewportLogBudget));
+      const maxScroll = Math.max(0, sourceLines.length - maxLogLines);
+      const scrollOffset = Math.min(Math.max(0, this.scrollOffset), maxScroll);
+      const start = Math.max(0, sourceLines.length - maxLogLines - scrollOffset);
+      const visibleLogs = sourceLines.slice(start, start + maxLogLines);
+      return {
+        maxLogLines,
+        maxScroll,
+        scrollOffset,
+        visibleLogs,
+        visibleStart: sourceLines.length === 0 ? 0 : start + 1,
+        visibleEnd: Math.min(sourceLines.length, start + visibleLogs.length),
+      };
+    };
+    let taskContextLine = "";
+    let logWindow = selectLogWindow(goalContextLine ? 2 : 0);
+    if (!goalContextLine && rawTaskContextLine && !this.visibleTimelineHasCurrentTask(logWindow.visibleLogs)) {
+      taskContextLine = rawTaskContextLine;
+      logWindow = selectLogWindow(2);
+    }
+    this.lastScrollMax = logWindow.maxScroll;
+    this.lastScrollSourceLength = sourceLines.length;
+    this.scrollOffset = logWindow.scrollOffset;
+    const { visibleLogs, visibleStart, visibleEnd, maxLogLines } = logWindow;
     const viewName = this.showRawLogs ? "raw" : "timeline";
     const scrollLabel = this.scrollOffset > 0
       ? ` | ${viewName}:${visibleStart}-${visibleEnd}/${sourceLines.length}`
@@ -2653,9 +2907,12 @@ export class SimpleTui {
     const todoStatus = this.todos.length > 0 ? `TODO(${todoDone}/${this.todos.length})` : "";
     const planStatus = this.planModeEnabled ? "plan:on" : "";
     const bashMode = /^\s*!/.test(this.currentInput) ? "mode:bash" : "";
+    const approvalLabel = typeof this.getApprovalLabel === "function" ? String(this.getApprovalLabel() || "").trim() : "";
+    const approvalStatus = approvalLabel ? `approve:${approvalLabel}` : "";
     const verboseStatus = joinStatusParts([
       this.lastStatus || "idle",
       planStatus,
+      approvalStatus,
       ctxStatus,
       todoStatus,
       bashMode,
@@ -2666,6 +2923,7 @@ export class SimpleTui {
       ctxStatus,
       todoStatus,
       this.planModeEnabled ? "plan" : "",
+      approvalLabel === "on" ? "approve:on" : "",
       /^\s*!/.test(this.currentInput) ? "bash" : "",
       this.scrollOffset > 0 ? scrollLabel.replace(/^\s*\|\s*/, "") : "",
     ]);
@@ -2676,11 +2934,11 @@ export class SimpleTui {
       const left = truncateLine(` ${leftStatusLabel}`, width);
       const fixedLeft = stringDisplayWidth(left);
       const rightBudget = Math.max(0, bottomWidth - fixedLeft - 1);
-      const right = truncateLine(`${promptStatusRaw}${bashMode}`, rightBudget);
+      const right = truncateLine(promptStatusRaw, rightBudget);
       const pad = Math.max(1, bottomWidth - fixedLeft - stringDisplayWidth(right));
       promptStatus = `${left}${" ".repeat(pad)}${right}`;
     } else {
-      const raw = `${promptStatusRaw}${bashMode}`;
+      const raw = promptStatusRaw;
       promptStatus =
         stringDisplayWidth(raw) >= bottomWidth
           ? truncateLine(raw, bottomWidth)
@@ -2696,8 +2954,9 @@ export class SimpleTui {
     const spin = spinFrames[this.thinkingTick % spinFrames.length];
     const thought = String(this.thoughtStreamText || "").trim();
     const thoughtSuffix = thought ? ` · ${truncateLine(thought.replace(/^Thinking:\s*/i, ""), Math.max(20, width - 46))}` : "";
-    const runningLine = ` ${spin} thinking${this.thinkingStage ? `:${this.thinkingStage}` : ""} · ${this.formatElapsedSinceTurnStart()}${thoughtSuffix}`;
-    const runningBlock = this.thinking ? [color(runningLine, `1;${thinkingColor}`)] : [];
+    const activitySuffix = this.formatElapsedSinceLastActivity();
+    const runningLine = ` ${spin} thinking${this.thinkingStage ? `:${this.thinkingStage}` : ""} · ${this.formatElapsedSinceTurnStart()}${activitySuffix}${thoughtSuffix}`;
+    const runningBlock = this.thinking ? [color(truncateLine(runningLine, bottomWidth), `1;${thinkingColor}`)] : [];
     const thoughtStreamBlock = [];
 
     const todoMark = (status) =>
@@ -2715,15 +2974,15 @@ export class SimpleTui {
           ].map((line) => truncateLine(line, width)),
         ]
       : [];
-    const hasWorkspaceContent =
+    const hasWorkspaceContentBeforeRunning =
       Boolean(errorLine) ||
       visibleLogs.length > 0 ||
       todoLinesBlock.length > 0 ||
       approvalBlock.length > 0 ||
       clarificationBlock.length > 0 ||
       contextBlock.length > 0 ||
-      runningBlock.length > 0 ||
       thoughtStreamBlock.length > 0;
+    const hasWorkspaceContent = hasWorkspaceContentBeforeRunning || runningBlock.length > 0;
 
     const commandSuggestionBlock = this.commandSuggestionsVisible
       ? [
@@ -2743,6 +3002,7 @@ export class SimpleTui {
             const label = current ? ` models <${current}>` : " models";
             return color(label, "2;37");
           })(),
+          truncateLine(` ${color("Enter switch | Tab/Up/Down select | Esc cancel", "2;37")}`, bottomWidth),
           ...(modelSuggestionViewport && modelSuggestionViewport.hiddenAbove > 0
             ? [truncateLine(` ${color(`... ${modelSuggestionViewport.hiddenAbove} above`, "2;37")}`, bottomWidth)]
             : []),
@@ -2760,14 +3020,15 @@ export class SimpleTui {
 
     const beforeInputLines = [
       ...(errorLine ? [`\x1b[31m${errorLine}\x1b[0m`] : []),
-      ...runningBlock,
       ...visibleLogs,
       ...todoLinesBlock,
       ...approvalBlock,
       ...clarificationBlock,
       ...contextBlock,
       ...thoughtStreamBlock,
-      ...(hasWorkspaceContent ? [""] : []),
+      ...(runningBlock.length > 0 && hasWorkspaceContentBeforeRunning ? [""] : []),
+      ...runningBlock,
+      ...(runningBlock.length === 0 && hasWorkspaceContent ? [""] : []),
       sep,
     ];
     const frameLines = [

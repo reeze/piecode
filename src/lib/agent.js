@@ -4,6 +4,7 @@ import { TaskPlanner } from "./taskPlanner.js";
 import { TurnEngine } from "./turnEngine.js";
 import { shouldPlanTaskMessage } from "./plannedTaskRunner.js";
 import { AgentManager } from "./agentManager.js";
+import { TeamManager } from "./teamManager.js";
 import { appendMemory, renderMemoryForPrompt } from "./memory.js";
 
 function summarizeToolUseNames(events = [], maxItems = 12) {
@@ -39,6 +40,7 @@ export class Agent {
     shellPermissionRef = null,
     subagentDepth = 0,
     agentManager = null,
+    teamManager = null,
     agentDefinitionsRef = null,
     currentAgentDefinition = null,
     getSteers = null,
@@ -61,6 +63,7 @@ export class Agent {
     this.shellPermissionRef = shellPermissionRef && typeof shellPermissionRef === "object" ? shellPermissionRef : { value: {} };
     this.subagentDepth = Math.max(0, Number.parseInt(String(subagentDepth), 10) || 0);
     this.agentManager = agentManager instanceof AgentManager ? agentManager : new AgentManager();
+    this.teamManager = teamManager instanceof TeamManager ? teamManager : new TeamManager();
     this.agentDefinitionsRef = agentDefinitionsRef && typeof agentDefinitionsRef === "object" ? agentDefinitionsRef : { value: [] };
     this.currentAgentDefinition = currentAgentDefinition && typeof currentAgentDefinition === "object" ? currentAgentDefinition : null;
     this.getSteers = typeof getSteers === "function" ? getSteers : null;

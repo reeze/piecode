@@ -16,10 +16,6 @@ const DEFAULT_OPENROUTER_BASE_URL =
 const DEFAULT_CODEX_MODEL = process.env.CODEX_MODEL || 'gpt-5.3-codex';
 const DEFAULT_CODEX_BACKEND_BASE_URL = 'https://chatgpt.com/backend-api';
 const CODEX_ACCOUNT_CLAIM = 'https://api.openai.com/auth';
-const DEFAULT_SEED_MODEL =
-  process.env.SEED_MODEL || 'doubao-seed-code-preview-latest';
-const DEFAULT_SEED_BASE_URL =
-  process.env.SEED_BASE_URL || 'https://ark.cn-beijing.volces.com/api/coding';
 const DEFAULT_MODEL_TIMEOUT_MS = Math.max(
   5_000,
   Number.parseInt(process.env.PIECODE_MODEL_TIMEOUT_MS || '120000', 10) ||
@@ -323,14 +319,6 @@ export function getReasoningEffortCapabilities({
       values: reasoningModel
         ? ['minimal', 'low', 'medium', 'high', 'xhigh']
         : ['low', 'medium', 'high'],
-      source: 'provider',
-    };
-  }
-
-  if (combined.includes('seed')) {
-    return {
-      supported: true,
-      values: ['low', 'medium', 'high'],
       source: 'provider',
     };
   }
@@ -1146,249 +1134,6 @@ function createOpenAICompatibleProvider({
   };
 }
 
-function buildSeedChatUrls(baseUrl) {
-  const base = (baseUrl || DEFAULT_SEED_BASE_URL).replace(/\/$/, '');
-  const urls = [];
-  if (base.endsWith('/chat/completions')) {
-    urls.push(base);
-  } else {
-    urls.push(`${base}/chat/completions`);
-    urls.push(`${base}/v1/chat/completions`);
-  }
-
-  if (base.includes('/api/coding')) {
-    try {
-      const u = new URL(base);
-      urls.push(`${u.origin}/api/v3/chat/completions`);
-    } catch {}
-  }
-
-  return [...new Set(urls)];
-}
-
-function extractAnthropicText(data) {
-  const blocks = Array.isArray(data?.content) ? data.content : [];
-  const text = blocks.find(
-    (b) => b?.type === 'text' && typeof b?.text === 'string'
-  )?.text;
-  return text || '';
-}
-
-function createSeedProvider({ model, apiKey, baseUrl, thinkingEffort = '', reasoningEfforts = null }) {
-  const resolvedModel = model || DEFAULT_SEED_MODEL;
-  const resolvedBase = baseUrl || DEFAULT_SEED_BASE_URL;
-  const effortContext = {
-    kind: 'seed-openai-compatible',
-    model: resolvedModel,
-    reasoningEfforts,
-  };
-  const effortCapabilities = getReasoningEffortCapabilities(effortContext);
-  const effectiveThinkingEffort = normalizeThinkingEffortForProvider(
-    thinkingEffort,
-    effortContext
-  );
-
-  return {
-    kind: 'seed-openai-compatible',
-    model: resolvedModel,
-    thinkingEffort: effectiveThinkingEffort,
-    reasoningEffortOptions: effortCapabilities.values,
-    supportsReasoningEffort: effortCapabilities.supported,
-    supportsNativeTools: true,
-    _lastUsage: null,
-    getLastUsage() {
-      return this._lastUsage || null;
-    },
-    async completeStream({
-      systemPrompt,
-      prompt,
-      messages,
-      tools,
-      onDelta,
-      signal,
-    }) {
-      this._lastUsage = null;
-      if (Array.isArray(messages) && Array.isArray(tools)) {
-        const nativeBody = {
-          model: resolvedModel,
-          temperature: 0.2,
-          stream: true,
-          messages: [{ role: 'system', content: systemPrompt }, ...messages],
-          tools,
-        };
-        let lastErr = null;
-        for (const url of buildSeedChatUrls(resolvedBase)) {
-          try {
-            const streamed = await postJsonStreamOpenAINative(
-              url,
-              { Authorization: `Bearer ${apiKey}` },
-              withReasoningEffort(nativeBody, thinkingEffort, effortContext),
-              onDelta,
-              { signal }
-            );
-            this._lastUsage = streamed.usage || null;
-            return {
-              type: 'native',
-              format: 'openai',
-              message: streamed.message,
-              finishReason: streamed.finishReason,
-              usage: this._lastUsage || null,
-            };
-          } catch (err) {
-            lastErr = err;
-            if (err?.status !== 404) break;
-          }
-        }
-        return this.complete({
-          systemPrompt,
-          prompt,
-          messages,
-          tools,
-          signal,
-        }).catch((err) => {
-          throw new Error(
-            `Seed native stream failed. Last stream error: ${lastErr?.message || 'unknown'}. Fallback error: ${err?.message || 'unknown'}`
-          );
-        });
-      }
-      const chatUrls = buildSeedChatUrls(resolvedBase);
-      const openaiBody = {
-        model: resolvedModel,
-        temperature: 0.2,
-        stream: true,
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: prompt },
-        ],
-      };
-
-      let lastErr = null;
-      for (const url of chatUrls) {
-        try {
-          const streamed = await postJsonStream(
-            url,
-            { Authorization: `Bearer ${apiKey}` },
-            withReasoningEffort(openaiBody, thinkingEffort, effortContext),
-            onDelta,
-            { signal }
-          );
-          this._lastUsage = streamed?.usage || null;
-          const text = String(streamed?.text || '');
-          if (text) return text;
-        } catch (err) {
-          lastErr = err;
-          if (err?.status !== 404) {
-            break;
-          }
-        }
-      }
-
-      // Fall back to non-stream mode when streaming is unavailable upstream.
-      return this.complete({ systemPrompt, prompt, signal }).catch((err) => {
-        throw new Error(
-          `Seed stream failed. Last stream error: ${lastErr?.message || 'unknown'}. Fallback error: ${err?.message || 'unknown'}`
-        );
-      });
-    },
-    async complete({ systemPrompt, prompt, messages, tools, signal }) {
-      this._lastUsage = null;
-      const useNative = Array.isArray(messages) && Array.isArray(tools);
-      const chatUrls = buildSeedChatUrls(resolvedBase);
-      const openaiBody = useNative
-        ? {
-            model: resolvedModel,
-            temperature: 0.2,
-            messages: [{ role: 'system', content: systemPrompt }, ...messages],
-            tools,
-          }
-        : {
-            model: resolvedModel,
-            temperature: 0.2,
-            messages: [
-              { role: 'system', content: systemPrompt },
-              { role: 'user', content: prompt },
-            ],
-          };
-
-      let lastErr = null;
-      for (const url of chatUrls) {
-        try {
-          const data = await postJson(
-            url,
-            { Authorization: `Bearer ${apiKey}` },
-            withReasoningEffort(openaiBody, thinkingEffort, effortContext),
-            { signal }
-          );
-          this._lastUsage = normalizeUsage(data?.usage);
-          if (useNative) {
-            const msg = data?.choices?.[0]?.message;
-            if (msg) {
-              return {
-                type: 'native',
-                format: 'openai',
-                message: msg,
-                finishReason: data?.choices?.[0]?.finish_reason,
-                usage: this._lastUsage || null,
-              };
-            }
-          }
-          const text = data?.choices?.[0]?.message?.content;
-          if (text) return text;
-        } catch (err) {
-          lastErr = err;
-          if (err?.status !== 404) {
-            break;
-          }
-        }
-      }
-
-      // Do not attempt Anthropic-text fallback for native tool calls.
-      // It needs `prompt` text and incompatible schema, causing misleading errors.
-      if (useNative) {
-        throw new Error(
-          `Seed provider native call failed. Tried: ${chatUrls.join(', ')}. Last error: ${lastErr?.message || 'unknown'}`
-        );
-      }
-
-      // Claude-compatible fallback for /api/coding deployments.
-      const anthropicUrl = `${resolvedBase.replace(/\/$/, '')}/v1/messages`;
-      const anthropicBody = {
-        model: resolvedModel,
-        max_tokens: 1600,
-        system: systemPrompt,
-        messages: [{ role: 'user', content: prompt }],
-      };
-      const anthHeaders = [
-        { 'x-api-key': apiKey, 'anthropic-version': '2023-06-01' },
-        {
-          Authorization: `Bearer ${apiKey}`,
-          'anthropic-version': '2023-06-01',
-        },
-      ];
-
-      for (const headers of anthHeaders) {
-        try {
-          const data = await postJson(
-            anthropicUrl,
-            headers,
-            anthropicBody,
-            { signal }
-          );
-          this._lastUsage = normalizeUsage(data?.usage);
-          const text = extractAnthropicText(data);
-          if (text) return text;
-        } catch (err) {
-          lastErr = err;
-        }
-      }
-
-      throw new Error(
-        `Seed provider failed. Tried: ${chatUrls.join(', ')}, ${anthropicUrl}. Last error: ${lastErr?.message || 'unknown'}`
-      );
-    },
-  };
-}
-
 function resolveCodexResponsesUrl(baseUrl) {
   const raw =
     baseUrl && String(baseUrl).trim()
@@ -1830,22 +1575,6 @@ export function getProvider(options = {}) {
       });
     }
 
-    if (provider === 'seed') {
-      const seedApiKey =
-        configuredApiKey || process.env.SEED_API_KEY || process.env.ARK_API_KEY;
-      if (!seedApiKey) {
-        throw new Error(
-          'Missing API key for seed provider. Set SEED_API_KEY or pass --api-key.'
-        );
-      }
-      return createSeedProvider({
-        model: configuredModel || DEFAULT_SEED_MODEL,
-        apiKey: seedApiKey,
-        baseUrl: configuredBaseUrl || DEFAULT_SEED_BASE_URL,
-        thinkingEffort: configuredThinkingEffort,
-      });
-    }
-
     if (provider === 'codex') {
       const codexAuth = loadCodexAuth();
       if (!prefersCodexCli()) {
@@ -1926,15 +1655,6 @@ export function getProvider(options = {}) {
           process.env.OPENROUTER_SITE_URL || 'https://piecode.local',
         'X-Title': process.env.OPENROUTER_APP_NAME || 'Piecode',
       },
-    });
-  }
-
-  if (process.env.SEED_API_KEY || process.env.ARK_API_KEY) {
-    return createSeedProvider({
-      model: configuredModel || DEFAULT_SEED_MODEL,
-      apiKey: process.env.SEED_API_KEY || process.env.ARK_API_KEY,
-      baseUrl: configuredBaseUrl || DEFAULT_SEED_BASE_URL,
-      thinkingEffort: configuredThinkingEffort,
     });
   }
 

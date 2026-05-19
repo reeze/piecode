@@ -518,7 +518,7 @@ function renderDiffHtml(diffText) {
     if (line.startsWith("@@")) cls += " hunk";
     else if (line.startsWith("+") && !line.startsWith("+++")) cls += " add";
     else if (line.startsWith("-") && !line.startsWith("---")) cls += " del";
-    else if (line.startsWith("diff --git") || line.startsWith("# ")) cls += " file";
+    else if (/^(diff --git|index |--- |\+\+\+ |# )/.test(line)) cls += " file";
     return `<span class="${cls}">${escapeHtml(line || " ")}</span>`;
   }).join("\n");
 }
@@ -630,6 +630,15 @@ function syncComposerState() {
   resizeComposerInput();
 }
 
+function formatDiffMeta(data = {}) {
+  const untrackedCount = Array.isArray(data.untrackedFiles) ? data.untrackedFiles.length : 0;
+  const hasTrackedChanges = Boolean(String(data.stagedDiff || "").trim() || String(data.unstagedDiff || "").trim());
+  const pieces = [hasTrackedChanges ? "tracked changes" : "no tracked changes"];
+  pieces.push(`${untrackedCount} untracked file${untrackedCount === 1 ? "" : "s"}`);
+  if (data.truncated) pieces.push(`truncated${data.omittedChars ? ` (${data.omittedChars} chars omitted)` : ""}`);
+  return `Generated ${timeLabel(data.generatedAt)} · ${pieces.join(" · ")}`;
+}
+
 function closeMobileActionSheet() {
   if (!el.mobileActionSheet) return;
   el.mobileActionSheet.hidden = true;
@@ -694,9 +703,7 @@ async function openDiffOverlay() {
       el.diffBody.innerHTML = `<div class="diff-empty">${escapeHtml(data.error)}</div>`;
       return;
     }
-    const untrackedCount = Array.isArray(data.untrackedFiles) ? data.untrackedFiles.length : 0;
-    const truncated = data.truncated ? ` · truncated${data.omittedChars ? ` (${data.omittedChars} chars omitted)` : ""}` : "";
-    el.diffMeta.textContent = `Generated ${timeLabel(data.generatedAt)} · ${untrackedCount} untracked file(s)${truncated}`;
+    el.diffMeta.textContent = formatDiffMeta(data);
     if (!String(data.diff || "").trim()) {
       el.diffBody.innerHTML = `<div class="diff-empty">No tracked changes or untracked files in this workspace.</div>`;
       return;
@@ -898,6 +905,7 @@ el.composer.addEventListener("submit", async (evt) => {
   const mode = state.running ? (attachments.length > 0 ? "queue" : "steer") : "normal";
   el.messageInput.value = "";
   syncComposerState();
+  renderSlashSuggestions();
   try {
     const result = await postJson("/api/messages", { message, planOnly: el.planOnly.checked, attachments, mode });
     if (result.queued) pushEvent("Queued next task");
@@ -906,6 +914,7 @@ el.composer.addEventListener("submit", async (evt) => {
   } catch (err) {
     el.messageInput.value = message;
     syncComposerState();
+    renderSlashSuggestions();
     upsertTimeline({ id: `local-error-${Date.now()}`, type: "message", role: "error", content: err.message, at: new Date().toISOString() });
   }
 });
@@ -978,7 +987,7 @@ el.composer.addEventListener("drop", (evt) => {
 });
 
 el.slashHelpBtn.addEventListener("click", () => {
-  applySuggestion("/help");
+  applySuggestion("/");
 });
 
 el.mobileMenuBtn?.addEventListener("click", () => {

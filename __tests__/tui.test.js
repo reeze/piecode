@@ -158,7 +158,7 @@ describe("tui usability", () => {
     });
 
     const compactBatch = stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0]);
-    expect(compactBatch).toContain("Run read_file x2");
+    expect(compactBatch).toContain("Tools Read x2");
     expect(compactBatch).toContain("a.txt, b.txt");
     tui.setRawLogsVisible(true);
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("README.md");
@@ -180,9 +180,9 @@ describe("tui usability", () => {
     tui.render();
 
     const rawFrame = out.writes[out.writes.length - 1] || "";
-    const taskLine = rawFrame.split("\n").find((line) => stripAnsi(line).includes("Task: short task"));
+    const taskLine = rawFrame.split("\n").find((line) => stripAnsi(line).includes(`${tui.symbols.prompt} short task`));
     expect(taskLine).toBeTruthy();
-    expect(taskLine).toMatch(/Task: short task\s+\x1b\[0m/);
+    expect(taskLine).toMatch(new RegExp(`${tui.symbols.prompt} short task\\s+\\x1b\\[0m`));
     expect(stripAnsi(taskLine).length).toBe(out.columns - 2);
   });
 
@@ -203,7 +203,8 @@ describe("tui usability", () => {
       expect(line).toMatch(/\s+\x1b\[0m$/);
       expect(stripAnsi(line).length).toBe(out.columns - 2);
     }
-    expect(stripAnsi(lines[0])).toContain("Task:");
+    expect(stripAnsi(lines[0])).toContain(tui.symbols.prompt);
+    expect(stripAnsi(lines[0])).not.toContain("Task:");
     expect(stripAnsi(lines[1])).not.toContain("Task:");
   });
 
@@ -225,7 +226,7 @@ describe("tui usability", () => {
 
     expect(tui.timeline).toContain("");
     const plain = tui.timeline.map((line) => stripAnsi(line));
-    const taskIdx = plain.findIndex((line) => line.includes("Task: improve readability"));
+    const taskIdx = plain.findIndex((line) => line.includes("improve readability"));
     const toolIdx = plain.findIndex((line) => line.includes("Read"));
     const resultIdx = plain.findIndex((line) => line.includes("1 file changed"));
     const responseIdx = plain.findIndex((line) => line.includes("Done"));
@@ -251,7 +252,7 @@ describe("tui usability", () => {
     ]);
 
     const plain = tui.timeline.map((line) => stripAnsi(line)).join("\n");
-    expect(plain).toContain("Task: previous request");
+    expect(plain).toContain(`${tui.symbols.prompt} previous request`);
     expect(plain).toContain("previous answer");
   });
 
@@ -307,7 +308,8 @@ describe("tui usability", () => {
     });
 
     const taskLineRaw = tui.formatTimelineLines("[task] simplify repo")[0];
-    expect(stripAnsi(taskLineRaw)).toContain("Task: simplify repo");
+    expect(stripAnsi(taskLineRaw)).toContain(`${tui.symbols.prompt} simplify repo`);
+    expect(stripAnsi(taskLineRaw)).not.toContain("Task:");
     expect(taskLineRaw).toContain("\x1b[1;37;48;5;236m");
     expect(stripAnsi(taskLineRaw).length).toBe(out.columns - 2);
     const okIcon = tui.symbols.ok;
@@ -325,13 +327,17 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines("[progress] Checking the UI path before editing")[0])).toContain(
       "Checking the UI path before editing"
     );
+    expect(stripAnsi(tui.formatTimelineLines("[progress] Checking the UI path before editing")[0])).toContain(
+      "Progress"
+    );
     expect(tui.formatTimelineLines("[tool] shell (echo hi)")).toEqual([]);
     expect(tui.formatTimelineLines("[tool] todo_write (3 todos)")).toEqual([]);
+    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("Tool");
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("Read README.md");
     expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).toContain("Search");
     expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).toContain("targetSymbol");
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (path=README.md)")[0])).toContain("Read README.md");
-    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("Run read_file x2");
+    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("Tools Read x2");
     expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("a.txt, b.txt");
     expect(stripAnsi(tui.formatTimelineLines('[tool] rg (pattern="targetSymbol" path="src")')[0])).toContain("targetSymbol in src");
     expect(stripAnsi(tui.formatTimelineLines('[tool] read_files (paths=["a.txt","b.txt","c.txt","d.txt"])')[0])).toContain("a.txt, b.txt, c.txt +1");
@@ -343,10 +349,24 @@ describe("tui usability", () => {
     expect(toolResultLine).toContain("1 file changed, 1 insertion(+), 1 deletion(-)");
     expect(toolResultLine.trim()).toMatch(/^(?:↳|->)\s+/);
     expect(toolResultLine).toMatch(/^\S/);
-    expect(tui.formatTimelineLines("[tool-result] line one\nline two")).toEqual([]);
+    expect(stripAnsi(tui.formatTimelineLines("[tool-result] Wrote 4481 bytes to index.html")[0])).toContain(
+      "Wrote 4481 bytes to index.html"
+    );
+    const multiLineToolOutput = tui.formatTimelineLines("[tool-result] line one\nline two\n  nested");
+    const plainMultiLineToolOutput = multiLineToolOutput.map((line) => stripAnsi(line));
+    expect(plainMultiLineToolOutput).toEqual(["↳ line one", "    line two", "      nested"]);
+    expect(plainMultiLineToolOutput.filter((line) => /^(?:↳|->)\s+/.test(line))).toHaveLength(1);
     expect(stripAnsi(
       tui.formatTimelineLines("[tool-result] Result too long (chars: 26343), saved to .piecode/shell/result-1.txt")[0]
     )).toContain("Output saved (26343 chars)");
+    expect(stripAnsi(tui.formatTimelineLines("[help] title: PieCode command map")[0])).toContain("PieCode command map");
+    expect(stripAnsi(tui.formatTimelineLines("[help] section: Model and runtime")[0])).toContain("Model and runtime");
+    expect(stripAnsi(tui.formatTimelineLines("[help] item: /model, /model list - switch or inspect models")[0])).toContain(
+      "/model, /model list - switch or inspect models"
+    );
+    expect(stripAnsi(tui.formatTimelineLines("[help] tip: type / to search commands")[0])).toContain(
+      "tip: type / to search commands"
+    );
     expect(stripAnsi(tui.formatTimelineLines("[banner-1] ██████")[0])).toContain("██████");
     expect(stripAnsi(tui.formatTimelineLines("[banner-meta] model: seed:model")[0])).toContain("model: seed:model");
     expect(stripAnsi(tui.formatTimelineLines("[banner-hint] keys: CTRL+L | !cmd shell")[0])).toContain("keys: CTRL+L");
@@ -358,7 +378,7 @@ describe("tui usability", () => {
     expect(latestFrame(out)).not.toContain("keys: CTRL+L logs | CTRL+T todos");
     expect(tui.formatTimelineLines("[thinking] internal details")).toEqual([]);
     expect(tui.formatTimelineLines("[thinking] request:turn payload-here")).toEqual([]);
-    expect(stripAnsi(tui.formatTimelineLines("[thought] I should inspect files first")[0])).toContain("I should inspect files first");
+    expect(stripAnsi(tui.formatTimelineLines("[thought] I should inspect files first")[0])).toContain("Thinking I should inspect files first");
     expect(stripAnsi(tui.formatTimelineLines("[agent] start subagent-1: inspect providers")[0])).toContain("Agent start subagent-1");
     const markdownResponse = stripAnsi(
       tui.formatTimelineLines("[response] ## Title\n- **bold** and `code`")[1]
@@ -392,6 +412,25 @@ describe("tui usability", () => {
     const rawDiffResponse = tui.formatTimelineLines("[response] ```diff\n-old\n+new\n```").join("\n");
     expect(rawDiffResponse).toContain("\x1b[31m-old\x1b[0m");
     expect(rawDiffResponse).toContain("\x1b[32m+new\x1b[0m");
+    const rawGitDiffToolResult = tui.formatTimelineLines([
+      "[tool-result] diff --git a/file.js b/file.js",
+      "index 1111111..2222222 100644",
+      "--- a/file.js",
+      "+++ b/file.js",
+      "@@ -1 +1 @@",
+      "-old",
+      "+new",
+    ].join("\n")).join("\n");
+    expect(rawGitDiffToolResult).toContain("\x1b[31m-old\x1b[0m");
+    expect(rawGitDiffToolResult).toContain("\x1b[32m+new\x1b[0m");
+    expect(rawGitDiffToolResult).toContain("\x1b[1;36m@@ -1 +1 @@\x1b[0m");
+    const rawLargeDiffToolResult = tui.formatTimelineLines([
+      "[tool-result] diff --git a/file.js b/file.js",
+      ...Array.from({ length: 100 }, (_v, idx) => `+line-${idx + 1}`),
+    ].join("\n")).join("\n");
+    expect(rawLargeDiffToolResult).toContain("more diff lines");
+    expect(rawLargeDiffToolResult).toContain("\x1b[32m+line-1");
+    expect(rawLargeDiffToolResult).not.toContain("+line-100");
     const hrResponse = stripAnsi(tui.formatTimelineLines("[response] before\n------\nafter").join("\n"));
     expect(hrResponse).toContain("before");
     expect(hrResponse).toContain("after");
@@ -531,6 +570,67 @@ describe("tui usability", () => {
     expect(frame).toContain("Response:");
     expect(frame).toContain("Thinking Output:");
     expect(frame).toContain("n/p: switch entry");
+    expect(stripAnsi(frame)).toContain("LLM debug");
+  });
+
+  test("help overlay text renders immediately after startup content", () => {
+    const out = createOut(80, 22);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.event("[banner-title-inline] Pie Code  let's cook");
+    tui.event("[banner-meta] model: seed:model");
+    tui.setStartupShortcutHint("keys: CTRL+L timeline/raw | CTRL+T todos | CTRL+O debug | /model switch | /help map");
+    tui.start();
+    tui.openOverlay(
+      "PieCode command map",
+      [
+        "## PieCode command map",
+        "",
+        "### Essentials",
+        "- `/help`, `/status`, `/clear`, `/compact`, `/exit` - session basics",
+        "### Model and runtime",
+        "- `/model`, `/model list` - switch or inspect models",
+      ].join("\n"),
+      { mode: "help", hint: " j/k: scroll  ctrl-f/b: page  q: close " }
+    );
+
+    const frame = latestFrame(out);
+    expect(frame).toContain("PieCode command map");
+    expect(frame).toContain("Essentials");
+    expect(frame).toContain("/help, /status, /clear, /compact, /exit");
+    expect(frame).toContain("Help");
+    expect(frame).toContain("q: close");
+    expect(frame).not.toContain("Pie Code  let's cook");
+  });
+
+  test("overlay status exposes scroll direction when debug content overflows", () => {
+    const out = createOut(80, 12);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.openOverlay(
+      "LLM Debug 1/1",
+      Array.from({ length: 40 }, (_v, i) => `line-${i + 1}`).join("\n"),
+      { mode: "llm-debug" }
+    );
+    expect(stripAnsi(latestFrame(out))).toContain("more:below");
+
+    tui.scrollOverlayLines(10);
+    const frame = stripAnsi(latestFrame(out));
+    expect(frame).toContain("more:above");
+    expect(frame).toContain("more:above | below");
   });
 
   test("overlay slash search jumps to matching content", () => {
@@ -818,6 +918,8 @@ describe("tui usability", () => {
       tui.onThinking("tool");
       expect(tui.thinking).toBe(true);
       expect(tui.thinkingTimer).toBeNull();
+      expect(tui.progressRefreshTimer).toBeTruthy();
+      tui.stop();
     });
   });
 
@@ -902,10 +1004,28 @@ describe("tui usability", () => {
     const frame = latestFrame(out);
     expect(frame).toContain("ctx:88/100(88%)");
     expect(frame).toContain("Task completed");
-    expect(frame).toContain("Goal: Running · optimize UI design in tui · 2/4");
+    expect(frame).toContain("Goal: Running · optimize UI design in tui · 2/4 · 50%");
     expect(frame).not.toContain("goal:continue");
     expect(frame).not.toContain("mode:bash");
     expect(frame).not.toContain("plan:on");
+  });
+
+  test("wide status row exposes approval and avoids duplicate mode labels", () => {
+    const out = createOut(120, 24);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "on",
+    });
+
+    tui.start();
+    tui.renderInput("!echo hi", 8);
+
+    const frame = stripAnsi(latestFrame(out));
+    expect(frame).toContain("approve:on");
+    expect(frame.match(/mode:bash/g)).toHaveLength(1);
   });
 
   test("context usage is capped at 100% in the status bar", () => {
@@ -955,7 +1075,7 @@ describe("tui usability", () => {
     expect(frame).not.toContain("TODO(");
   });
 
-  test("active goal renders before input instead of in the status bar", () => {
+  test("active goal renders before input and terminal goals move to timeline", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
       out,
@@ -974,12 +1094,13 @@ describe("tui usability", () => {
       status: "continue",
     });
     let frame = latestFrame(out);
-    expect(frame).toContain("Goal: Running · add goal status indicator · 2/5");
+    expect(frame).toContain("Goal: Running · add goal status indicator · 2/5 · 40%");
     expect(frame).not.toContain("goal:continue");
 
     tui.onThinking("turn");
     frame = latestFrame(out);
-    expect(frame.indexOf("thinking")).toBeLessThan(frame.indexOf("Goal: Running · add goal status indicator"));
+    expect(frame.indexOf("Goal: Running · add goal status indicator")).toBeLessThan(frame.indexOf("thinking"));
+    expect(frame.indexOf("thinking")).toBeLessThan(frame.indexOf("❯"));
     tui.onThinkingDone();
 
     tui.setGoalStatus({
@@ -990,13 +1111,49 @@ describe("tui usability", () => {
       status: "complete",
     });
     frame = latestFrame(out);
-    expect(frame).toContain("Goal: Done · add goal status indicator · 5/5");
+    expect(frame).toContain(`${tui.symbols.ok} Goal: Done · add goal status indicator · 5/5 · 100%`);
+    {
+      const lines = tui.timeline.map((line) => stripAnsi(line));
+      const doneLineIndex = lines.findIndex((line) => line.includes("Goal: Done · add goal status indicator"));
+      expect(doneLineIndex).toBeGreaterThan(0);
+      expect(lines[doneLineIndex - 1].trim()).toBe("");
+    }
+    expect(frame).not.toMatch(/Goal: Done · add goal status indicator · 5\/5 · 100%\s*\n[-─]+\s*\n\s*❯/);
     expect(frame).not.toContain("goal:complete");
 
     tui.setGoalStatus(null);
     frame = latestFrame(out);
-    expect(frame).not.toContain("Goal:");
+    expect(frame).toContain(`${tui.symbols.ok} Goal: Done · add goal status indicator · 5/5 · 100%`);
     expect(frame).not.toContain("goal:");
+  });
+
+  test("goal events render visibly and duplicate active status avoids repaint", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.event("[goal] loop started (max 9 turns)");
+    tui.event("[goal] status=continue turn=2/9");
+    tui.event("[goal] status=complete turn=9/9");
+    tui.render();
+    let frame = stripAnsi(latestFrame(out));
+    expect(frame).toContain("Goal loop started max 9 turns");
+    expect(frame).toContain("Goal Running 2/9");
+    expect(frame).not.toContain("Goal Done 9/9");
+
+    tui.setGoalStatus({ active: true, label: "ship goal mode", iteration: 2, maxIterations: 9, status: "continue" });
+    const writesAfterFirst = out.writes.length;
+    tui.setGoalStatus({ active: true, label: "ship goal mode", iteration: 2, maxIterations: 9, status: "continue" });
+    expect(out.writes).toHaveLength(writesAfterFirst);
+
+    frame = stripAnsi(latestFrame(out));
+    expect(frame).toContain("Goal: Running · ship goal mode · 2/9 · 22%");
   });
 
   test("all completed todos show status-bar notice without timeline completion event", () => {
@@ -1147,13 +1304,12 @@ describe("tui usability", () => {
     tui.event("[task] create a small CLI calculator");
     tui.onToolUse("write_file");
     let frame = latestFrame(out);
-    expect(frame).toContain("Task");
     expect(frame).toContain("create a small CLI calculator");
     expect(frame).toContain("Using tool: write_file");
     expect(frame).not.toContain("Done");
     let rawTaskContextLine = (out.writes[out.writes.length - 1] || "")
       .split("\n")
-      .find((line) => stripAnsi(line).includes("Task: create a small CLI calculator ·"));
+      .find((line) => stripAnsi(line).includes(`${tui.symbols.prompt} create a small CLI calculator ·`));
     expect(rawTaskContextLine).toBeUndefined();
 
     for (let i = 0; i < 30; i += 1) {
@@ -1163,19 +1319,68 @@ describe("tui usability", () => {
     frame = latestFrame(out);
     rawTaskContextLine = (out.writes[out.writes.length - 1] || "")
       .split("\n")
-      .find((line) => stripAnsi(line).includes("Task: create a small CLI calculator ·"));
+      .find((line) => stripAnsi(line).includes(`${tui.symbols.prompt} create a small CLI calculator ·`));
     expect(rawTaskContextLine).toContain("\x1b[1;37;48;5;236m");
-    expect(rawTaskContextLine).toMatch(/Task: create a small CLI calculator.*\s+\x1b\[0m/);
+    expect(stripAnsi(rawTaskContextLine)).toContain(`${tui.symbols.prompt} create a small CLI calculator`);
     expect(stripAnsi(rawTaskContextLine).length).toBe(out.columns - 2);
 
     tui.onTurnSuccess(1234);
     frame = latestFrame(out);
-    expect(frame).toContain("Task: Done · create a small CLI calculator");
+    expect(frame).toContain(`${tui.symbols.prompt} Done · create a small CLI calculator`);
     rawTaskContextLine = (out.writes[out.writes.length - 1] || "")
       .split("\n")
-      .find((line) => stripAnsi(line).includes("Task: Done · create a small CLI calculator"));
+      .find((line) => stripAnsi(line).includes(`${tui.symbols.prompt} Done · create a small CLI calculator`));
     expect(rawTaskContextLine).toContain("\x1b[1;37;48;5;236m");
     expect(stripAnsi(rawTaskContextLine).length).toBe(out.columns - 2);
+  });
+
+  test("task context stays hidden when the visible timeline task wraps", () => {
+    const out = createOut(72, 16);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+    const task =
+      "Create a single-file browser Snake game in index.html with keyboard controls score restart and dark arcade styling";
+
+    tui.start();
+    tui.event(`[task] ${task}`);
+    tui.onToolUse("write_file");
+
+    const frame = stripAnsi(latestFrame(out));
+    expect(frame).toContain(`${tui.symbols.prompt} Create a single-file browser Snake game`);
+    expect(frame).toContain("controls score restart and dark arcade styling");
+    expect(frame).not.toContain("Task:");
+  });
+
+  test("hidden task context rows are reclaimed while thinking", () => {
+    const out = createOut(80, 16);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.event("[task] optimize piecode tui workflow rows");
+    for (let i = 1; i <= 8; i += 1) {
+      tui.event(`line-${i}`);
+    }
+    tui.onThinking("turn");
+
+    const frame = latestFrame(out);
+    expect(frame).toContain(`${tui.symbols.prompt} optimize piecode tui workflow rows`);
+    expect(frame).toContain("line-1");
+    expect(frame).toContain("line-8");
+    expect(frame).not.toContain("Task:");
+    expect(tui.lastScrollMax).toBe(0);
+    expect(tui.lastFrameLineCount).toBeLessThanOrEqual(out.rows);
+    tui.stop();
   });
 
   test("task context shows failed after task error", () => {
@@ -1195,10 +1400,10 @@ describe("tui usability", () => {
     }
     tui.onTurnError("boom", 1200);
     const frame = latestFrame(out);
-    expect(frame).toContain("Task: Failed · inspect repo");
+    expect(frame).toContain(`${tui.symbols.prompt} Failed · inspect repo`);
   });
 
-  test("running indicator is rendered in workspace while thinking", () => {
+  test("running indicator is rendered before the input while thinking", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
       out,
@@ -1212,11 +1417,18 @@ describe("tui usability", () => {
     tui.event("[task] inspect repo");
     tui.onThinking("turn");
     const frame = latestFrame(out);
-    expect(frame).toContain("Task: inspect repo");
+    expect(frame).toContain(`${tui.symbols.prompt} inspect repo`);
     expect(frame).toContain("thinking");
-    const workspaceLines = frame.split("\n").filter((line) => line.includes("thinking") || line.includes("Task: inspect repo"));
-    expect(workspaceLines[0]).toContain("thinking");
-    expect(workspaceLines[1]).toContain("Task: inspect repo");
+    const lines = frame.split("\n").map((line) => stripAnsi(line));
+    const thinkingLineIndex = lines.findIndex((line) => line.includes("thinking"));
+    const taskLineIndex = lines.findIndex((line) => line.includes(`${tui.symbols.prompt} inspect repo`));
+    const inputLineIndex = lines.findIndex((line) => line.includes("继续描述你想改什么"));
+    const relevantLines = lines.filter((line) => line.includes("thinking") || line.includes(`${tui.symbols.prompt} inspect repo`) || line.includes("继续描述你想改什么"));
+    expect(relevantLines[0]).toContain(`${tui.symbols.prompt} inspect repo`);
+    expect(thinkingLineIndex).toBeLessThan(inputLineIndex);
+    expect(thinkingLineIndex).toBeGreaterThan(taskLineIndex + 1);
+    expect(lines[thinkingLineIndex - 1].trim()).toBe("");
+    expect(lines[thinkingLineIndex + 1]).toMatch(/[-─]{8,}/);
     expect(frame).not.toContain("↳ | ");
     expect(frame).not.toContain(" | tok ↑0 ↓0");
     tui.onThinkingDone();
@@ -1321,7 +1533,7 @@ describe("tui usability", () => {
     expect(lastWrite).toContain(`\x1b[${tui.lastInputRow};10H`);
   });
 
-  test("live thought content is transient while progress entries persist in timeline", () => {
+  test("tool progress prefers one durable run entry while live thoughts remain transient", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
       out,
@@ -1339,14 +1551,41 @@ describe("tui usability", () => {
     expect(frame).toContain("inspect files first");
     expect(tui.timeline.map(stripAnsi).join("\n")).not.toContain("inspect files first");
     expect(tui.thoughtStreamVisible).toBe(false);
-    tui.event("[progress] inspect files first");
+
+    tui.event("[run] read file src/lib/tui.js");
+    tui.render();
     frame = latestFrame(out);
-    expect(tui.timeline.map(stripAnsi).join("\n")).toContain("inspect files first");
-    expect(frame).toContain("inspect files first");
+    const timeline = tui.timeline.map(stripAnsi).join("\n");
+    expect(timeline).toContain("Read src/lib/tui.js");
+    expect(timeline).not.toContain("about to read");
+    expect(frame).toContain("Read src/lib/tui.js");
+
     tui.clearLiveThought();
     frame = latestFrame(out);
     expect(tui.thoughtStreamVisible).toBe(false);
-    expect(tui.timeline.map(stripAnsi).join("\n")).toContain("inspect files first");
+    expect(tui.timeline.map(stripAnsi).join("\n")).toContain("Read src/lib/tui.js");
+    tui.stop();
+  });
+
+  test("running indicator shows stale activity age", () => {
+    const out = createOut(100, 28);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.onThinking("turn");
+    tui.lastActivityAt = Date.now() - 15000;
+    tui.lastActivityLabel = "tool write_file";
+    tui.render();
+
+    const frame = stripAnsi(latestFrame(out));
+    expect(frame).toContain("last update");
+    expect(frame).toContain("tool write_file");
     tui.stop();
   });
 

@@ -52,6 +52,37 @@ describe("web app approval and clarification contract", () => {
     expect(applySuggestion).toContain("syncComposerState();");
   });
 
+  test("composer clears stale slash suggestions after submit", async () => {
+    const script = await fs.readFile("src/web/public/app.js", "utf8");
+    const start = script.indexOf('el.composer.addEventListener("submit"');
+    const end = script.indexOf('el.messageInput.addEventListener("input"', start);
+    const submitHandler = script.slice(start, end);
+
+    expect(start).toBeGreaterThanOrEqual(0);
+    expect(end).toBeGreaterThan(start);
+    expect(submitHandler).toContain('el.messageInput.value = "";');
+    expect(submitHandler).toContain("renderSlashSuggestions();");
+  });
+
+  test("commands button opens slash picker instead of inserting help command", async () => {
+    const script = await fs.readFile("src/web/public/app.js", "utf8");
+
+    expect(script).toContain('el.slashHelpBtn.addEventListener("click", () => {\n  applySuggestion("/");\n});');
+    expect(script).not.toContain('el.slashHelpBtn.addEventListener("click", () => {\n  applySuggestion("/help");\n});');
+  });
+
+  test("diff overlay summarizes tracked and untracked changes", async () => {
+    const script = await fs.readFile("src/web/public/app.js", "utf8");
+
+    expect(script).toContain("function formatDiffMeta(data = {})");
+    expect(script).toContain('hasTrackedChanges ? "tracked changes" : "no tracked changes"');
+    expect(script).toContain('el.diffMeta.textContent = formatDiffMeta(data);');
+    expect(script).toContain('function renderDiffHtml(diffText)');
+    expect(script).toContain('cls += " add"');
+    expect(script).toContain('cls += " del"');
+    expect(script).toContain('cls += " hunk"');
+  });
+
   test("frontend exposes plugin commands in fallback suggestions and status metadata", async () => {
     const script = await fs.readFile("src/web/public/app.js", "utf8");
     const html = await fs.readFile("src/web/public/index.html", "utf8");

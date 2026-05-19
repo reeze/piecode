@@ -140,6 +140,7 @@ describe('Prompt functions', () => {
       expect(prompt).toContain('DONE CRITERIA');
       expect(prompt).toContain('USER-FACING PROGRESS CONTRACT');
       expect(prompt).toContain('surface progress in phases');
+      expect(prompt).toContain('Do not repeat the same progress sentence');
       expect(prompt).toContain('Final responses should be user-friendly');
       expect(prompt).toContain('The harness will show that sentence as progress');
       expect(prompt).toContain('changed files, validation, blockers, and next step');
@@ -162,6 +163,7 @@ describe('Prompt functions', () => {
       expect(prompt).toContain('write_file is for new files or explicit rewrites');
       expect(prompt).toContain('Before tool calls, say what context you are gathering');
       expect(prompt).toContain('include a non-empty `thought` field');
+      expect(prompt).toContain('Do not duplicate the same progress sentence');
       expect(prompt).toContain('show diffs only when the user asks for review');
     });
   });

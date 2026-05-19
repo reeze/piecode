@@ -42,6 +42,53 @@ function nextGraphemeIndex(text, cursor) {
   return source.length;
 }
 
+function splitLineRanges(text) {
+  const source = String(text || "");
+  const out = [];
+  let start = 0;
+  for (let i = 0; i <= source.length; i += 1) {
+    if (i === source.length || source[i] === "\n") {
+      out.push({ start, end: i, text: source.slice(start, i) });
+      start = i + 1;
+    }
+  }
+  return out.length > 0 ? out : [{ start: 0, end: 0, text: "" }];
+}
+
+function graphemeColumn(text, offset) {
+  const safeOffset = Math.max(0, Math.min(String(text || "").length, Number(offset) || 0));
+  let column = 0;
+  for (const boundary of graphemeBoundaries(text)) {
+    if (boundary <= 0) continue;
+    if (boundary > safeOffset) break;
+    column += 1;
+  }
+  return column;
+}
+
+function offsetForGraphemeColumn(text, column) {
+  const safeColumn = Math.max(0, Math.floor(Number(column) || 0));
+  const boundaries = graphemeBoundaries(text);
+  return boundaries[Math.min(safeColumn, boundaries.length - 1)] || 0;
+}
+
+function cursorPosition(text, cursor) {
+  const source = String(text || "");
+  const safeCursor = Math.max(0, Math.min(source.length, Number(cursor) || 0));
+  const lines = splitLineRanges(source);
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (safeCursor <= line.end || i === lines.length - 1) {
+      return {
+        lines,
+        lineIndex: i,
+        column: graphemeColumn(line.text, safeCursor - line.start),
+      };
+    }
+  }
+  return { lines, lineIndex: lines.length - 1, column: 0 };
+}
+
 export class TuiLineEditor {
   constructor({
     keypressSource,
@@ -193,6 +240,24 @@ export class TuiLineEditor {
     this.cursor = this.line.length;
   }
 
+  _moveVertical(direction) {
+    if (!String(this.line || "").includes("\n")) return false;
+    const pos = cursorPosition(this.line, this.cursor);
+    const nextLineIndex = pos.lineIndex + (direction < 0 ? -1 : 1);
+    if (nextLineIndex < 0 || nextLineIndex >= pos.lines.length) return true;
+    const nextLine = pos.lines[nextLineIndex];
+    this.cursor = nextLine.start + offsetForGraphemeColumn(nextLine.text, pos.column);
+    return true;
+  }
+
+  _moveToLogicalLineBoundary(which) {
+    if (!String(this.line || "").includes("\n")) return false;
+    const pos = cursorPosition(this.line, this.cursor);
+    const line = pos.lines[pos.lineIndex] || pos.lines[0];
+    this.cursor = which === "end" ? line.end : line.start;
+    return true;
+  }
+
   handleKeypress(str, key = {}, { allowWithoutPending = false } = {}) {
     if ((!this.pending && !allowWithoutPending) || this.closed) return { submitted: false, value: "" };
     if (this.shouldHandleKeypress && this.shouldHandleKeypress(str, key) === false) return;
@@ -236,10 +301,12 @@ export class TuiLineEditor {
       return;
     }
     if (name === "home") {
+      if (this._moveToLogicalLineBoundary("start")) return;
       this.cursor = 0;
       return;
     }
     if (name === "end") {
+      if (this._moveToLogicalLineBoundary("end")) return;
       this.cursor = this.line.length;
       return;
     }
@@ -259,10 +326,12 @@ export class TuiLineEditor {
     }
 
     if (!ctrl && !meta && !shift && name === "up") {
+      if (this._moveVertical(-1)) return;
       this._moveHistory(-1);
       return;
     }
     if (!ctrl && !meta && !shift && name === "down") {
+      if (this._moveVertical(1)) return;
       this._moveHistory(1);
       return;
     }

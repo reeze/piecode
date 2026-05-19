@@ -200,6 +200,38 @@ describe("web server security helpers", () => {
     expect(session.activePluginsRef.value.map((plugin) => plugin.name)).toEqual(["demo"]);
   });
 
+  test("web /help keeps dynamic skill and plugin command lists out of the main help output", async () => {
+    const session = new WebAgentSession({ workspaceDir: process.cwd(), settings: {}, settingsFile: "" });
+    session.skillIndex = new Map([
+      ["demo-skill", {
+        name: "demo-skill",
+        description: "Demo skill",
+        path: "/tmp/demo-skill/SKILL.md",
+        frontmatter: { command: "demo-skill", commandDescription: "Run demo skill" },
+        commandFiles: [],
+      }],
+    ]);
+    session.pluginIndex = new Map([
+      ["demo-plugin", {
+        name: "demo-plugin",
+        description: "Demo plugin",
+        version: "1.0.0",
+        path: "/tmp/demo-plugin/PLUGIN.md",
+        frontmatter: { command: "demo-plugin", commandDescription: "Run demo plugin" },
+        commandFiles: [],
+        skills: [],
+      }],
+    ]);
+
+    const result = await session.handleSlashCommand("/help");
+
+    expect(result.handled).toBe(true);
+    expect(result.message).toContain("## Web Slash Commands");
+    expect(result.message).toContain("Use `/plugins commands` or `/skills commands`");
+    expect(result.message).not.toContain("Run demo skill");
+    expect(result.message).not.toContain("Run demo plugin");
+  });
+
   test("web plugin management commands mirror CLI basics", async () => {
     const tempDir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-web-plugin-"));
     const pluginDir = path.join(tempDir, "demo");

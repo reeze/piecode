@@ -181,6 +181,51 @@ describe("tui line editor", () => {
     rl.close();
   });
 
+  test("up and down move within multiline input instead of replacing it with history", () => {
+    const source = new EventEmitter();
+    const rl = new TuiLineEditor({ keypressSource: source, history: ["previous prompt"] });
+
+    rl.write("first\nsecond\nthird");
+    expect(rl.cursor).toBe("first\nsecond\nthird".length);
+
+    rl.handleKeypress("", { name: "up" }, { allowWithoutPending: true });
+    expect(rl.line).toBe("first\nsecond\nthird");
+    expect(rl.cursor).toBe("first\nsecon".length);
+
+    rl.handleKeypress("", { name: "up" }, { allowWithoutPending: true });
+    expect(rl.cursor).toBe("first".length);
+
+    rl.handleKeypress("", { name: "up" }, { allowWithoutPending: true });
+    expect(rl.line).toBe("first\nsecond\nthird");
+    expect(rl.cursor).toBe("first".length);
+
+    rl.handleKeypress("", { name: "down" }, { allowWithoutPending: true });
+    expect(rl.cursor).toBe("first\nsecon".length);
+
+    rl.close();
+  });
+
+  test("home and end target the current logical line in multiline input", () => {
+    const source = new EventEmitter();
+    const rl = new TuiLineEditor({ keypressSource: source });
+
+    rl.write("alpha\nbeta\ncharlie");
+    rl.cursor = "alpha\nbe".length;
+
+    rl.handleKeypress("", { name: "home" }, { allowWithoutPending: true });
+    expect(rl.cursor).toBe("alpha\n".length);
+
+    rl.handleKeypress("", { name: "end" }, { allowWithoutPending: true });
+    expect(rl.cursor).toBe("alpha\nbeta".length);
+
+    rl.handleKeypress("", { ctrl: true, name: "a" }, { allowWithoutPending: true });
+    expect(rl.cursor).toBe(0);
+
+    rl.handleKeypress("", { ctrl: true, name: "e" }, { allowWithoutPending: true });
+    expect(rl.cursor).toBe("alpha\nbeta\ncharlie".length);
+    rl.close();
+  });
+
   test("cursor movement and deletion are grapheme-aware for CJK and emoji", () => {
     const source = new EventEmitter();
     const rl = new TuiLineEditor({ keypressSource: source });

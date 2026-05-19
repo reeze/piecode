@@ -22,6 +22,9 @@ export function resolveSkillRoots(settings = {}, workspaceDir = process.cwd()) {
 
   const workspaceRoot = path.resolve(workspaceDir || process.cwd());
   const projectRoots = [
+    path.join(workspaceRoot, ".AGENTS", "skills"),
+    path.join(workspaceRoot, ".Agents", "skills"),
+    path.join(workspaceRoot, ".agents", "skills"),
     path.join(workspaceRoot, "AGENTS", "skills"),
     path.join(workspaceRoot, "Agents", "skills"),
     path.join(workspaceRoot, "agents", "skills"),

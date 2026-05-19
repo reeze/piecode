@@ -45,6 +45,7 @@ import { buildInputHints } from "./lib/inputHints.js";
 import { Display } from "./lib/display.js";
 import { consumeMouseWheelDeltas, stripMouseInputNoise } from "./lib/mouse.js";
 import { TuiLineEditor } from "./lib/tuiLineEditor.js";
+import { filterUsableModelCatalog, getModelQueryFromInput, isModelProviderConfigured } from "./lib/modelInput.js";
 import { McpHub, mergeCommonMcpServers, resolveMcpServerConfigs } from "./lib/mcp.js";
 import { AgentSessionState, SessionEventBus, createJsonlSessionSink } from "./lib/sessionProtocol.js";
 import {
@@ -71,6 +72,7 @@ import {
   buildGoalPrompt,
   createGoalRun,
   parseGoalStatus,
+  summarizeGoalOutput,
 } from "./lib/goalMode.js";
 
 const HISTORY_MAX = 500;
@@ -133,7 +135,6 @@ const DEFAULT_CONTEXT_WINDOW = 128000;
 
 const MODEL_SUGGESTIONS = [
   "codex:gpt-5.3-codex",
-  "seed:doubao-seed-code-preview-latest",
   "openrouter:moonshotai/kimi-k2.5",
   "openrouter:google/gemini-3-flash-preview",
   "openrouter:anthropic/claude-sonnet-4.5",
@@ -152,7 +153,6 @@ const MODEL_SUGGESTIONS = [
   "meta-llama/llama-3.1-70b-instruct",
   "qwen/qwen-2.5-coder-32b-instruct",
   "deepseek/deepseek-chat",
-  "doubao-seed-code-preview-latest",
   "gpt-5.3-codex",
 ];
 
@@ -577,6 +577,63 @@ async function saveHistory(filePath, history) {
   }
 }
 
+function getInteractiveHelpLines() {
+  return [
+    "## PieCode command map",
+    "",
+    "### Essentials",
+    "- `/help`, `/status`, `/clear`, `/compact`, `/exit` - session basics",
+    "- `/sessions`, `/resume <id>` - continue previous work",
+    "",
+    "### Agent workflow",
+    "- `/btw <question>`, `/plan`, `/goal <task>`, `/agents` - steer long tasks",
+    "- `/approve on|off` - control shell command approval",
+    "",
+    "### Model and runtime",
+    "- `/model`, `/model list` - switch or inspect models",
+    "- `/think <none|minimal|low|medium|high|xhigh|off>` - adjust reasoning effort",
+    "",
+    "### Extensions",
+    "- `/skills`, `/plugins`, `/mcp` - inspect and manage extensions",
+    "- `/attach image`, `/skill-creator` - add context or create skills",
+    "",
+    "### Diagnostics",
+    "- `/debug status|llm|last|save`, `/trace on|off` - inspect internals",
+    "",
+    "Tip: type `/` to search commands; type `!` before a shell command to run it.",
+  ];
+}
+
+function getTimelineHelpLines() {
+  return [
+    "[help] title: PieCode command map",
+    "[help] section: Essentials",
+    "[help] item: /help, /status, /clear, /compact, /exit - session basics",
+    "[help] item: /sessions, /resume <id> - continue previous work",
+    "[help] section: Agent workflow",
+    "[help] item: /btw <question>, /plan, /goal <task>, /agents - steer long tasks",
+    "[help] item: /approve on|off - control shell command approval",
+    "[help] section: Model and runtime",
+    "[help] item: /model, /model list - switch or inspect models",
+    "[help] item: /think <none|minimal|low|medium|high|xhigh|off> - adjust reasoning effort",
+    "[help] section: Extensions",
+    "[help] item: /skills, /plugins, /mcp - inspect and manage extensions",
+    "[help] item: /attach image, /skill-creator - add context or create skills",
+    "[help] section: Diagnostics",
+    "[help] item: /debug status|llm|last|save, /trace on|off - inspect internals",
+    "[help] tip: type / to search commands; type ! before a shell command to run it",
+  ];
+}
+
+function openHelpOverlay(tui) {
+  if (!tui || typeof tui.openOverlay !== "function") return false;
+  tui.openOverlay("PieCode command map", getInteractiveHelpLines().join("\n"), {
+    mode: "help",
+    hint: " j/k: scroll  ctrl-f/b: page  q: close ",
+  });
+  return true;
+}
+
 function printHelp() {
   console.log(`Pie Code - Coding agent
 
@@ -592,7 +649,7 @@ Options:
   --prompt, -p         One-shot prompt to run
   --resume, -r         Resume a saved session by full or short id
   --help, -h           Show this help
-  --provider, -P       Model provider: anthropic, openai, openrouter, codex, seed
+  --provider, -P       Model provider: anthropic, openai, openrouter, codex
   --api-key, -K        API key for the provider
   --model, -M          Model name to use
   --base-url, -B       Base URL for OpenAI-compatible endpoints (default: https://api.openai.com/v1)
@@ -622,11 +679,6 @@ Environment:
   OPENROUTER_MODEL     Optional (default openai/gpt-4.1-mini)
   OPENROUTER_SITE_URL  Optional Referer header for OpenRouter
   OPENROUTER_APP_NAME  Optional app title header for OpenRouter
-
-  SEED_API_KEY         Seed/Volcengine provider API key
-  ARK_API_KEY          Alias for SEED_API_KEY
-  SEED_BASE_URL        Optional (default https://ark.cn-beijing.volces.com/api/coding)
-  SEED_MODEL           Optional (default doubao-seed-code-preview-latest)
 
   CODEX_HOME           Optional (default ~/.codex)
   CODEX_MODEL          Optional for codex token mode (default gpt-5.3-codex)
@@ -1250,6 +1302,15 @@ function formatToolBatchSummary(calls = [], maxLen = 180) {
   return summarizeForLog(`${names}${suffix}`, maxLen);
 }
 
+const TOOL_RESULT_DIFF_MAX_LINES = 80;
+
+function truncateDiffTextForTimeline(value, { maxLines = TOOL_RESULT_DIFF_MAX_LINES } = {}) {
+  const lines = String(value || "").replace(/\r/g, "").split("\n");
+  const limit = Math.max(1, Number(maxLines) || TOOL_RESULT_DIFF_MAX_LINES);
+  if (lines.length <= limit) return lines.join("\n");
+  return `${lines.slice(0, limit).join("\n")}\n... (${lines.length - limit} more diff lines)`;
+}
+
 function formatToolResultLinesForTimeline(tool, result, error) {
   if (error) return [];
   const name = String(tool || "");
@@ -1313,6 +1374,9 @@ function formatToolResultLinesForTimeline(tool, result, error) {
       if (match?.[1] && !files.includes(match[1])) files.push(match[1]);
       if (files.length >= 6) break;
     }
+    if (/^diff --git\b|^# (?:Staged|Unstaged|Untracked) changes\b/im.test(raw)) {
+      return [`[tool-result] ${truncateDiffTextForTimeline(raw)}`];
+    }
     if (files.length > 0) {
       const shown = files.slice(0, 4).join(", ");
       const more = files.length > 4 ? ` +${files.length - 4}` : "";
@@ -1325,6 +1389,12 @@ function formatToolResultLinesForTimeline(tool, result, error) {
     const lines = raw.split("\n").map((line) => line.trimEnd()).filter(Boolean).slice(0, 8);
     if (lines.length === 0) return [];
     return lines.map((line) => `[tool-result] ${summarizeForLog(line, 220)}`);
+  }
+
+  if (name === "write_file" || name === "write") {
+    const wrote = raw.match(/^Wrote\s+(\d+)\s+bytes\s+to\s+(.+)$/i);
+    if (wrote) return [`[tool-result] Wrote ${wrote[1]} bytes to ${wrote[2]}`];
+    return [`[tool-result] ${summarizeForLog(raw.split("\n")[0], 220)}`];
   }
 
   if (name !== "edit_file") return [];
@@ -1526,6 +1596,7 @@ function formatStageUpdate(text, maxLen = 220) {
     .replace(/\[([^\]]+)\]\([^)]+\)/g, "$1")
     .replace(/^\s*[-*+]\s+/gm, "")
     .replace(/\s+/g, " ")
+    .replace(/^\s*(?:short\s+progress\s+update|progress\s+update|progress|thinking|thought|reason)\s*:\s*/i, "")
     .trim();
   if (!source) return "";
   return source.length > maxLen ? `${source.slice(0, maxLen - 3)}...` : source;
@@ -1648,7 +1719,6 @@ function inferContextWindow(modelName) {
   if (model.includes("claude-3.7")) return 200000;
   if (model.includes("claude-3.5")) return 200000;
   if (model.includes("claude-3")) return 200000;
-  if (model.includes("doubao-seed")) return 128000;
   if (model.includes("deepseek")) return 128000;
   return DEFAULT_CONTEXT_WINDOW;
 }
@@ -2194,7 +2264,6 @@ function printSkillCommandList(skillIndex, logLine) {
 function providerPrefix(kind) {
   const k = String(kind || "").toLowerCase();
   if (k.includes("openrouter")) return "openrouter";
-  if (k.includes("seed")) return "seed";
   if (k.includes("anthropic")) return "anthropic";
   if (k.includes("openai")) return "openai";
   if (k.includes("codex")) return "codex";
@@ -2252,7 +2321,7 @@ function emitStartupLogo(tui, provider, workspaceDir) {
   tui.event(`[banner-meta] model: ${shortModel}`);
   tui.event(`[banner-meta] workspace: ${shortWorkspace}`);
 
-  const shortcutHint = "keys: CTRL+L logs | CTRL+T todos | CTRL+O llm debug | /attach image";
+  const shortcutHint = "keys: CTRL+L timeline/raw | CTRL+T todos | CTRL+O debug | /model switch | /help map";
   if (typeof tui.setStartupShortcutHint === "function") {
     tui.setStartupShortcutHint(shortcutHint);
   }
@@ -2899,6 +2968,7 @@ async function handleSlashCommand(input, ctx) {
     tui,
     setModel,
     setStatusBar,
+    openModelPicker,
     planModeRef,
     settings,
     settingsFile,
@@ -3014,73 +3084,11 @@ async function handleSlashCommand(input, ctx) {
       return null;
     }
   };
-  const loadSeedContextMetadata = async ({ force = false, logErrors = false } = {}) => {
-    if (!force && hasModelContextMetadata("seed")) return null;
-    try {
-      const metadata = await fetchSeedModelMetadata({ settings });
-      if (metadata?.contextByModel && typeof metadata.contextByModel === "object") {
-        applyContextWindowMetadata(modelContextWindowsRef.value, metadata.contextByModel, "seed");
-      }
-      markModelContextMetadataLoaded("seed");
-      return metadata;
-    } catch (err) {
-      if (logErrors) {
-        logLine(`seed metadata unavailable: ${String(err?.message || err)}`);
-      }
-      return null;
-    }
-  };
-
   if (lower === "/exit" || lower === "/quit") return { done: true, handled: true };
   if (lower === "/help") {
     if (tui) {
-      const helpLines = [
-        "commands:",
-        "/help",
-        "/exit | /quit",
-        "/clear",
-        "/compact",
-        "/sessions",
-        "/resume <id>  (or piecode --resume <id>)",
-        "/status",
-        "/btw <question>",
-        "/agents",
-        "/plan",
-        "/goal <task>",
-        "/approve on|off",
-        "/trace on|off",
-        "/debug",
-        "/debug status",
-        "/debug llm",
-        "/debug last",
-        "/debug save",
-        "/model",
-        "/think <none|minimal|low|medium|high|xhigh|off>",
-        "/reasoning <none|minimal|low|medium|high|xhigh|off>",
-        "/mcp",
-        "/mcp list",
-        "/mcp show <name>",
-        "/mcp add <name> <command> [args...]",
-        "/mcp remove <name>",
-        "/mcp reload",
-        "/mcp import on|off",
-        "/skills",
-        "/skills list",
-        "/skills commands",
-        "/skills use <name>",
-        "/skills off <name>",
-        "/skills clear",
-        "/plugins",
-        "/plugins list",
-        "/plugins commands",
-        "/plugins use <name>",
-        "/plugins off <name>",
-        "/plugins clear",
-        "/use <name>",
-        "/skill-creator",
-        "/attach image",
-      ];
-      for (const line of helpLines) logLine(line);
+      openHelpOverlay(tui);
+      for (const line of getTimelineHelpLines()) logLine(line);
     } else {
       printHelp();
     }
@@ -3336,9 +3344,7 @@ async function handleSlashCommand(input, ctx) {
   }
   if (lower === "/model") {
     const providerName = providerPrefix(providerRef.value?.kind);
-    if (providerName === "seed") {
-      await loadSeedContextMetadata({ force: false, logErrors: false });
-    } else if (providerName === "openrouter") {
+    if (providerName === "openrouter") {
       await loadOpenRouterContextMetadata({ force: false, logErrors: false });
     }
     const p = providerRef.value;
@@ -3346,6 +3352,10 @@ async function handleSlashCommand(input, ctx) {
       setStatusBar(formatModelStatus(p, "current model"));
       const warning = formatProviderWarning(p);
       if (warning) logLine(warning);
+      if (typeof openModelPicker === "function") {
+        openModelPicker("");
+        return { done: false, handled: true, preserveInput: true };
+      }
     } else {
       logLine(formatModelStatus(p, "current model"));
       const warning = formatProviderWarning(p);
@@ -3365,8 +3375,9 @@ async function handleSlashCommand(input, ctx) {
     let openRouterLatest = [];
     const extraSettingsModels = [];
 
+    const openRouterConfiguredForUse = isConfiguredModelProvider("openrouter", settings);
     const groups = await loadOpenRouterContextMetadata({ force: true, logErrors: false });
-    if (groups) {
+    if (groups && openRouterConfiguredForUse) {
       openRouterPopular = Array.isArray(groups.popular) ? groups.popular : [];
       openRouterLatest = Array.isArray(groups.latest) ? groups.latest : [];
       if (openRouterPopular.length > 0) {
@@ -3379,30 +3390,19 @@ async function handleSlashCommand(input, ctx) {
         logLine("latest (openrouter):");
         for (const id of openRouterLatest) logLine(`- openrouter:${id}`);
       }
+    } else if (groups && !openRouterConfiguredForUse) {
+      logLine("openrouter models hidden: missing OPENROUTER_API_KEY or providers.openrouter.apiKey");
     }
 
-    const seedMetadata = await loadSeedContextMetadata({ force: true, logErrors: true });
-    if (Array.isArray(seedMetadata?.models) && seedMetadata.models.length > 0) {
-      listed = true;
-      logLine("available (seed):");
-      if (seedMetadata?.sourceUrl) {
-        logLine(`seed metadata source: ${seedMetadata.sourceUrl}`);
-      }
-      const preview = seedMetadata.models.slice(0, 20);
-      for (const id of preview) logLine(`- seed:${id}`);
-      if (seedMetadata.models.length > preview.length) {
-        logLine(`- ... ${seedMetadata.models.length - preview.length} more`);
-      }
-      for (const id of seedMetadata.models) {
-        extraSettingsModels.push(`seed:${id}`);
-      }
-    }
-
-    modelCatalogRef.value = mergeModelCatalog(
-      MODEL_SUGGESTIONS,
-      openRouterPopular,
-      openRouterLatest,
-      [...collectModelsFromSettings(settings), ...extraSettingsModels]
+    modelCatalogRef.value = getUsableModelCatalog(
+      mergeModelCatalog(
+        MODEL_SUGGESTIONS,
+        openRouterPopular,
+        openRouterLatest,
+        [...collectModelsFromSettings(settings), ...extraSettingsModels]
+      ),
+      settings,
+      collectModelsFromSettings(settings)
     );
     if (!listed) {
       for (const modelId of modelCatalogRef.value) logLine(`- ${modelId}`);
@@ -3418,9 +3418,7 @@ async function handleSlashCommand(input, ctx) {
     try {
       const nextProvider = await setModel(targetModel);
       const nextProviderName = providerPrefix(nextProvider?.kind);
-      if (nextProviderName === "seed") {
-        await loadSeedContextMetadata({ force: false, logErrors: false });
-      } else if (nextProviderName === "openrouter") {
+      if (nextProviderName === "openrouter") {
         await loadOpenRouterContextMetadata({ force: false, logErrors: false });
       }
       const nextContextLimit = resolveContextWindow({
@@ -3835,15 +3833,6 @@ async function handleSlashCommand(input, ctx) {
   return { done: false, handled: false };
 }
 
-function getModelQueryFromInput(line) {
-  const raw = String(line || "").trimStart();
-  if (!raw.startsWith("/model")) return null;
-  const rest = raw.slice("/model".length).trim();
-  if (!rest) return "";
-  if (rest.toLowerCase() === "list") return null;
-  return rest;
-}
-
 function getFilteredModelSuggestions(query, catalog = MODEL_SUGGESTIONS) {
   const source = Array.isArray(catalog) && catalog.length > 0 ? catalog : MODEL_SUGGESTIONS;
   const q = String(query || "").trim().toLowerCase();
@@ -3992,182 +3981,6 @@ function getLocalMcpServerNameSet(settings, workspaceDir) {
   return names;
 }
 
-function buildSeedModelListUrls(endpoint) {
-  const base = String(endpoint || "").replace(/\/$/, "");
-  if (!base) return [];
-  const urls = new Set();
-  const add = (value) => {
-    const text = String(value || "").trim();
-    if (text) urls.add(text);
-  };
-
-  const chatPathRe = /\/chat\/completions$/i;
-  const versionedChatPathRe = /\/v\d+\/chat\/completions$/i;
-  if (chatPathRe.test(base)) {
-    add(base.replace(chatPathRe, "/models"));
-    add(base.replace(chatPathRe, "/model/list"));
-  }
-  if (versionedChatPathRe.test(base)) {
-    add(base.replace(versionedChatPathRe, "/v1/models"));
-    add(base.replace(versionedChatPathRe, "/v1/model/list"));
-  }
-
-  if (!/\/models$/i.test(base) && !/\/model\/list$/i.test(base)) {
-    add(`${base}/models`);
-    add(`${base}/model/list`);
-  }
-
-  try {
-    const u = new URL(base);
-    const pathname = String(u.pathname || "");
-    if (/\/api\/coding$/i.test(pathname)) {
-      add(`${u.origin}/api/coding/models`);
-      add(`${u.origin}/api/coding/model/list`);
-    }
-    add(`${u.origin}/api/v3/models`);
-    add(`${u.origin}/api/v3/model/list`);
-    add(`${u.origin}/api/v1/models`);
-    add(`${u.origin}/api/v1/model/list`);
-    add(`${u.origin}/v1/models`);
-    add(`${u.origin}/models`);
-  } catch {
-    // ignore invalid URL
-  }
-
-  return [...urls];
-}
-
-function extractModelRows(data) {
-  if (Array.isArray(data?.data)) return data.data;
-  if (Array.isArray(data?.models)) return data.models;
-  if (Array.isArray(data?.list)) return data.list;
-  if (Array.isArray(data?.result?.list)) return data.result.list;
-  if (Array.isArray(data?.result?.data)) return data.result.data;
-  if (Array.isArray(data?.result?.models)) return data.result.models;
-  if (Array.isArray(data?.ModelList)) return data.ModelList;
-  return [];
-}
-
-function seedAuthHeaderVariants(apiKey) {
-  const key = String(apiKey || "").trim();
-  if (!key) return [];
-  const base = {
-    "content-type": "application/json",
-    accept: "application/json",
-  };
-  return [
-    { ...base, Authorization: `Bearer ${key}` },
-    { ...base, "x-api-key": key },
-    { ...base, "X-API-Key": key },
-    { ...base, "api-key": key },
-  ];
-}
-
-function collectSeedProviderCandidates(settings = {}) {
-  const candidates = [];
-  const seen = new Set();
-  const addCandidate = (endpoint, apiKey) => {
-    const endpointText = String(endpoint || "").trim();
-    const apiKeyText = String(apiKey || "").trim();
-    if (!endpointText || !apiKeyText) return;
-    const key = `${endpointText}::${apiKeyText}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    candidates.push({ endpoint: endpointText, apiKey: apiKeyText });
-  };
-
-  const envApiKey = process.env.SEED_API_KEY || process.env.ARK_API_KEY || "";
-  const envEndpoint = process.env.SEED_BASE_URL || "";
-  const providers =
-    settings?.providers && typeof settings.providers === "object" && !Array.isArray(settings.providers)
-      ? settings.providers
-      : {};
-
-  for (const [providerName, providerSettings] of Object.entries(providers)) {
-    const key = String(providerName || "").trim().toLowerCase();
-    if (!key.startsWith("seed")) continue;
-    if (!providerSettings || typeof providerSettings !== "object") continue;
-    addCandidate(
-      providerSettings.endpoint || providerSettings.baseUrl || envEndpoint,
-      providerSettings.apiKey || envApiKey
-    );
-  }
-
-  if (String(settings?.provider || "").trim().toLowerCase().startsWith("seed")) {
-    addCandidate(settings?.endpoint || settings?.baseUrl || envEndpoint, settings?.apiKey || envApiKey);
-  }
-
-  addCandidate(envEndpoint || "https://ark.cn-beijing.volces.com/api/coding", envApiKey);
-  return candidates;
-}
-
-async function fetchSeedModelMetadata({ settings }) {
-  const providerCandidates = collectSeedProviderCandidates(settings);
-  if (providerCandidates.length === 0) {
-    throw new Error("Seed metadata lookup skipped: missing endpoint/apiKey configuration");
-  }
-
-  let lastErr = null;
-  for (const candidate of providerCandidates) {
-    const urls = buildSeedModelListUrls(candidate.endpoint);
-    for (const url of urls) {
-      const headerVariants = seedAuthHeaderVariants(candidate.apiKey);
-      for (const headers of headerVariants) {
-        try {
-          const res = await fetch(url, {
-            method: "GET",
-            headers,
-          });
-          if (!res.ok) {
-            const err = new Error(`Seed models request failed (${res.status}) at ${url}`);
-            err.status = res.status;
-            throw err;
-          }
-          const data = await res.json().catch(() => ({}));
-          const rows = extractModelRows(data);
-          const models = [];
-          const contextByModel = {};
-          for (const row of rows) {
-            const id = String(
-              row?.id ||
-                row?.model ||
-                row?.model_id ||
-                row?.modelId ||
-                row?.ModelId ||
-                row?.name ||
-                row?.slug ||
-                ""
-            ).trim();
-            if (!id) continue;
-            models.push(id);
-            const contextWindow = extractContextWindowValue(
-              row?.context_length ??
-                row?.context_window ??
-                row?.max_context_length ??
-                row?.maxContextLength ??
-                row
-            );
-            if (contextWindow != null) {
-              contextByModel[id] = contextWindow;
-              contextByModel[`seed:${id}`] = contextWindow;
-            }
-          }
-          if (models.length > 0) {
-            return { models, contextByModel, sourceUrl: url };
-          }
-          const err = new Error(`Seed models request returned no models at ${url}`);
-          err.status = 204;
-          throw err;
-        } catch (err) {
-          lastErr = err;
-        }
-      }
-    }
-  }
-
-  throw new Error(`Seed metadata lookup failed: ${lastErr?.message || "unknown error"}`);
-}
-
 async function fetchOpenRouterModelGroups({ settings }) {
   const providerSettings =
     settings?.providers && typeof settings.providers === "object"
@@ -4223,6 +4036,14 @@ function mergeModelCatalog(baseCatalog, popular, latest, localSettingsModels = [
   return out;
 }
 
+function getUsableModelCatalog(baseCatalog, settings, alwaysInclude = []) {
+  return filterUsableModelCatalog(baseCatalog, settings, process.env, alwaysInclude);
+}
+
+function isConfiguredModelProvider(provider, settings) {
+  return isModelProviderConfigured(provider, settings, process.env);
+}
+
 async function probeAvailableModels({
   settings,
   modelCatalogRef,
@@ -4232,11 +4053,10 @@ async function probeAvailableModels({
   tui = null,
 } = {}) {
   if (String(process.env.PIECODE_MODEL_PROBE || "1") === "0") {
-    return { openrouter: null, seed: null };
+    return { openrouter: null };
   }
 
   const loadedSources = [];
-  const extraModels = [];
   const popular = [];
   const latest = [];
 
@@ -4258,7 +4078,6 @@ async function probeAvailableModels({
   };
 
   let openrouter = null;
-  let seed = null;
 
   try {
     openrouter = await fetchOpenRouterModelGroups({ settings });
@@ -4270,28 +4089,22 @@ async function probeAvailableModels({
     // Best effort: model discovery should never block startup.
   }
 
-  try {
-    seed = await fetchSeedModelMetadata({ settings });
-    applyContext(seed?.contextByModel, "seed");
-    for (const id of seed?.models || []) extraModels.push(`seed:${id}`);
-    markLoaded("seed");
-  } catch {
-    // Seed often requires provider-specific credentials; skip quietly.
-  }
-
   if (loadedSources.length > 0) {
-    modelCatalogRef.value = mergeModelCatalog(
+    const discoveredCatalog = mergeModelCatalog(
       MODEL_SUGGESTIONS,
       popular,
       latest,
-      [...collectModelsFromSettings(settings), ...extraModels]
+      collectModelsFromSettings(settings)
     );
-    const message = `model probe: loaded ${loadedSources.join(", ")} metadata (${modelCatalogRef.value.length} suggestions)`;
+    modelCatalogRef.value = getUsableModelCatalog(discoveredCatalog, settings, collectModelsFromSettings(settings));
+    const hiddenCount = Math.max(0, discoveredCatalog.length - modelCatalogRef.value.length);
+    const hiddenSuffix = hiddenCount > 0 ? `, ${hiddenCount} unavailable hidden` : "";
+    const message = `model probe: loaded ${loadedSources.join(", ")} metadata (${modelCatalogRef.value.length} usable suggestions${hiddenSuffix})`;
     if (typeof logLine === "function") logLine(message);
     else if (tui && typeof tui.render === "function") tui.render(undefined, message);
   }
 
-  return { openrouter, seed };
+  return { openrouter };
 }
 
 function collectModelsFromSettings(settings = {}) {
@@ -4337,7 +4150,7 @@ function collectModelsFromSettings(settings = {}) {
 
 function parseModelTarget(target) {
   const raw = String(target || "").trim();
-  const m = raw.match(/^(anthropic|openai|openrouter|codex|seed)\s*:\s*(.+)$/i);
+  const m = raw.match(/^(anthropic|openai|openrouter|codex)\s*:\s*(.+)$/i);
   if (m) {
     return {
       provider: m[1].toLowerCase(),
@@ -4360,7 +4173,6 @@ function inferEndpointForProvider(providerOptions, provider) {
   if (explicit) return String(explicit);
   const kind = String(provider?.kind || "").toLowerCase();
   if (kind.includes("openrouter")) return "https://openrouter.ai/api/v1";
-  if (kind.includes("seed")) return "https://ark.cn-beijing.volces.com/api/coding";
   if (kind.includes("openai") || kind.includes("codex")) return "https://api.openai.com/v1";
   if (kind.includes("anthropic")) return "https://api.anthropic.com/v1/messages";
   return "unknown";
@@ -4405,7 +4217,11 @@ async function main() {
   const planModeRef = { value: process.env.PIECODE_PLAN_MODE === "1" };
   const settingsModelSuggestions = collectModelsFromSettings(settings);
   const modelCatalogRef = {
-    value: mergeModelCatalog(MODEL_SUGGESTIONS, [], [], settingsModelSuggestions),
+    value: getUsableModelCatalog(
+      mergeModelCatalog(MODEL_SUGGESTIONS, [], [], settingsModelSuggestions),
+      settings,
+      settingsModelSuggestions
+    ),
   };
   const modelContextWindowsRef = { value: new Map() };
   const modelContextMetadataRef = { value: new Set() };
@@ -4786,6 +4602,39 @@ async function main() {
     if (!text) return;
     keepIdleStatusRef.value = true;
     tui.render(currentInputRef.value, text);
+  };
+  const getCurrentModelTarget = () => {
+    const provider = providerRef.value;
+    const model = String(provider?.model || "").trim();
+    if (!model) return "";
+    const prefix = providerPrefix(provider?.kind);
+    return prefix ? `${prefix}:${model}` : model;
+  };
+  const openModelPicker = (query = "") => {
+    if (!tui) return false;
+    const pickerQuery = String(query || "").trim();
+    const nextLine = `/model ${pickerQuery}`.trimEnd() + " ";
+    const activeModel = getCurrentModelTarget();
+    const catalog = activeModel
+      ? mergeModelCatalog(modelCatalogRef.value, [], [], [activeModel])
+      : modelCatalogRef.value;
+    const nextOptions = getFilteredModelSuggestions(pickerQuery, catalog);
+    modelPickerRef.active = nextOptions.length > 0;
+    modelPickerRef.query = pickerQuery;
+    modelPickerRef.options = nextOptions;
+    modelPickerRef.index = 0;
+    commandPickerRef.active = false;
+    commandPickerRef.mode = "command";
+    commandPickerRef.options = [];
+    commandPickerRef.index = 0;
+    tui.clearCommandSuggestions();
+    safeRlWrite(null, { ctrl: true, name: "u" });
+    safeRlWrite(nextLine);
+    currentInputRef.value = nextLine;
+    if (modelPickerRef.active) tui.setModelSuggestions(modelPickerRef.options, modelPickerRef.index);
+    else tui.clearModelSuggestions();
+    tui.renderInput(currentInputRef.value);
+    return modelPickerRef.active;
   };
   const updateGoalStatus = (status = null) => {
     if (!tui || typeof tui.setGoalStatus !== "function") return;
@@ -5477,10 +5326,14 @@ async function main() {
     } catch {
       // best effort
     }
-    modelCatalogRef.value = mergeModelCatalog(
-      MODEL_SUGGESTIONS,
-      [],
-      [],
+    modelCatalogRef.value = getUsableModelCatalog(
+      mergeModelCatalog(
+        MODEL_SUGGESTIONS,
+        [],
+        [],
+        collectModelsFromSettings(settings)
+      ),
+      settings,
       collectModelsFromSettings(settings)
     );
     const nextContextLimit = resolveContextWindow({
@@ -6044,6 +5897,7 @@ async function main() {
       tui,
       setModel: switchModel,
       setStatusBar,
+      openModelPicker,
       planModeRef,
       settings,
       settingsFile,
@@ -6078,7 +5932,7 @@ async function main() {
     }
     if (slash.handled) {
       if (display) display.clearSuggestions();
-      currentInputRef.value = "";
+      if (!slash.preserveInput) currentInputRef.value = "";
       continue;
     }
 
@@ -6147,6 +6001,7 @@ async function main() {
 
         goalRun.lastOutput = turnResult.output || "";
         goalRun.status = parseGoalStatus(goalRun.lastOutput);
+        goalRun.lastCheckpoint = summarizeGoalOutput(goalRun.lastOutput);
         updateGoalStatus({
           active: true,
           label: goalRun.goal,
@@ -6175,7 +6030,10 @@ async function main() {
           maxIterations: goalRun.maxIterations,
           status: "continue",
         });
-        agentInput = buildGoalContinuationPrompt(goalRun.goal, goalRun.iteration, goalRun.lastOutput);
+        agentInput = buildGoalContinuationPrompt(goalRun.goal, goalRun.iteration, goalRun.lastOutput, {
+          maxIterations: goalRun.maxIterations,
+          checkpoint: goalRun.lastCheckpoint,
+        });
       }
 
       const saved = await finishTaskTrace(taskTraceRef, workspaceDir, {

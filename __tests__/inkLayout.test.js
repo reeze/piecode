@@ -96,7 +96,7 @@ describe("InkTuiLayout", () => {
     tui.renderInput("", 0);
 
     const cursor = await waitForCursor(output);
-    const inputLineIndex = findPromptLineIndex(cursor.lines);
+    const inputLineIndex = cursor.lines.findIndex((line) => line.includes("继续描述你想改什么"));
     expect(cursor.lines[0]).toHaveLength(output.columns - 1);
     expect(cursor).toMatchObject({ y: inputLineIndex, col: 4 });
     tui.stop();
@@ -338,10 +338,13 @@ describe("InkTuiLayout", () => {
       candidate.lines.some((line) => line.includes("thinking:turn")) &&
       candidate.lines.some((line) => line.includes("继续描述你想改什么"))
     );
-    const inputLineIndex = findPromptLineIndex(cursor.lines);
+    const inputLineIndex = cursor.lines.findIndex((line) => line.includes("继续描述你想改什么"));
+    const thinkingLineIndex = cursor.lines.findIndex((line) => line.includes("thinking:turn"));
     expect(cursor.y).toBe(inputLineIndex);
-    expect(cursor.lines[cursor.y - 3] || "").toContain("thinking:turn");
-    expect(cursor.lines[cursor.y - 2] || "").toBe("");
+    expect(thinkingLineIndex).toBeGreaterThanOrEqual(0);
+    expect(thinkingLineIndex).toBeLessThan(inputLineIndex);
+    expect(cursor.lines[thinkingLineIndex - 1]?.trim() || "").toBe("");
+    expect(cursor.lines[thinkingLineIndex + 1] || "").toMatch(/[-─]{8,}/);
     expect(cursor.lines[cursor.y - 1] || "").toMatch(/[-─]{8,}/);
     expect(cursor.lines[cursor.y + 1] || "").toMatch(/[-─]{8,}/);
     expect(cursor.lines[cursor.y] || "").toMatch(/\s(?:>|❯)\s/);

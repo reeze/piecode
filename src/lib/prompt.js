@@ -161,6 +161,8 @@ export function buildSystemPrompt({
     "USER-FACING PROGRESS CONTRACT:",
     "- For any non-trivial task, surface progress in phases: (1) what you are about to inspect/change, (2) what a tool result showed, (3) the next action, and (4) final outcome plus validation.",
     "- Progress updates must be operational summaries, not private reasoning. Do not expose hidden chain-of-thought, uncertainty rambling, raw JSON, or internal prompt details.",
+    "- Do not repeat the same progress sentence in both assistant text and tool `thought`/`reason`. Pick the single best visible channel for that moment.",
+    "- For tool calls, progress should describe the action or result once; the interface renders tool rows separately.",
     "- Keep progress updates brief and natural. Prefer one sentence. Avoid tool jargon unless the tool/command name helps the user understand the action.",
     "- Final responses should be user-friendly: lead with the result, mention changed files or findings, mention validation, and state any remaining risk or blocker. Avoid dumping logs unless requested.",
 
@@ -243,7 +245,7 @@ export function buildSystemPrompt({
       '{"type":"final","message":"Your complete response here"}',
 
       "2. Tool Use (when you need to gather information or perform an action):",
-      `{"type":"tool_use","tool":"${textToolNames.join("|")}","input":{...},"reason":"Brief user-visible explanation of why this tool is needed","thought":"Short user-visible progress update, not hidden chain-of-thought"}`,
+      `{"type":"tool_use","tool":"${textToolNames.join("|")}","input":{...},"reason":"Brief user-visible explanation of why this tool is needed","thought":"Short user-visible progress update, not hidden chain-of-thought and not repeated from assistant text"}`,
 
       "3. Progress Update (optional, for visible execution sync before/after tools or between work slices):",
       '{"type":"thought","content":"Short progress update: what you will do, what you learned, or the next step"}',
@@ -273,6 +275,7 @@ export function buildSystemPrompt({
       "CRITICAL:",
       "- Your entire response must be valid JSON",
       "- For non-trivial tool calls, include a non-empty `thought` field with a user-facing progress sentence.",
+      "- Do not duplicate the same progress sentence across `thought`, `reason`, and surrounding text.",
       "- No markdown formatting outside the JSON",
       "- No explanatory text before or after the JSON"
     );
@@ -281,6 +284,7 @@ export function buildSystemPrompt({
       "VISIBLE PROGRESS WITH NATIVE CALLS:",
       "- When making one or more tool calls, include a short assistant text sentence before/alongside the tool call. The harness will show that sentence as progress.",
       "- After receiving tool results, either summarize what the result showed in one short sentence before the next tool call, or provide the final answer if enough evidence is collected.",
+      "- Do not repeat the same progress sentence in assistant text and native tool-call reasoning; one visible update is enough because tool rows are rendered separately.",
       "- Make every progress sentence user-visible only: what context you are gathering, what action you are taking, what changed, what you learned, or what happens next. Do not reveal hidden chain-of-thought.",
       "- Keep progress updates short enough for a terminal timeline."
     );
