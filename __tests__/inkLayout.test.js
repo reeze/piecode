@@ -180,7 +180,13 @@ describe("InkTuiLayout", () => {
 
     layout.render({
       workspaceLines: Array.from({ length: 30 }, (_v, index) => `workspace line ${index + 1}`),
-      attentionLines: ["! action needed", "? approval required", "q: Approve shell command?", "$ npm test", "y:once n:deny"],
+      attentionLines: [
+        "! action needed",
+        "? approval required UNCLASSIFIED",
+        "action: Approve shell command?",
+        "command: npm test",
+        "choose: y=allow once  r=remember exact command  a=allow all this session  n=deny  enter=deny",
+      ],
       inputLines: ["❯ "],
       statusLine: "Awaiting approval | approve:off",
       hintLine: "",

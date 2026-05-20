@@ -1007,12 +1007,34 @@ function appendThinkingToLlmDebugEvent(llmHistoryRef, stage, delta) {
   return target;
 }
 
+function summarizeDebugPayloadSize(item) {
+  const chars = Number(item?.chars) || String(item?.payload || "").length;
+  return chars > 0 ? `${formatCompactNumber(chars)} chars` : "empty";
+}
+
+function summarizeDebugUsage(item) {
+  const usage = normalizeTokenUsage(item?.usage);
+  if (!usage) return "usage: -";
+  const input = usage.input_tokens != null ? formatCompactNumber(usage.input_tokens) : "-";
+  const output = usage.output_tokens != null ? formatCompactNumber(usage.output_tokens) : "-";
+  const total = usage.total_tokens != null ? formatCompactNumber(usage.total_tokens) : "-";
+  return `usage: in=${input} out=${output} total=${total}`;
+}
+
 function renderLlmDebugEntry(entry, position, total) {
-  const lines = ["## LLM Debug Dump"];
-  lines.push("", `Entry: ${position}/${total}`);
   const req = entry?.request || null;
   const res = entry?.response || null;
   const thinking = String(entry?.thinking || "");
+  const stage = req?.stage || res?.stage || entry?.stage || "-";
+  const provider = req?.provider || res?.provider || "-";
+  const model = req?.model || res?.model || "-";
+  const lines = ["## LLM Debug Dump"];
+  lines.push(
+    "",
+    `Entry: ${position}/${total} · stage=${stage} · provider=${provider} · model=${model}`,
+    `Overview: request ${req ? summarizeDebugPayloadSize(req) : "missing"} · thinking ${thinking ? `${formatCompactNumber(thinking.length)} chars` : "empty"} · response ${res ? summarizeDebugPayloadSize(res) : "missing"} · ${summarizeDebugUsage(res || req)}`,
+    "Sections: Request · Thinking Output · Response Key Content · Response Raw"
+  );
 
   if (req) {
     const formattedReq = formatJsonMaybe(String(req.payload || ""));
@@ -1092,7 +1114,7 @@ function openLlmDebugOverlay({ tui, llmHistoryRef, llmLastRef, logLine }) {
   if (tui && typeof tui.openOverlay === "function") {
     tui.openOverlay(`LLM Debug ${selected + 1}/${entries.length}`, payload, {
       mode: "llm-debug",
-      hint: " /:search  n/p: switch entry  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close ",
+      hint: " /:search  n/p: entry  ctrl-n/p: section  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close ",
     });
   } else if (typeof logLine === "function") {
     logLine(`[response] ${payload}`);
@@ -4788,7 +4810,7 @@ async function main() {
               const payload = renderLlmDebugEntry(entries[next], next + 1, entries.length);
               tui.openOverlay(`LLM Debug ${next + 1}/${entries.length}`, payload, {
                 mode: "llm-debug",
-                hint: " /:search  n/p: switch entry  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close ",
+                hint: " /:search  n/p: entry  ctrl-n/p: section  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close ",
               });
             }
             return;
@@ -4808,7 +4830,7 @@ async function main() {
               const payload = renderLlmDebugEntry(entries[prev], prev + 1, entries.length);
               tui.openOverlay(`LLM Debug ${prev + 1}/${entries.length}`, payload, {
                 mode: "llm-debug",
-                hint: " /:search  n/p: switch entry  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close ",
+                hint: " /:search  n/p: entry  ctrl-n/p: section  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close ",
               });
             }
             return;
@@ -4835,6 +4857,14 @@ async function main() {
           }
           if (!key.ctrl && !key.meta && !key.shift && key.name === "g") {
             tui.jumpOverlayCurrentSectionBottom();
+            return;
+          }
+          if (key.ctrl && key.name === "n" && typeof tui.jumpOverlaySectionRelative === "function") {
+            tui.jumpOverlaySectionRelative(1);
+            return;
+          }
+          if (key.ctrl && key.name === "p" && typeof tui.jumpOverlaySectionRelative === "function") {
+            tui.jumpOverlaySectionRelative(-1);
             return;
           }
           if (key.ctrl && key.name === "f") {
@@ -5419,6 +5449,7 @@ async function main() {
         question: "Approve shell command?",
         command: cmdPreview,
         reason,
+        risk: classificationLevel,
       };
     }
     let ans = "";

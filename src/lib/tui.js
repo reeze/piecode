@@ -746,6 +746,12 @@ function highlightOverlaySectionLine(line) {
   if (/^\s*TOOLS:/i.test(text)) {
     return text.replace(/^\s*TOOLS:/i, (m) => color(m.trim(), "1;30;45"));
   }
+  if (/^\s*Overview:/i.test(text)) {
+    return text.replace(/^\s*Overview:/i, (m) => color(m.trim(), "1;33"));
+  }
+  if (/^\s*Sections:/i.test(text)) {
+    return text.replace(/^\s*Sections:/i, (m) => color(m.trim(), "1;36"));
+  }
   if (/^\s*Request:/i.test(text)) {
     return text.replace(/^\s*Request:/i, (m) => color(m.trim(), "1;36"));
   }
@@ -1130,6 +1136,8 @@ export class SimpleTui {
     this.overlayHint = "";
     this.overlaySearchActive = false;
     this.overlaySearchQuery = "";
+    this.overlaySectionOffsets = [];
+    this.overlayActiveSection = "";
     this.mouseCaptureEnabled = String(process.env.PIECODE_MOUSE_CAPTURE || "").trim() === "1";
     this.unicodeSymbols = shouldUseUnicodeSymbols(process.env);
     this.symbols = makeTuiSymbols(this.unicodeSymbols);
@@ -1601,6 +1609,7 @@ export class SimpleTui {
             command: String(meta.command || "").trim(),
             reason: String(meta.reason || "").trim(),
             details: String(meta.details || "").trim(),
+            risk: String(meta.risk || meta.level || "").trim(),
           }
         : null;
     this.approvalDefaultYes = Boolean(defaultYes);
@@ -1744,6 +1753,8 @@ export class SimpleTui {
     this.overlayHint = String(options?.hint || "");
     this.overlaySearchActive = false;
     this.overlaySearchQuery = "";
+    this.overlaySectionOffsets = [];
+    this.overlayActiveSection = "";
     this.render();
   }
 
@@ -1757,6 +1768,8 @@ export class SimpleTui {
     this.overlayHint = "";
     this.overlaySearchActive = false;
     this.overlaySearchQuery = "";
+    this.overlaySectionOffsets = [];
+    this.overlayActiveSection = "";
     this.render();
   }
 
@@ -1865,21 +1878,69 @@ export class SimpleTui {
       if (chunks.length === 0) wrapped.push("");
       else wrapped.push(...chunks);
     }
+    const sectionPatterns = [
+      { key: "request", label: "Request", pattern: /^request:/i },
+      { key: "overview", label: "Overview", pattern: /^overview:/i },
+      { key: "thinking", label: "Thinking", pattern: /^thinking output:/i },
+      { key: "response", label: "Response", pattern: /^response:/i },
+      { key: "key", label: "Key", pattern: /^response key content:/i },
+      { key: "raw", label: "Raw", pattern: /^response raw:/i },
+    ];
+    const sectionOffsets = [];
     let requestOffset = 0;
     let responseOffset = Math.max(0, wrapped.length - 1);
     for (let i = 0; i < renderedLines.length; i += 1) {
-      const line = stripAnsi(String(renderedLines[i] || "")).trimStart().toLowerCase();
-      if (line.startsWith("request:")) requestOffset = rawStartOffsets[i] || 0;
-      if (line.startsWith("response:")) responseOffset = rawStartOffsets[i] || responseOffset;
+      const line = stripAnsi(String(renderedLines[i] || "")).trimStart();
+      const lower = line.toLowerCase();
+      const offset = rawStartOffsets[i] || 0;
+      for (const section of sectionPatterns) {
+        if (section.pattern.test(line)) {
+          if (!sectionOffsets.some((item) => item.key === section.key)) {
+            sectionOffsets.push({ key: section.key, label: section.label, offset });
+          }
+          break;
+        }
+      }
+      if (lower.startsWith("request:")) requestOffset = offset;
+      if (lower.startsWith("response:")) responseOffset = offset;
     }
-    return { wrapped, requestOffset, responseOffset };
+    sectionOffsets.sort((a, b) => a.offset - b.offset);
+    return { wrapped, requestOffset, responseOffset, sectionOffsets };
   }
 
   jumpOverlaySection(which = "request") {
     if (!this.overlayVisible) return 0;
     const width = Math.max(20, Math.max(40, this.out.columns || 100) - 1);
     const layout = this.buildOverlayLayout(width);
-    this.overlayScroll = which === "response" ? layout.responseOffset : layout.requestOffset;
+    const targetKey = String(which || "request").toLowerCase();
+    const direct = layout.sectionOffsets.find((section) => section.key === targetKey);
+    if (direct) this.overlayScroll = direct.offset;
+    else this.overlayScroll = targetKey === "response" ? layout.responseOffset : layout.requestOffset;
+    this.render();
+    return this.overlayScroll;
+  }
+
+  jumpOverlaySectionRelative(delta = 1) {
+    if (!this.overlayVisible) return 0;
+    const width = Math.max(20, Math.max(40, this.out.columns || 100) - 1);
+    const layout = this.buildOverlayLayout(width);
+    const sections = Array.isArray(layout.sectionOffsets) ? layout.sectionOffsets : [];
+    if (sections.length === 0) return this.overlayScroll;
+    const direction = Number(delta) < 0 ? -1 : 1;
+    let index = direction > 0
+      ? sections.findIndex((section) => section.offset > this.overlayScroll)
+      : -1;
+    if (direction < 0) {
+      for (let i = sections.length - 1; i >= 0; i -= 1) {
+        if (sections[i].offset < this.overlayScroll) {
+          index = i;
+          break;
+        }
+      }
+    }
+    if (index < 0) index = direction > 0 ? 0 : sections.length - 1;
+    const targetOffset = sections[index].offset;
+    this.overlayScroll = direction > 0 && targetOffset > 0 ? targetOffset - 1 : targetOffset;
     this.render();
     return this.overlayScroll;
   }
@@ -1996,6 +2057,7 @@ export class SimpleTui {
     let question = String(meta?.question || "").trim();
     let command = String(meta?.command || "").trim();
     let detailsText = String(meta?.reason || meta?.details || "").trim();
+    let riskText = String(meta?.risk || "").trim();
 
     if (!question || !command || !detailsText) {
       const cmdMatch = prompt.match(/\$\s+([^\n]+)$/m);
@@ -2018,6 +2080,7 @@ export class SimpleTui {
       }
       if (!command && shellBody) command = shellBody;
       if (!detailsText && shellReason) detailsText = shellReason;
+      if (!riskText && detailsText && /danger/i.test(detailsText)) riskText = "dangerous";
       question = "Approve shell command?";
     }
 
@@ -2025,12 +2088,13 @@ export class SimpleTui {
       question = "Approve command execution?";
     }
 
-    lines.push(color(" ? approval required", "1;33"));
+    const riskLabel = riskText ? ` ${riskText.toUpperCase()}` : "";
+    lines.push(color(` ? approval required${riskLabel}`, riskText === "dangerous" ? "1;31" : "1;33"));
     if (question) {
-      lines.push(truncateLine(`   ${color("q:", "1;36")} ${question}`, width));
+      lines.push(truncateLine(`   ${color("action:", "1;36")} ${question}`, width));
     }
     if (command) {
-      lines.push(truncateLine(`   ${color("$", "1;35")} ${color(command, "37")}`, width));
+      lines.push(truncateLine(`   ${color("command:", "1;35")} ${color(command, "37")}`, width));
     }
     if (!detailsText && prompt && normalize(prompt) !== normalize(question) && normalize(prompt) !== normalize(command)) {
       detailsText = prompt;
@@ -2038,10 +2102,9 @@ export class SimpleTui {
     if (detailsText && normalize(detailsText) !== normalize(question)) {
       lines.push(truncateLine(`   ${color("why:", "1;35")} ${detailsText}`, width));
     }
-    const choiceLine = this.approvalDefaultYes
-      ? `${color("y", "1;32")}:once ${color("r", "1;36")}:remember ${color("a", "1;33")}:session ${color("n", "1;31")}:deny ${color("enter", "1;33")}:${color("once", "32")}`
-      : `${color("y", "1;32")}:once ${color("r", "1;36")}:remember ${color("a", "1;33")}:session ${color("n", "1;31")}:deny ${color("enter", "1;33")}:${color("deny", "31")}`;
-    lines.push(truncateLine(`   ${choiceLine}`, width));
+    lines.push(truncateLine(`   ${color("choose:", "1;36")} ${color("y", "1;32")}=allow once  ${color("r", "1;36")}=remember exact command  ${color("a", "1;33")}=allow all this session`, width));
+    const enterDecision = this.approvalDefaultYes ? color("allow once", "32") : color("deny", "31");
+    lines.push(truncateLine(`           ${color("n", "1;31")}=deny  ${color("enter", "1;33")}=${enterDecision}`, width));
     return lines;
   }
 
@@ -2804,18 +2867,27 @@ export class SimpleTui {
     if (this.overlayVisible) {
       const sep = separatorLine(width, this.unicodeSymbols);
       const title = truncateLine(` ${this.overlayTitle}`, width);
-      const fallbackHint = " /:search  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close ";
+      const fallbackHint = this.overlayMode === "llm-debug"
+        ? " /:search  ctrl-n/p: section  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close "
+        : " /:search  j/k: scroll  J/K: req/resp  g: section end  ctrl-f/b: page  q: close ";
       const hintText = this.overlaySearchActive
         ? ` /${this.overlaySearchQuery}  (enter: jump, esc: cancel, backspace: edit)`
         : this.overlayHint || fallbackHint;
       const hint = truncateLine(hintText, width);
-      const { wrapped } = this.buildOverlayLayout(width);
+      const { wrapped, sectionOffsets } = this.buildOverlayLayout(width);
       const viewport = Math.max(4, height - 4);
       const maxStart = Math.max(0, wrapped.length - viewport);
       this.overlayScroll = Math.max(0, Math.min(this.overlayScroll, maxStart));
       const visible = wrapped
         .slice(this.overlayScroll, this.overlayScroll + viewport)
         .map((line) => highlightOverlaySectionLine(line));
+      const sections = Array.isArray(sectionOffsets) ? sectionOffsets : [];
+      const visibleEndOffset = this.overlayScroll + Math.max(0, visible.length - 1);
+      const activeSection = [...sections].reverse().find((section) => section.offset >= this.overlayScroll && section.offset <= visibleEndOffset) || [...sections].reverse().find((section) => section.offset <= this.overlayScroll) || sections[0] || null;
+      this.overlaySectionOffsets = sections;
+      this.overlayActiveSection = activeSection?.label || "";
+      const sectionLabel = activeSection ? `section:${activeSection.label}` : "";
+      const sectionNav = sections.length > 0 ? `sections:${sections.map((section) => section.label).join(",")}` : "";
       const modeLabel = this.formatOverlayModeLabel();
       const aboveBelow = joinStatusParts([
         this.overlayScroll > 0 ? "above" : "",
@@ -2823,8 +2895,10 @@ export class SimpleTui {
       ]);
       const scrollLabel = joinStatusParts([
         modeLabel,
+        sectionLabel,
         `lines ${Math.min(wrapped.length, this.overlayScroll + 1)}-${Math.min(wrapped.length, this.overlayScroll + visible.length)}/${wrapped.length}`,
         aboveBelow ? `more:${aboveBelow}` : "",
+        sectionNav,
       ]);
       const statusLine = truncateLine(scrollLabel, width);
       const frameLines = [sep, `\x1b[1m${title}\x1b[0m`, sep, ...visible, sep, `\x1b[2m${statusLine}\x1b[0m`, `\x1b[2m${hint}\x1b[0m`];

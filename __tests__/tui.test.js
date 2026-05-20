@@ -627,12 +627,15 @@ describe("tui usability", () => {
     );
 
     const lines = tui.formatApprovalLines(220).map((line) => stripAnsi(line));
-    expect(lines.join("\n")).toContain("? approval required");
-    expect(lines.join("\n")).toContain("q: Approve shell command?");
-    expect(lines.join("\n")).toContain('$ curl -sL "https://agentskills.io/specification"');
+    expect(lines.join("\n")).toContain("? approval required DANGEROUS");
+    expect(lines.join("\n")).toContain("action: Approve shell command?");
+    expect(lines.join("\n")).toContain('command: curl -sL "https://agentskills.io/specification"');
     expect(lines.join("\n")).toContain("why: command is neither known safe nor explicitly dangerous");
-    expect(lines.join("\n")).toContain("remember");
-    expect(lines.join("\n")).toContain("session");
+    expect(lines.join("\n")).toContain("choose: y=allow once");
+    expect(lines.join("\n")).toContain("r=remember exact command");
+    expect(lines.join("\n")).toContain("a=allow all this session");
+    expect(lines.join("\n")).toContain("n=deny");
+    expect(lines.join("\n")).toContain("enter=deny");
     expect(lines.join("\n")).not.toContain(
       'Details: shell: curl -sL "https://agentskills.io/specification" (command is neither known safe nor explicitly dangerous)'
     );
@@ -697,6 +700,52 @@ describe("tui usability", () => {
     expect(frame).toContain("Help");
     expect(frame).toContain("q: close");
     expect(frame).not.toContain("Pie Code  let's cook");
+  });
+
+  test("debug overlay shows overview and section navigation metadata", () => {
+    const out = createOut(120, 8);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.openOverlay(
+      "LLM Debug 1/1",
+      [
+        "## LLM Debug Dump",
+        "",
+        "Entry: 1/1 · stage=turn · provider=seed · model=test",
+        "Overview: request 10 chars · thinking empty · response 20 chars · usage: in=1 out=2 total=3",
+        "Sections: Request · Thinking Output · Response Key Content · Response Raw",
+        "",
+        "Request: stage=turn provider=seed model=test endpoint=local",
+        "Thinking Output: <none>",
+        "Response: stage=turn provider=seed model=test endpoint=local",
+        "Response Key Content:",
+        "- usage: in=1 out=2 total=3",
+        "Response Raw:",
+        "```text",
+        "{\"ok\":true}",
+        "```",
+      ].join("\n"),
+      { mode: "llm-debug" }
+    );
+
+    const frame = stripAnsi(latestFrame(out));
+    expect(frame).toContain("Overview:");
+    expect(frame).toContain("Sections:");
+    expect(frame).toContain("section:Overview");
+    expect(frame).toContain("sections:Overview,Request,Thinking,Response,Key,Raw");
+    expect(frame).toContain("ctrl-n/p: section");
+
+    tui.jumpOverlaySectionRelative(1);
+    const afterJump = stripAnsi(latestFrame(out));
+    expect(afterJump).toContain("section:Request");
+    expect(tui.overlayActiveSection).toBe("Request");
   });
 
   test("overlay status exposes scroll direction when debug content overflows", () => {
