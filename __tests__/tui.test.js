@@ -157,9 +157,11 @@ describe("tui usability", () => {
       getApprovalLabel: () => "off",
     });
 
-    const compactBatch = stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0]);
-    expect(compactBatch).toContain("Tools Read x2");
-    expect(compactBatch).toContain("a.txt, b.txt");
+    const compactBatchLines = tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)").map(stripAnsi);
+    const compactBatch = compactBatchLines.join("\n");
+    expect(compactBatch).toContain("Read x2");
+    expect(compactBatch).not.toContain("Tools Read x2");
+    expect(compactBatchLines).toEqual(["› Read x2", "    a.txt", "    b.txt"]);
     tui.setRawLogsVisible(true);
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("README.md");
     expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("read_file(b.txt)");
@@ -235,6 +237,84 @@ describe("tui usability", () => {
     expect(plain[responseIdx - 1]).toBe("");
     expect(plain[resultIdx]).toMatch(/^\S/);
     expect(taskIdx).toBeLessThan(toolIdx);
+  });
+
+  test("timeline inserts breathing room between updates, tool batches, and responses", () => {
+    const out = createOut(100, 32);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.event("[progress] I am checking the render path.");
+    tui.event("[tools] read_file x2 - read_file(README.md); read_file(src/cli.js)");
+    tui.event("[response] The render path is in src/lib/tui.js.");
+
+    const plain = tui.timeline.map((line) => stripAnsi(line));
+    const updateIdx = plain.findIndex((line) => line.includes("I am checking the render path."));
+    const toolsIdx = plain.findIndex((line) => line.includes("Read x2"));
+    const responseIdx = plain.findIndex((line) => line.includes("The render path is in src/lib/tui.js."));
+    expect(updateIdx).toBeGreaterThanOrEqual(0);
+    expect(toolsIdx).toBeGreaterThan(updateIdx);
+    expect(responseIdx).toBeGreaterThan(toolsIdx);
+    expect(plain[toolsIdx - 1]).toBe("");
+    expect(plain[responseIdx - 1]).toBe("");
+  });
+
+  test("timeline does not duplicate identical consecutive done results", () => {
+    const tui = new SimpleTui({
+      out: createOut(100, 24),
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    const doneLine = "[result] done | time: 57s | tok ↑283k ↓2.4k";
+    tui.event(doneLine);
+    tui.event(doneLine);
+
+    const doneRows = tui.timeline.map((line) => stripAnsi(line)).filter((line) => line.includes("done | time: 57s"));
+    expect(doneRows).toEqual(["✓ done | time: 57s | tok ↑283k ↓2.4k"]);
+  });
+
+  test("timeline removes duplicate shell done rows after later events", () => {
+    const tui = new SimpleTui({
+      out: createOut(100, 24),
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.event("[result] shell done | time: 9s");
+    tui.event("[result] shell done | time: 9s");
+    tui.event("status: idle | model=test");
+
+    const doneRows = tui.timeline.map((line) => stripAnsi(line)).filter((line) => line.includes("shell done | time: 9s"));
+    expect(doneRows).toEqual(["✓ shell done | time: 9s"]);
+  });
+
+  test("rendered tool batch details keep indentation", () => {
+    const out = createOut(100, 24);
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+    });
+
+    tui.start();
+    tui.event("[tools] read_file x2 - read_file(README.md); read_file(src/cli.js)");
+    tui.renderInput("");
+
+    const lines = latestFrame(out).split("\n").map((line) => stripAnsi(line));
+    expect(lines.some((line) => /^ {4}README\.md/.test(line))).toBe(true);
+    expect(lines.some((line) => /^ {4}src\/cli\.js/.test(line))).toBe(true);
   });
 
   test("restores saved session messages into the TUI timeline", () => {
@@ -317,6 +397,7 @@ describe("tui usability", () => {
     expect(tui.formatTimelineLines("[model] seed-openai-compatible:doubao")).toEqual([]);
     expect(tui.formatTimelineLines("[plan] budget=3 - scoped plan")).toEqual([]);
     expect(stripAnsi(tui.formatTimelineLines('[run] shell command="echo hi"')[0])).toContain("Shell echo hi");
+    expect(tui.formatTimelineLines('[run] shell command="echo hi"')[0]).toContain("\x1b[36mShell\x1b[0m echo hi");
     expect(stripAnsi(tui.formatTimelineLines("[run] shell echo hi")[0])).toContain("Shell echo hi");
     expect(stripAnsi(tui.formatTimelineLines("[run] test npm test -- --runInBand __tests__")[0])).toContain(
       "Test npm test -- --runInBand __tests__"
@@ -327,18 +408,23 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines("[progress] Checking the UI path before editing")[0])).toContain(
       "Checking the UI path before editing"
     );
-    expect(stripAnsi(tui.formatTimelineLines("[progress] Checking the UI path before editing")[0])).toContain(
-      "Progress"
-    );
+    expect(stripAnsi(tui.formatTimelineLines("[progress] Checking the UI path before editing")[0])).not.toContain("Update");
+    const progressLine = tui.formatTimelineLines("[progress] Checking the UI path before editing")[0];
+    expect(progressLine).not.toContain("\x1b[37mChecking the UI path before editing\x1b[0m");
+    expect(progressLine).not.toContain("\x1b[2;37mChecking the UI path before editing\x1b[0m");
     expect(tui.formatTimelineLines("[tool] shell (echo hi)")).toEqual([]);
     expect(tui.formatTimelineLines("[tool] todo_write (3 todos)")).toEqual([]);
-    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("Tool");
+    expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).not.toContain("Tool");
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (README.md)")[0])).toContain("Read README.md");
+    expect(tui.formatTimelineLines("[tool] read_file (README.md)")[0]).toContain("\x1b[36mRead\x1b[0m README.md");
     expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).toContain("Search");
     expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).toContain("targetSymbol");
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (path=README.md)")[0])).toContain("Read README.md");
-    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("Tools Read x2");
-    expect(stripAnsi(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0])).toContain("a.txt, b.txt");
+    const readBatch = tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)").map(stripAnsi);
+    expect(readBatch).toEqual(["› Read x2", "    a.txt", "    b.txt"]);
+    expect(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0]).toContain(
+      "\x1b[36mRead x2\x1b[0m"
+    );
     expect(stripAnsi(tui.formatTimelineLines('[tool] rg (pattern="targetSymbol" path="src")')[0])).toContain("targetSymbol in src");
     expect(stripAnsi(tui.formatTimelineLines('[tool] read_files (paths=["a.txt","b.txt","c.txt","d.txt"])')[0])).toContain("a.txt, b.txt, c.txt +1");
     expect(stripAnsi(tui.formatTimelineLines("[result] done")[0])).toContain(`${okIcon} done`);
@@ -378,7 +464,11 @@ describe("tui usability", () => {
     expect(latestFrame(out)).not.toContain("keys: CTRL+L logs | CTRL+T todos");
     expect(tui.formatTimelineLines("[thinking] internal details")).toEqual([]);
     expect(tui.formatTimelineLines("[thinking] request:turn payload-here")).toEqual([]);
-    expect(stripAnsi(tui.formatTimelineLines("[thought] I should inspect files first")[0])).toContain("Thinking I should inspect files first");
+    expect(stripAnsi(tui.formatTimelineLines("[thought] I should inspect files first")[0])).toContain("I should inspect files first");
+    expect(stripAnsi(tui.formatTimelineLines("[thought] I should inspect files first")[0])).not.toContain("Thinking");
+    expect(tui.formatTimelineLines("[thought] I should inspect files first")[0]).not.toContain(
+      "\x1b[37mI should inspect files first\x1b[0m"
+    );
     expect(stripAnsi(tui.formatTimelineLines("[agent] start subagent-1: inspect providers")[0])).toContain("Agent start subagent-1");
     const markdownResponse = stripAnsi(
       tui.formatTimelineLines("[response] ## Title\n- **bold** and `code`")[1]

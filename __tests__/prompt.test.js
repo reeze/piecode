@@ -161,8 +161,9 @@ describe('Prompt functions', () => {
       expect(prompt).toContain('Before editing existing files, read them first');
       expect(prompt).toContain('Prefer targeted edits');
       expect(prompt).toContain('write_file is for new files or explicit rewrites');
-      expect(prompt).toContain('Before tool calls, say what context you are gathering');
+      expect(prompt).toContain('Before tool calls, state the context being gathered');
       expect(prompt).toContain('include a non-empty `thought` field');
+      expect(prompt).toContain('Progress and thought text must be task-focused, not first person');
       expect(prompt).toContain('Do not duplicate the same progress sentence');
       expect(prompt).toContain('show diffs only when the user asks for review');
     });

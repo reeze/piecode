@@ -1,8 +1,3 @@
-import React from "react";
-import { Box, Text, render } from "ink";
-
-const h = React.createElement;
-
 function cleanLine(line) {
   return String(line ?? "").replace(/\r/g, "");
 }
@@ -28,24 +23,103 @@ function clamp(value, min, max) {
   return Math.max(min, Math.min(max, n));
 }
 
-function stripAnsi(text) {
-  return String(text || "").replace(/\x1b(?:\[[0-9;?]*[ -/]*[@-~]|[%()][ -~])/g, "");
+function charDisplayWidth(ch) {
+  const cp = String(ch || "").codePointAt(0);
+  if (cp == null) return 0;
+  if (cp <= 0x1f || (cp >= 0x7f && cp <= 0x9f)) return 0;
+  if (
+    cp === 0x200d ||
+    (cp >= 0xfe00 && cp <= 0xfe0f) ||
+    (cp >= 0xe0100 && cp <= 0xe01ef) ||
+    (cp >= 0x300 && cp <= 0x36f) ||
+    (cp >= 0x1ab0 && cp <= 0x1aff) ||
+    (cp >= 0x1dc0 && cp <= 0x1dff) ||
+    (cp >= 0x20d0 && cp <= 0x20ff) ||
+    (cp >= 0xfe20 && cp <= 0xfe2f)
+  ) {
+    return 0;
+  }
+  if (
+    (cp >= 0x1100 && cp <= 0x115f) ||
+    (cp >= 0x2329 && cp <= 0x232a) ||
+    (cp >= 0x2e80 && cp <= 0xa4cf) ||
+    (cp >= 0xac00 && cp <= 0xd7a3) ||
+    (cp >= 0xf900 && cp <= 0xfaff) ||
+    (cp >= 0x1f200 && cp <= 0x1f2ff) ||
+    (cp >= 0xfe10 && cp <= 0xfe19) ||
+    (cp >= 0xfe30 && cp <= 0xfe6f) ||
+    (cp >= 0xff00 && cp <= 0xff60) ||
+    (cp >= 0xffe0 && cp <= 0xffe6) ||
+    (cp >= 0x20000 && cp <= 0x3fffd) ||
+    (cp >= 0x1f300 && cp <= 0x1faff)
+  ) {
+    return 2;
+  }
+  return 1;
 }
 
+const graphemeSegmenter = typeof Intl !== "undefined" && Intl.Segmenter
+  ? new Intl.Segmenter(undefined, { granularity: "grapheme" })
+  : null;
+
 function visibleWidth(text) {
-  return stripAnsi(text).length;
+  const value = String(text || "");
+  let width = 0;
+  for (let i = 0; i < value.length;) {
+    const ansiMatch = value.slice(i).match(/^\x1b(?:\[[0-9;?]*[ -/]*[@-~]|[%()][ -~])/);
+    if (ansiMatch) {
+      i += ansiMatch[0].length;
+      continue;
+    }
+    const nextAnsi = value.slice(i).search(/\x1b(?:\[[0-9;?]*[ -/]*[@-~]|[%()][ -~])/);
+    const end = nextAnsi < 0 ? value.length : i + nextAnsi;
+    const plain = value.slice(i, end);
+    if (graphemeSegmenter) {
+      for (const segment of graphemeSegmenter.segment(plain)) {
+        width += [...segment.segment].reduce((sum, char) => sum + charDisplayWidth(char), 0);
+      }
+    } else {
+      for (const char of plain) width += charDisplayWidth(char);
+    }
+    i = end;
+  }
+  return width;
+}
+
+function truncateDisplayLine(text, width) {
+  const source = String(text || "");
+  const maxWidth = Math.max(0, Number(width) || 0);
+  if (maxWidth <= 0) return "";
+  if (visibleWidth(source) <= maxWidth) return source;
+  let out = "";
+  let used = 0;
+  let sawAnsi = false;
+  for (let i = 0; i < source.length;) {
+    const ansiMatch = source.slice(i).match(/^\x1b(?:\[[0-9;?]*[ -/]*[@-~]|[%()][ -~])/);
+    if (ansiMatch) {
+      out += ansiMatch[0];
+      sawAnsi = true;
+      i += ansiMatch[0].length;
+      continue;
+    }
+    const segment = graphemeSegmenter
+      ? graphemeSegmenter.segment(source.slice(i))[Symbol.iterator]().next().value?.segment || source[i]
+      : source.codePointAt(i) > 0xffff ? source.slice(i, i + 2) : source[i];
+    const widthForSegment = [...segment].reduce((sum, char) => sum + charDisplayWidth(char), 0);
+    if (used + widthForSegment > maxWidth) break;
+    out += segment;
+    used += widthForSegment;
+    i += segment.length;
+  }
+  return sawAnsi ? `${out}\x1b[0m` : out;
 }
 
 function padLine(line, width) {
   const text = cleanLine(line);
   const maxWidth = Math.max(1, Number(width) || 1);
-  const clipped = visibleWidth(text) > maxWidth ? text.slice(0, maxWidth) : text;
+  const clipped = truncateDisplayLine(text, maxWidth);
   const pad = Math.max(0, maxWidth - visibleWidth(clipped));
   return `${clipped}${" ".repeat(pad)}`;
-}
-
-function Line({ children, width = 1, dim = false, bold = false }) {
-  return h(Text, { wrap: "truncate", dimColor: dim, bold }, padLine(children, width));
 }
 
 function resolveRawCursor(frame, width, rows) {
@@ -64,18 +138,20 @@ function resolveRawCursor(frame, width, rows) {
 
 function resolveStructuredCursor(frame, width, rows) {
   const workspaceLines = Array.isArray(frame?.workspaceLines) ? frame.workspaceLines.map(cleanLine) : [];
+  const attentionLines = Array.isArray(frame?.attentionLines) ? frame.attentionLines.map(cleanLine) : [];
   const inputLines = Array.isArray(frame?.inputLines) && frame.inputLines.length > 0
     ? frame.inputLines.map(cleanLine)
     : [""];
   const statusLine = cleanLine(frame?.statusLine || "");
   const hintLines = splitLines(frame?.hintLine || "");
-  const bottomRows = 1 + inputLines.length + 1 + (statusLine ? 1 : 0) + hintLines.length;
+  const bottomRows = attentionLines.length + 1 + inputLines.length + 1 + (statusLine ? 1 : 0) + hintLines.length;
   const visibleWorkspace = visibleWorkspaceLines(workspaceLines, rows, bottomRows);
   const cursorRowOffset = Math.max(0, Math.floor(Number(frame?.cursorRowOffset) || 0));
   return {
-    row: clamp(visibleWorkspace.length + 2 + cursorRowOffset, 1, rows),
+    row: clamp(visibleWorkspace.length + attentionLines.length + 2 + cursorRowOffset, 1, rows),
     col: clamp(frame?.cursorCol || 1, 1, width),
     visibleWorkspace,
+    attentionLines,
     inputLines,
     statusLine,
     hintLines,
@@ -89,58 +165,33 @@ function visibleWorkspaceLines(workspaceLines, rows, bottomRows) {
   return workspaceLines.slice(workspaceLines.length - budget);
 }
 
-function padFrameRows(elements, rows, keyPrefix, width) {
-  const out = Array.isArray(elements) ? [...elements] : [];
+function padFrameRows(lines, rows, width) {
+  const out = (Array.isArray(lines) ? lines : []).map((line) => padLine(line, width));
   const targetRows = Math.max(1, Math.floor(Number(rows) || 1));
   while (out.length < targetRows) {
-    out.push(h(Line, { key: `${keyPrefix}-clear-${out.length}`, width }, ""));
+    out.push(padLine("", width));
   }
   return out.slice(0, targetRows);
 }
 
-function InkRawFrame({ frame, width, rows }) {
-  const { visible } = resolveRawCursor(frame, width, rows);
-  const elements = visible.map((line, index) => h(Line, { key: `raw-${index}`, width }, line));
-  return h(
-    Box,
-    { flexDirection: "column", width, height: rows, overflow: "hidden" },
-    ...padFrameRows(elements, rows, "raw", width)
-  );
-}
-
-function InkStructuredFrame({ frame, width, rows }) {
-  const { visibleWorkspace, inputLines, statusLine, hintLines } = resolveStructuredCursor(frame, width, rows);
+function terminalFrameLines(frame, width, rows) {
+  if (frame?.mode === "rawFrame") {
+    const { visible } = resolveRawCursor(frame, width, rows);
+    return padFrameRows(visible, rows, width);
+  }
+  const { visibleWorkspace, attentionLines, inputLines, statusLine, hintLines } = resolveStructuredCursor(frame, width, rows);
   const separatorGlyph = String(frame?.separatorGlyph || "-").slice(0, 1) || "-";
   const separator = separatorLine(separatorGlyph, width);
-  const elements = [];
-
-  visibleWorkspace.forEach((line, index) => {
-    elements.push(h(Line, { key: `w-${index}`, width }, line));
-  });
-  elements.push(h(Line, { key: "sep-top", width, dim: true }, separator));
-  inputLines.forEach((line, index) => {
-    elements.push(h(Line, { key: `i-${index}`, width, bold: index === 0 }, line));
-  });
-  elements.push(h(Line, { key: "sep-bottom", width, dim: true }, separator));
-  if (statusLine) elements.push(h(Line, { key: "status", width, dim: true }, statusLine));
-  hintLines.forEach((line, index) => {
-    elements.push(h(Line, { key: `h-${index}`, width, dim: true }, line));
-  });
-
-  return h(
-    Box,
-    { flexDirection: "column", width, height: rows, overflow: "hidden" },
-    ...padFrameRows(elements, rows, "structured", width)
-  );
-}
-
-function InkTuiApp({ frame }) {
-  const width = Math.max(20, Number(frame?.columns) || 100);
-  const rows = Math.max(8, Number(frame?.rows) || 30);
-  if (frame?.mode === "rawFrame") {
-    return h(InkRawFrame, { frame, width, rows });
-  }
-  return h(InkStructuredFrame, { frame, width, rows });
+  const lines = [
+    ...visibleWorkspace,
+    ...attentionLines,
+    separator,
+    ...inputLines,
+    separator,
+    ...(statusLine ? [statusLine] : []),
+    ...hintLines,
+  ];
+  return padFrameRows(lines, rows, width);
 }
 
 export class InkTuiLayout {
@@ -148,12 +199,12 @@ export class InkTuiLayout {
     this.input = input || process.stdin;
     this.output = output || process.stdout;
     this.error = error;
-    this.instance = null;
     this.renderVersion = 0;
     this.cursorTarget = { row: 1, col: 1 };
     this.inAlternateScreen = false;
     this.frame = {
       workspaceLines: [],
+      attentionLines: [],
       inputLines: [""],
       statusLine: "",
       hintLine: "",
@@ -174,26 +225,11 @@ export class InkTuiLayout {
     };
 
     this.cursorTarget = this.resolveCursorTarget(this.frame);
-    const tree = h(InkTuiApp, { frame: this.frame });
-    if (!this.instance) {
+    if (!this.inAlternateScreen) {
       this.output.write("\x1b[?1049h\x1b[2J\x1b[H");
       this.inAlternateScreen = true;
-      this.instance = render(tree, {
-        stdin: this.input,
-        stdout: this.output,
-        stderr: this.error,
-        exitOnCtrlC: false,
-        patchConsole: false,
-        interactive: true,
-        alternateScreen: true,
-        incrementalRendering: false,
-        maxFps: 20,
-      });
-      this.scheduleCursorSync();
-      return;
     }
-    this.instance.rerender(tree);
-    this.scheduleCursorSync();
+    this.paintFrame();
   }
 
   resolveCursorTarget(frame = this.frame) {
@@ -207,38 +243,26 @@ export class InkTuiLayout {
     return { row, col };
   }
 
-  scheduleCursorSync() {
-    const version = ++this.renderVersion;
-    const sync = () => {
-      if (!this.instance || version !== this.renderVersion) return;
-      const row = clamp(this.cursorTarget?.row || 1, 1, Math.max(1, this.frame.rows || 30));
-      const col = clamp(this.cursorTarget?.col || 1, 1, Math.max(1, this.frame.columns || 100));
-      try {
-        this.output.write(`\x1b[${row};${col}H\x1b[?25h`);
-      } catch {
-        // best effort
-      }
-    };
-
-    const waitUntilRenderFlush = this.instance?.waitUntilRenderFlush?.bind(this.instance);
-    if (waitUntilRenderFlush) {
-      waitUntilRenderFlush().then(sync, sync);
-      return;
+  paintFrame() {
+    this.renderVersion += 1;
+    const width = Math.max(20, Number(this.frame?.columns) || 100);
+    const rows = Math.max(8, Number(this.frame?.rows) || 30);
+    const lines = terminalFrameLines(this.frame, width, rows);
+    const row = clamp(this.cursorTarget?.row || 1, 1, rows);
+    const col = clamp(this.cursorTarget?.col || 1, 1, width);
+    try {
+      this.output.write(`\x1b[?25l\x1b[H${lines.join("\r\n")}\x1b[${row};${col}H\x1b[?25h`);
+    } catch {
+      // best effort
     }
-    setImmediate(sync);
   }
 
   destroy() {
     try {
       this.renderVersion += 1;
-      if (this.instance) {
-        this.instance.unmount();
-        this.instance.cleanup?.();
-      }
     } catch {
       // best effort
     } finally {
-      this.instance = null;
       try {
         if (this.inAlternateScreen) {
           this.output.write("\x1b[?1049l");

@@ -150,8 +150,8 @@ export function buildSystemPrompt({
     "- Before editing existing files, read them first. Prefer targeted edits; use full rewrites only when intentional.",
     "- Respect existing user work: check relevant diffs/status when needed and do not overwrite unrelated changes.",
     "- For simple tasks, avoid long preambles or unnecessary upfront plans; for non-trivial work, briefly state the plan, act, then summarize changes and validation.",
-    "- Keep the user visibly informed with short, user-facing progress updates. Before tool calls, say what context you are gathering or what action you are taking. After useful tool results, say what you learned, what changed, or what you will do next.",
-    "- Expose concise execution progress and operational results, but do not reveal hidden chain-of-thought. Use short status updates like 'I am checking the TUI render path now' or 'The search points to src/lib/tui.js; I will inspect that next.'",
+    "- Keep the user visibly informed with short, task-focused progress updates. Before tool calls, state the context being gathered or the action being taken. After useful tool results, state what was found, what changed, or the next action.",
+    "- Expose concise execution progress and operational results, but do not reveal hidden chain-of-thought. Use task-focused status updates like 'Checking the TUI render path now' or 'Search points to src/lib/tui.js; inspecting that next.'",
     "- Do not expand file diffs by default. Mention changed files and summarize changes; show diffs only when the user asks for review or explicitly requests a diff.",
     "- After code changes, run the most relevant practical validation (tests, lint, typecheck, build, or focused command); if not run, say why.",
     "- Use todo tracking only for real multi-step work. Save memory sparingly: durable preferences or project facts only; never store secrets; avoid duplicates and transient task details.",
@@ -159,8 +159,9 @@ export function buildSystemPrompt({
     "- Inspect relevant attachments; briefly note when an attachment is ignored as irrelevant.",
 
     "USER-FACING PROGRESS CONTRACT:",
-    "- For any non-trivial task, surface progress in phases: (1) what you are about to inspect/change, (2) what a tool result showed, (3) the next action, and (4) final outcome plus validation.",
+    "- For any non-trivial task, surface progress in phases: (1) context to inspect/change, (2) what a tool result showed, (3) the next action, and (4) final outcome plus validation.",
     "- Progress updates must be operational summaries, not private reasoning. Do not expose hidden chain-of-thought, uncertainty rambling, raw JSON, or internal prompt details.",
+    "- Do not use first-person progress phrasing such as 'I am', 'I will', 'I found', or 'let me'. Prefer task-focused phrasing: 'Checking...', 'Found...', 'Next: inspect...'.",
     "- Do not repeat the same progress sentence in both assistant text and tool `thought`/`reason`. Pick the single best visible channel for that moment.",
     "- For tool calls, progress should describe the action or result once; the interface renders tool rows separately.",
     "- Keep progress updates brief and natural. Prefer one sentence. Avoid tool jargon unless the tool/command name helps the user understand the action.",
@@ -179,7 +180,7 @@ export function buildSystemPrompt({
     "LONG TASK LOOP:",
     "- Keep a compact working state: goal, constraints, repo facts, changed files, validation, blockers, and next step.",
     "- Work in coherent slices: inspect, change, validate, summarize; reassess after tool results and update strategy when evidence changes.",
-    "- Between slices, provide brief progress syncs: current state, what changed/was found, and what you will do next.",
+    "- Between slices, provide brief progress syncs: current state, what changed/was found, and the next action.",
     "- Before major transitions (large edit, validation, final answer), reconcile the todo list/working state against user requirements and discovered constraints.",
     "- Preserve enough context in summaries so work can continue after compaction, interruption, or resume.",
 
@@ -245,10 +246,10 @@ export function buildSystemPrompt({
       '{"type":"final","message":"Your complete response here"}',
 
       "2. Tool Use (when you need to gather information or perform an action):",
-      `{"type":"tool_use","tool":"${textToolNames.join("|")}","input":{...},"reason":"Brief user-visible explanation of why this tool is needed","thought":"Short user-visible progress update, not hidden chain-of-thought and not repeated from assistant text"}`,
+      `{"type":"tool_use","tool":"${textToolNames.join("|")}","input":{...},"reason":"Brief task-focused explanation of why this tool is needed","thought":"Short task-focused progress update, not hidden chain-of-thought and not repeated from assistant text"}`,
 
       "3. Progress Update (optional, for visible execution sync before/after tools or between work slices):",
-      '{"type":"thought","content":"Short progress update: what you will do, what you learned, or the next step"}',
+      '{"type":"thought","content":"Short progress update: action underway, result found, or next step"}',
 
       "TOOLS:",
       "- Clarify: clarify_user asks the user to choose one option or multiple options through the harness when a decision is blocked or materially ambiguous. Input: {question, options:[{label,value?,description?}], multiple?:boolean}.",
@@ -270,11 +271,12 @@ export function buildSystemPrompt({
         : []),
 
       "EXAMPLE:",
-      '{"type":"tool_use","tool":"rg","input":{"pattern":"functionName\\(","path":"src"},"reason":"Find references before editing","thought":"I will search the code path first so the edit stays scoped."}',
+      '{"type":"tool_use","tool":"rg","input":{"pattern":"functionName\\(","path":"src"},"reason":"Find references before editing","thought":"Searching the code path first so the edit stays scoped."}',
 
       "CRITICAL:",
       "- Your entire response must be valid JSON",
       "- For non-trivial tool calls, include a non-empty `thought` field with a user-facing progress sentence.",
+      "- Progress and thought text must be task-focused, not first person.",
       "- Do not duplicate the same progress sentence across `thought`, `reason`, and surrounding text.",
       "- No markdown formatting outside the JSON",
       "- No explanatory text before or after the JSON"
@@ -285,7 +287,8 @@ export function buildSystemPrompt({
       "- When making one or more tool calls, include a short assistant text sentence before/alongside the tool call. The harness will show that sentence as progress.",
       "- After receiving tool results, either summarize what the result showed in one short sentence before the next tool call, or provide the final answer if enough evidence is collected.",
       "- Do not repeat the same progress sentence in assistant text and native tool-call reasoning; one visible update is enough because tool rows are rendered separately.",
-      "- Make every progress sentence user-visible only: what context you are gathering, what action you are taking, what changed, what you learned, or what happens next. Do not reveal hidden chain-of-thought.",
+      "- Write visible progress as task-focused status, not first-person narration. Prefer 'Checking...', 'Found...', and 'Next: ...' over 'I am...', 'I found...', or 'I will...'.",
+      "- Make every progress sentence user-visible only: context being gathered, action being taken, what changed, what was found, or what happens next. Do not reveal hidden chain-of-thought.",
       "- Keep progress updates short enough for a terminal timeline."
     );
   }

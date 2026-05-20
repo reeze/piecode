@@ -55,6 +55,28 @@ export function createAgentEventHandler(deps = {}) {
   } = deps;
 
   const progressState = { last: "", lastAt: 0 };
+  const pendingBatchStarts = new Map();
+  const toolStartKey = (tool, input) => {
+    let inputText = "";
+    try {
+      inputText = JSON.stringify(input || {});
+    } catch {
+      inputText = String(input || "");
+    }
+    return `${String(tool || "")}\u0000${inputText}`;
+  };
+  const addPendingBatchStart = (tool, input) => {
+    const key = toolStartKey(tool, input);
+    pendingBatchStarts.set(key, (pendingBatchStarts.get(key) || 0) + 1);
+  };
+  const consumePendingBatchStart = (tool, input) => {
+    const key = toolStartKey(tool, input);
+    const count = pendingBatchStarts.get(key) || 0;
+    if (count <= 0) return false;
+    if (count === 1) pendingBatchStarts.delete(key);
+    else pendingBatchStarts.set(key, count - 1);
+    return true;
+  };
   const emitProgress = (message, { force = false } = {}) => {
     const text = normalizeProgressText(message, 260);
     if (!text) return;
@@ -307,29 +329,30 @@ export function createAgentEventHandler(deps = {}) {
     }
     if (evt.type === "thought") {
       recordTaskEvent?.(taskTraceRef, evt);
-      const update = formatStageUpdate(evt.content);
+      const update = normalizeProgressText(formatStageUpdate(evt.content), 260);
       if (tui && update) tui.setLiveThought(update);
       if (display && update) display.onThought(update);
-      if (!tui && update) emitProgress(update, { force: true });
+      if (update) emitProgress(update);
     }
     if (evt.type === "tool_batch_start") {
       recordTaskEvent?.(taskTraceRef, evt);
       if (display) display.onToolBatchUse(evt.calls);
       const calls = Array.isArray(evt.calls) ? evt.calls : [];
-      const label = traceRef.value || verboseToolLogs ? formatToolBatchSummary(calls) : formatToolCounts(calls.map((call) => call?.tool));
+      for (const call of calls) addPendingBatchStart(call?.tool, call?.input);
+      const label = formatToolBatchSummary(calls) || formatToolCounts(calls.map((call) => call?.tool));
       logLine?.(`[tools] ${label || "tools"}`);
     }
     if (evt.type === "tool_use") {
       recordTaskEvent?.(taskTraceRef, evt);
       const isTodoTool = evt.tool === "todo_write" || evt.tool === "todowrite";
-      const visibleThought = formatStageUpdate(evt.thought || evt.reason || "");
+      const visibleThought = normalizeProgressText(formatStageUpdate(evt.thought || evt.reason || ""), 260);
       if (tui) tui.onToolUse(evt.tool);
       if (tui && visibleThought) tui.setLiveThought(visibleThought);
       if (display && !evt.parallel) display.onToolUse(evt.tool, evt.input, evt.reason || evt.thought);
       if (isTodoTool) {
         // keep todo activity in status bar only
       } else {
-        if (!tui && visibleThought) emitProgress(visibleThought, { force: true });
+        if (visibleThought) emitProgress(visibleThought);
         if (evt.parallel) {
           // batch header already logged by tool_batch_start
         } else if (traceRef.value || verboseToolLogs) {
@@ -351,7 +374,9 @@ export function createAgentEventHandler(deps = {}) {
       }
       if (display) display.onToolStart(evt.tool, evt.input);
       const readableRunLine = formatReadableToolRunLine(evt.tool, evt.input || {});
-      logLine?.(readableRunLine);
+      if (!consumePendingBatchStart(evt.tool, evt.input || {})) {
+        logLine?.(readableRunLine);
+      }
       if (todoAutoTrackRef.value && evt.tool !== "todo_write" && evt.tool !== "todowrite") {
         const advanced = advanceTodosOnToolStart(todosRef.value);
         if (advanced.length > 0) {

@@ -118,9 +118,10 @@ describe("InkTuiLayout", () => {
     });
     await new Promise((resolve) => setTimeout(resolve, 0));
 
-    expect(stripAnsi(output.text()).replace(/\r/g, "")).toContain("one\ntwo\n");
+    const renderedLines = stripAnsi(output.text()).replace(/\r/g, "").split("\n").map((line) => line.trimEnd());
+    expect(renderedLines).toEqual(expect.arrayContaining(["one", "two"]));
     const cursor = getCursorTarget(output.text());
-    const inputLineIndex = cursor.lines.findIndex((line) => line === "ask");
+    const inputLineIndex = cursor.lines.findIndex((line) => line.trimEnd() === "ask");
     expect(cursor).toMatchObject({ y: inputLineIndex, col: 2 });
     layout.destroy();
   });
@@ -169,6 +170,33 @@ describe("InkTuiLayout", () => {
     expect(plain).toContain("overlay body");
     expect(plain).not.toContain("workspace event");
     expect(plain).not.toContain("ask here");
+    layout.destroy();
+  });
+
+  test("keeps approval prompts visible above input even when workspace output overflows", async () => {
+    const input = createInput();
+    const output = new CaptureOutput({ columns: 52, rows: 10 });
+    const layout = new InkTuiLayout({ input, output, error: output });
+
+    layout.render({
+      workspaceLines: Array.from({ length: 30 }, (_v, index) => `workspace line ${index + 1}`),
+      attentionLines: ["! action needed", "? approval required", "q: Approve shell command?", "$ npm test", "y:once n:deny"],
+      inputLines: ["❯ "],
+      statusLine: "Awaiting approval | approve:off",
+      hintLine: "",
+      separatorGlyph: "-",
+      cursorRowOffset: 0,
+      cursorCol: 4,
+    });
+    const cursor = await waitForCursor(output, (candidate) => candidate.lines.some((line) => line.includes("approval required")));
+    const plain = cursor.lines.join("\n");
+    expect(plain).toContain("approval required");
+    expect(plain).toContain("Approve shell command");
+    expect(plain).toContain("npm test");
+    expect(plain).toContain("Awaiting approval");
+    expect(plain).toContain("workspace line 30");
+    expect(plain).not.toContain("workspace line 1");
+    expect(cursor.y).toBe(cursor.lines.findIndex((line) => line.includes("❯")));
     layout.destroy();
   });
 

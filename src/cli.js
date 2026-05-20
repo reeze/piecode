@@ -1061,6 +1061,13 @@ function openLlmDebugOverlay({ tui, llmHistoryRef, llmLastRef, logLine }) {
     const req = llmLastRef?.value?.request || null;
     const res = llmLastRef?.value?.response || null;
     if (!req && !res) {
+      if (tui && typeof tui.openOverlay === "function") {
+        tui.openOverlay("LLM Debug", "No LLM request/response captured yet.\n\nRun a model task, then press CTRL+O again.", {
+          mode: "llm-debug",
+          hint: " q: close ",
+        });
+        return true;
+      }
       if (typeof logLine === "function") logLine("no llm request/response captured yet");
       return false;
     }
@@ -1069,6 +1076,13 @@ function openLlmDebugOverlay({ tui, llmHistoryRef, llmLastRef, logLine }) {
     entries = Array.isArray(llmHistoryRef?.value?.entries) ? llmHistoryRef.value.entries : [];
   }
   if (entries.length === 0) {
+    if (tui && typeof tui.openOverlay === "function") {
+      tui.openOverlay("LLM Debug", "No LLM request/response captured yet.\n\nRun a model task, then press CTRL+O again.", {
+        mode: "llm-debug",
+        hint: " q: close ",
+      });
+      return true;
+    }
     if (typeof logLine === "function") logLine("no llm request/response captured yet");
     return false;
   }
@@ -1464,7 +1478,7 @@ function formatDirectShellOutput(stdoutText, stderrText) {
   return `${trimmed}...`;
 }
 
-async function runDirectShellCommand(command, { workspaceDir, logLine, tui, display } = {}) {
+async function runDirectShellCommand(command, { workspaceDir, logLine, tui, display, signal = null } = {}) {
   const cmd = String(command || "").trim();
   if (!cmd) {
     logLine("usage: ! <shell command>");
@@ -1481,6 +1495,7 @@ async function runDirectShellCommand(command, { workspaceDir, logLine, tui, disp
     const { stdout, stderr } = await execAsync(cmd, {
       cwd: workspaceDir,
       maxBuffer: 10 * 1024 * 1024,
+      signal,
     });
     const preview = formatDirectShellOutput(stdout, stderr);
     if (preview) logLine(`[response] ${preview}`);
@@ -1490,6 +1505,13 @@ async function runDirectShellCommand(command, { workspaceDir, logLine, tui, disp
     if (display) display.onToolEnd("shell", preview || "<empty>", null);
     return { ok: true };
   } catch (err) {
+    if (isTaskAbortError(err)) {
+      const durationMs = Date.now() - startedAt;
+      logLine(`[result] shell aborted | time: ${formatReadableDuration(durationMs)}`);
+      if (tui) tui.onThinkingDone();
+      if (display) display.onToolEnd("shell", "<aborted>", "aborted by user");
+      return { ok: false, aborted: true, error: "aborted by user" };
+    }
     const stdout = String(err?.stdout || "");
     const stderr = String(err?.stderr || "");
     const preview = formatDirectShellOutput(stdout, stderr);
@@ -4391,6 +4413,7 @@ async function main() {
     return [...names].sort((a, b) => a.localeCompare(b));
   };
   const taskRunningRef = { value: false };
+  const directShellAbortRef = { value: null };
   const steerQueueRef = { value: [] };
   const escAbortArmedRef = { value: false };
   const readlineOutput = useTui ? createMutedTtyOutput(stdout) : stdout;
@@ -4642,8 +4665,10 @@ async function main() {
   };
   let escAbortTimer = null;
   let onKeypress = null;
+  let onSigint = null;
   let onMouseData = null;
   let renderLiveInput = () => {};
+  let requestCurrentTaskAbort = () => false;
   if (tui || display) {
     renderLiveInput = () => {
       if (!tui || isReadlineClosed()) return;
@@ -4901,7 +4926,7 @@ async function main() {
         }
         if (key.ctrl && key.name === "c") {
           if (taskRunningRef.value) {
-            const requested = agent.requestAbort();
+            const requested = requestCurrentTaskAbort();
             tui.clearInputHint();
             tui.render(currentInputRef.value, requested ? "aborting task..." : "no active task to abort");
             return;
@@ -5542,6 +5567,36 @@ async function main() {
     }
     baseAgentOnEvent?.(evt);
   };
+  requestCurrentTaskAbort = () => {
+    const shellAbort = directShellAbortRef.value;
+    if (shellAbort && !shellAbort.signal?.aborted) {
+      shellAbort.abort();
+      return true;
+    }
+    return agent.requestAbort();
+  };
+  onSigint = () => {
+    if (taskRunningRef.value) {
+      const requested = requestCurrentTaskAbort();
+      if (tui) {
+        tui.clearInputHint();
+        tui.render(currentInputRef.value, requested ? "aborting task..." : "no active task to abort");
+      }
+      return;
+    }
+    if (tui) {
+      userExitRequestedRef.value = true;
+      currentInputRef.value = "";
+      tui.clearInputHint();
+      tui.render("", "exiting");
+    }
+    try {
+      rl.close();
+    } catch {
+      // no-op
+    }
+  };
+  process.on("SIGINT", onSigint);
 
   if (startupResumeSession) {
     agent.history = Array.isArray(startupResumeSession.agentHistory) ? startupResumeSession.agentHistory : [];
@@ -5608,6 +5663,9 @@ async function main() {
       if (onResize) {
         stdout.off("resize", onResize);
         process.off("SIGWINCH", onResize);
+      }
+      if (onSigint) {
+        process.off("SIGINT", onSigint);
       }
       if (tui) tui.stop();
       rl.close();
@@ -5841,18 +5899,34 @@ async function main() {
       currentInputRef.value = "";
       if (tui) tui.setProjectInstructionsVisible(false);
       if (tui) tui.render(currentInputRef.value, "running shell command");
-      const shellResult = await runDirectShellCommand(finalInput.slice(1), {
-        workspaceDir,
-        logLine,
-        tui,
-        display,
-      });
-      const saved = await finishTaskTrace(taskTraceRef, workspaceDir, {
-        status: shellResult?.ok ? "done" : "error",
-        error: shellResult?.ok ? "" : String(shellResult?.error || ""),
-        sessionBus,
-      });
-      if (saved) logLine(`[trace] session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
+      taskRunningRef.value = true;
+      const shellAbort = new AbortController();
+      directShellAbortRef.value = shellAbort;
+      let shellResult = null;
+      try {
+        shellResult = await runDirectShellCommand(finalInput.slice(1), {
+          workspaceDir,
+          logLine,
+          tui,
+          display,
+          signal: shellAbort.signal,
+        });
+        const saved = await finishTaskTrace(taskTraceRef, workspaceDir, {
+          status: shellResult?.ok ? "done" : shellResult?.aborted ? "aborted" : "error",
+          error: shellResult?.ok ? "" : String(shellResult?.error || ""),
+          sessionBus,
+        });
+        if (saved) logLine(`[trace] session trace saved: .piecode/sessions/${saved.sessionId} (${saved.id})`);
+      } finally {
+        directShellAbortRef.value = null;
+        taskRunningRef.value = false;
+        escAbortArmedRef.value = false;
+        if (escAbortTimer) {
+          clearTimeout(escAbortTimer);
+          escAbortTimer = null;
+        }
+        if (tui) tui.clearInputHint();
+      }
       continue;
     }
     const isSlash = finalInput.startsWith("/");

@@ -652,6 +652,7 @@ function normalizeTimelineSpacing(lines) {
   let previousGroup = "";
 
   const classify = (line) => {
+    const raw = String(line || "");
     const stripped = stripAnsi(String(line || ""));
     const plain = stripped.trimStart();
     if (!plain) return "blank";
@@ -659,6 +660,7 @@ function normalizeTimelineSpacing(lines) {
     if (/^(?:↳|->)\s+/.test(plain)) return "tool-result";
     if (/^(?:›|>)\s+/.test(plain)) return "tool";
     if (/^(?:✓|\[ok\])\s+.*\b(?:done|completed|success|succeeded)\b/i.test(plain)) return "done-result";
+    if (/\x1b\[1;35m(?:•|\*)\x1b\[0m/.test(raw)) return "update";
     if (/^(?:•|\*|✓|×|\[ok\]|\[x\])\s+/.test(plain)) return "response";
     if (/^\s{2,}\S/.test(stripped)) return previousGroup || "continuation";
     return "content";
@@ -682,6 +684,28 @@ function normalizeTimelineSpacing(lines) {
     previousGroup = group;
   }
 
+  return result;
+}
+
+function isDoneResultTimelineLine(line) {
+  const plain = stripAnsi(String(line || "")).trim();
+  return /^(?:✓|\[ok\])\s+.*\b(?:done|completed|success|succeeded)\b/i.test(plain);
+}
+
+function dedupeAdjacentResultRows(lines) {
+  const source = Array.isArray(lines) ? lines : [];
+  const result = [];
+  let previousResult = "";
+  for (const line of source) {
+    const plain = stripAnsi(String(line || "")).trim();
+    if (plain && isDoneResultTimelineLine(line)) {
+      if (previousResult && previousResult === plain) continue;
+      previousResult = plain;
+    } else if (plain) {
+      previousResult = "";
+    }
+    result.push(line);
+  }
   return result;
 }
 
@@ -991,6 +1015,9 @@ function wrapTimelineLine(line, width) {
   if (hasBackgroundColor(line) && stringDisplayWidth(stripAnsi(line)) <= Math.max(0, Number(width) || 0)) {
     return [line];
   }
+  if (/^\s+\S/.test(stripAnsi(String(line || ""))) && stringDisplayWidth(stripAnsi(line)) <= Math.max(0, Number(width) || 0)) {
+    return [line];
+  }
   const chunks = wrapText(line, width);
   if (chunks.length <= 1) return chunks;
   const indent = timelineContinuationIndent(line);
@@ -1157,6 +1184,13 @@ export class SimpleTui {
     }
     const timelineLines = this.formatTimelineLines(rawLine);
     const spacedTimelineLines = this.withTimelineSpacing(timelineLines);
+    if (rawLine.startsWith("[result] ")) {
+      const previous = this.timeline.slice().reverse().find((item) => String(item || "").trim());
+      const next = spacedTimelineLines.find((item) => String(item || "").trim());
+      if (previous && next && stripAnsi(previous).trim() === stripAnsi(next).trim()) {
+        return;
+      }
+    }
     for (const item of spacedTimelineLines) {
       this.timeline.push(item);
     }
@@ -1164,6 +1198,7 @@ export class SimpleTui {
     if (this.timeline.length > this.maxTimeline) {
       this.timeline = this.timeline.slice(this.timeline.length - this.maxTimeline);
     }
+    this.timeline = dedupeAdjacentResultRows(this.timeline);
   }
 
   markActivity(label = "") {
@@ -2122,11 +2157,6 @@ export class SimpleTui {
       const prefix = marker ? `${color(marker, markerColor)} ` : "";
       return items.map((item, index) => (index === 0 ? `${prefix}${item}` : `    ${item}`));
     };
-    const labeledTimelineItem = (marker, label, text, { markerColor = "2;37", labelColor = "1;36", textColor = "2;37" } = {}) => {
-      const body = String(text || "").trim();
-      if (!body) return [];
-      return timelineItem(marker, `${color(label, labelColor)} ${color(body, textColor)}`, markerColor);
-    };
     const responseBlock = (marker, lines, markerColor = "1;32") => {
       const items = (Array.isArray(lines) ? lines : [lines]).map((item) => String(item || ""));
       while (items.length > 0 && !items[0].trim()) items.shift();
@@ -2241,13 +2271,13 @@ export class SimpleTui {
     const toolLabel = (tool, details = "") => {
       const name = String(tool || "tool");
       const detail = compactToolDetail(name, details);
-      const suffix = detail ? ` ${color(detail, "2;37")}` : "";
+      const suffix = detail ? ` ${detail}` : "";
       return `${color(toolDisplayName(name), "36")}${suffix}`;
     };
     const summarizeToolBatch = (text) => {
       const body = String(text || "").trim();
-      if (!body) return "";
-      if (this.showRawLogs) return trimWorkspaceText(body, 420).text.replace(/\n/g, " ");
+      if (!body) return [];
+      if (this.showRawLogs) return [trimWorkspaceText(body, 420).text.replace(/\n/g, " ")];
       const match = body.match(/^([a-zA-Z0-9_.-]+)\s+x(\d+)\b/i);
       if (match) {
         const detailSource = body.split(/\s+-\s+/).slice(1).join(" - ").trim();
@@ -2256,12 +2286,14 @@ export class SimpleTui {
           const value = item.trim().match(/^[a-zA-Z0-9_.-]+\((.*)\)$/)?.[1]?.trim();
           if (value) names.push(value);
         }
-        const shown = names.slice(0, 3).join(", ");
-        const more = names.length > 3 ? ` +${names.length - 3}` : "";
-        return `${toolDisplayName(match[1])} x${match[2]}${shown ? ` · ${shown}${more}` : ""}`;
+        const header = `${toolDisplayName(match[1])} x${match[2]}`;
+        if (names.length === 0) return [header];
+        const shown = names.slice(0, 6);
+        const more = names.length > shown.length ? [`... ${names.length - shown.length} more`] : [];
+        return [header, ...shown, ...more];
       }
       const first = body.split(/\s+-\s+/, 1)[0]?.trim();
-      return trimWorkspaceText(first || body, 120).text.replace(/\n/g, " ");
+      return [trimWorkspaceText(first || body, 120).text.replace(/\n/g, " ")];
     };
     const summarizeToolResult = (text) => {
       const body = String(text || "").replace(/\r/g, "").trim();
@@ -2393,20 +2425,12 @@ export class SimpleTui {
     if (line.startsWith("[thought] ")) {
       const body = trimWorkspaceText(line.slice(10).trim(), 800).text;
       if (!body) return [];
-      return labeledTimelineItem(this.symbols.response, "Thinking", body, {
-        markerColor: "1;35",
-        labelColor: "1;35",
-        textColor: "2;37",
-      });
+      return timelineItem(this.symbols.response, body, "1;35");
     }
     if (line.startsWith("[progress] ")) {
       const body = trimWorkspaceText(line.slice(11).trim(), 800).text;
       if (!body) return [];
-      return labeledTimelineItem(this.symbols.response, "Progress", body, {
-        markerColor: "1;35",
-        labelColor: "1;35",
-        textColor: "2;37",
-      });
+      return timelineItem(this.symbols.response, body, "1;35");
     }
     if (line.startsWith("[run] ")) {
       const rawRun = line.slice(6).trim();
@@ -2427,12 +2451,8 @@ export class SimpleTui {
           : approval === "auto"
           ? color("[AUTO]", "2;32")
           : "";
-      const body = `${run.label || "Tool"}${safeDisplay ? ` ${safeDisplay}` : ""}${tag ? ` ${stripAnsi(tag)}` : ""}`;
-      return labeledTimelineItem(this.symbols.tool, "Run", body, {
-        markerColor: "1;36",
-        labelColor: "1;36",
-        textColor: "36",
-      });
+      const body = `${color(run.label || "Tool", "36")}${safeDisplay ? ` ${safeDisplay}` : ""}${tag ? ` ${tag}` : ""}`;
+      return timelineItem(this.symbols.tool, body, "2;37");
     }
     if (line.startsWith("[tool] ")) {
       const body = line.slice(7).trim();
@@ -2445,16 +2465,21 @@ export class SimpleTui {
         return [];
       }
       const match = body.match(/^([a-zA-Z0-9_.-]+)\s*(.*)$/);
-      return timelineItem(this.symbols.tool, `${color("Tool", "1;36")} ${toolLabel(match?.[1] || body, match?.[2] || "")}`, "1;36");
+      return timelineItem(this.symbols.tool, toolLabel(match?.[1] || body, match?.[2] || ""), "2;37");
     }
     if (line.startsWith("[tools] ")) {
       const body = line.slice(8).trim();
       const summary = summarizeToolBatch(body);
-      return labeledTimelineItem(this.symbols.tool, "Tools", summary || "batch", {
-        markerColor: "1;36",
-        labelColor: "1;36",
-        textColor: "36",
-      });
+      if (summary.length === 0) return [];
+      return timelineBlock(
+        this.symbols.tool,
+        summary.map((item, index) =>
+          index === 0
+            ? color(item, "36")
+            : item
+        ),
+        "2;37"
+      );
     }
     if (line.startsWith("[agent] ")) {
       return timelineItem(this.symbols.agent, `${color("Agent", "1;35")} ${trimWorkspaceText(line.slice(8).trim(), 600).text}`, "1;35");
@@ -2944,8 +2969,9 @@ export class SimpleTui {
           ? truncateLine(raw, bottomWidth)
           : `${" ".repeat(Math.max(0, bottomWidth - stringDisplayWidth(raw)))}${raw}`;
     }
-    const approvalBlock = this.approvalPrompt ? [sep, ...approvalContentLines] : [];
-    const clarificationBlock = this.clarificationPrompt ? [sep, ...clarificationContentLines] : [];
+    const attentionSep = colorFullLine(" ! action needed ", "1;30;43", width);
+    const approvalBlock = this.approvalPrompt ? [attentionSep, ...approvalContentLines] : [];
+    const clarificationBlock = this.clarificationPrompt ? [attentionSep, ...clarificationContentLines] : [];
     const contextLine = goalContextLine || taskContextLine;
     const contextBlock = contextLine ? ["", contextLine] : [];
     const thinkingColors = ["82", "118", "154", "190", "201"];
@@ -3048,6 +3074,10 @@ export class SimpleTui {
     this.lastInputLine = inputState.lines.join("\n");
     const cursorRow = Math.max(1, Math.min(height, this.lastInputRow + Math.max(0, inputState.cursorRowOffset)));
     if (this.layout) {
+      const attentionLines = [
+        ...approvalBlock,
+        ...clarificationBlock,
+      ].filter((line) => String(line || "").trim());
       const inputComposite = [
         ...inputState.lines.map((line) => line),
         ...commandSuggestionBlock,
@@ -3057,6 +3087,7 @@ export class SimpleTui {
         frameLines,
         cursorRow,
         workspaceLines: beforeInputLines.slice(0, -1),
+        attentionLines,
         inputLines: inputComposite,
         statusLine: promptStatus,
         separatorGlyph: this.unicodeSymbols ? "─" : "-",
