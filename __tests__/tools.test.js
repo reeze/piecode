@@ -708,6 +708,15 @@ describe("tools usability", () => {
     expect(classifyShellCommand("rg foo src").level).toBe("safe");
   });
 
+  test("rtk read-only wrappers are classified like their safe underlying commands", () => {
+    expect(classifyShellCommand("rtk git diff -- src/lib/tools.js").level).toBe("safe");
+    expect(classifyShellCommand("rtk git status --short").level).toBe("safe");
+    expect(classifyShellCommand("rtk grep token src").level).toBe("safe");
+    expect(classifyShellCommand("rtk read package.json").level).toBe("safe");
+    expect(classifyShellCommand("rtk npm run lint").level).toBe("unclassified");
+    expect(classifyShellCommand("rtk git commit -m test").level).toBe("dangerous");
+  });
+
   test("read_file rejects symlink escape outside workspace", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
     const outside = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-outside-"));

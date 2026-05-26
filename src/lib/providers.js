@@ -13,6 +13,10 @@ const DEFAULT_OPENROUTER_MODEL =
   process.env.OPENROUTER_MODEL || 'openai/gpt-4.1-mini';
 const DEFAULT_OPENROUTER_BASE_URL =
   process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
+const DEFAULT_SEED_MODEL =
+  process.env.SEED_MODEL || 'doubao-seed-code-preview-latest';
+const DEFAULT_SEED_BASE_URL =
+  process.env.SEED_BASE_URL || 'https://ark.cn-beijing.volces.com/api/coding';
 const DEFAULT_CODEX_MODEL = process.env.CODEX_MODEL || 'gpt-5.3-codex';
 const DEFAULT_CODEX_BACKEND_BASE_URL = 'https://chatgpt.com/backend-api';
 const CODEX_ACCOUNT_CLAIM = 'https://api.openai.com/auth';
@@ -23,12 +27,42 @@ const DEFAULT_MODEL_TIMEOUT_MS = Math.max(
 );
 const execFile = promisify(execFileCb);
 
+function createAbortTimeout(controller) {
+  let timer = null;
+  const refresh = () => {
+    if (timer) clearTimeout(timer);
+    timer = setTimeout(() => controller.abort(), DEFAULT_MODEL_TIMEOUT_MS);
+  };
+  const clear = () => {
+    if (timer) clearTimeout(timer);
+    timer = null;
+  };
+  refresh();
+  return { refresh, clear };
+}
+
 function requireEnv(name) {
   const value = process.env[name];
   if (!value) {
     throw new Error(`Missing required env var: ${name}`);
   }
   return value;
+}
+
+function describeFetchError(err) {
+  const parts = [String(err?.message || err || 'request failed')];
+  const cause = err?.cause;
+  if (cause?.code) parts.push(String(cause.code));
+  if (cause?.hostname) parts.push(String(cause.hostname));
+  return [...new Set(parts.filter(Boolean))].join(' ');
+}
+
+function modelNetworkError(label, url, err) {
+  const wrapped = new Error(
+    `${label} failed while connecting to ${url}: ${describeFetchError(err)}`
+  );
+  wrapped.cause = err;
+  return wrapped;
 }
 
 async function postJson(url, headers, body, options = {}) {
@@ -40,10 +74,7 @@ async function postJson(url, headers, body, options = {}) {
     abortListener = () => controller.abort();
     externalSignal.addEventListener('abort', abortListener, { once: true });
   }
-  const timeout = setTimeout(
-    () => controller.abort(),
-    DEFAULT_MODEL_TIMEOUT_MS
-  );
+  const timeout = createAbortTimeout(controller);
   let res;
   try {
     res = await fetch(url, {
@@ -66,9 +97,9 @@ async function postJson(url, headers, body, options = {}) {
         `Model request timed out after ${DEFAULT_MODEL_TIMEOUT_MS}ms`
       );
     }
-    throw err;
+    throw modelNetworkError('Model request', url, err);
   } finally {
-    clearTimeout(timeout);
+    timeout.clear();
     if (externalSignal && abortListener) {
       try {
         externalSignal.removeEventListener('abort', abortListener);
@@ -97,10 +128,7 @@ async function postJsonStream(url, headers, body, onChunk, options = {}) {
     abortListener = () => controller.abort();
     externalSignal.addEventListener('abort', abortListener, { once: true });
   }
-  const timeout = setTimeout(
-    () => controller.abort(),
-    DEFAULT_MODEL_TIMEOUT_MS
-  );
+  const timeout = createAbortTimeout(controller);
   let res;
   try {
     res = await fetch(url, {
@@ -113,6 +141,12 @@ async function postJsonStream(url, headers, body, onChunk, options = {}) {
       signal: controller.signal,
     });
   } catch (err) {
+    timeout.clear();
+    if (externalSignal && abortListener) {
+      try {
+        externalSignal.removeEventListener('abort', abortListener);
+      } catch {}
+    }
     if (err?.name === 'AbortError') {
       if (externalSignal?.aborted) {
         const abortErr = new Error('Model stream aborted.');
@@ -123,8 +157,9 @@ async function postJsonStream(url, headers, body, onChunk, options = {}) {
         `Model stream timed out after ${DEFAULT_MODEL_TIMEOUT_MS}ms`
       );
     }
-    throw err;
+    throw modelNetworkError('Model stream', url, err);
   }
+  timeout.refresh();
   try {
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
@@ -167,6 +202,7 @@ async function postJsonStream(url, headers, body, onChunk, options = {}) {
       }
       const { done, value } = packet;
       if (done) break;
+      timeout.refresh();
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
@@ -198,7 +234,7 @@ async function postJsonStream(url, headers, body, onChunk, options = {}) {
       usage,
     };
   } finally {
-    clearTimeout(timeout);
+    timeout.clear();
     if (externalSignal && abortListener) {
       try {
         externalSignal.removeEventListener('abort', abortListener);
@@ -404,10 +440,7 @@ async function postResponsesStreamDetailed(url, headers, body, onChunk, options 
     abortListener = () => controller.abort();
     externalSignal.addEventListener('abort', abortListener, { once: true });
   }
-  const timeout = setTimeout(
-    () => controller.abort(),
-    DEFAULT_MODEL_TIMEOUT_MS
-  );
+  const timeout = createAbortTimeout(controller);
   let res;
   try {
     res = await fetch(url, {
@@ -420,6 +453,12 @@ async function postResponsesStreamDetailed(url, headers, body, onChunk, options 
       signal: controller.signal,
     });
   } catch (err) {
+    timeout.clear();
+    if (externalSignal && abortListener) {
+      try {
+        externalSignal.removeEventListener('abort', abortListener);
+      } catch {}
+    }
     if (err?.name === 'AbortError') {
       if (externalSignal?.aborted) {
         const abortErr = new Error('Model stream aborted.');
@@ -430,9 +469,10 @@ async function postResponsesStreamDetailed(url, headers, body, onChunk, options 
         `Model stream timed out after ${DEFAULT_MODEL_TIMEOUT_MS}ms`
       );
     }
-    throw err;
+    throw modelNetworkError('Model stream', url, err);
   }
 
+  timeout.refresh();
   try {
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
@@ -569,6 +609,7 @@ async function postResponsesStreamDetailed(url, headers, body, onChunk, options 
       }
       const { done, value } = packet;
       if (done) break;
+      timeout.refresh();
       buffer += decoder.decode(value, { stream: true });
 
       let boundary;
@@ -597,7 +638,7 @@ async function postResponsesStreamDetailed(url, headers, body, onChunk, options 
 
     return { text: text.trim(), usage, toolCalls, finishReason };
   } finally {
-    clearTimeout(timeout);
+    timeout.clear();
     if (externalSignal && abortListener) {
       try {
         externalSignal.removeEventListener('abort', abortListener);
@@ -621,10 +662,7 @@ async function postJsonStreamOpenAINative(
     abortListener = () => controller.abort();
     externalSignal.addEventListener('abort', abortListener, { once: true });
   }
-  const timeout = setTimeout(
-    () => controller.abort(),
-    DEFAULT_MODEL_TIMEOUT_MS
-  );
+  const timeout = createAbortTimeout(controller);
   let res;
   try {
     res = await fetch(url, {
@@ -637,6 +675,12 @@ async function postJsonStreamOpenAINative(
       signal: controller.signal,
     });
   } catch (err) {
+    timeout.clear();
+    if (externalSignal && abortListener) {
+      try {
+        externalSignal.removeEventListener('abort', abortListener);
+      } catch {}
+    }
     if (err?.name === 'AbortError') {
       if (externalSignal?.aborted) {
         const abortErr = new Error('Model stream aborted.');
@@ -647,8 +691,9 @@ async function postJsonStreamOpenAINative(
         `Model stream timed out after ${DEFAULT_MODEL_TIMEOUT_MS}ms`
       );
     }
-    throw err;
+    throw modelNetworkError('Model stream', url, err);
   }
+  timeout.refresh();
   try {
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
@@ -681,7 +726,7 @@ async function postJsonStreamOpenAINative(
       try {
         packet = await reader.read();
       } catch (err) {
-        if (err?.name === 'AbortError') {
+    if (err?.name === 'AbortError') {
           if (externalSignal?.aborted) {
             const abortErr = new Error('Model stream aborted.');
             abortErr.code = 'ABORT_ERR';
@@ -689,12 +734,13 @@ async function postJsonStreamOpenAINative(
           }
           throw new Error(
             `Model stream timed out after ${DEFAULT_MODEL_TIMEOUT_MS}ms`
-          );
-        }
-        throw err;
-      }
+      );
+    }
+    throw modelNetworkError('Model stream', url, err);
+  }
       const { done, value } = packet;
       if (done) break;
+      timeout.refresh();
       buffer += decoder.decode(value, { stream: true });
       const lines = buffer.split('\n');
       buffer = lines.pop() || '';
@@ -735,6 +781,7 @@ async function postJsonStreamOpenAINative(
           const deltaToolCalls = Array.isArray(delta.tool_calls)
             ? delta.tool_calls
             : [];
+          if (deltaToolCalls.length > 0) timeout.refresh();
           for (const item of deltaToolCalls) {
             const idx = Number.isInteger(item?.index) ? item.index : 0;
             const current = toolCallsByIndex.get(idx) || {
@@ -750,14 +797,13 @@ async function postJsonStreamOpenAINative(
                 typeof item.function.name === 'string' &&
                 item.function.name
               ) {
-                current.function.name += item.function.name;
+                current.function.name = item.function.name;
               }
               if (
                 typeof item.function.arguments === 'string' &&
                 item.function.arguments
               ) {
                 current.function.arguments += item.function.arguments;
-                onChunk?.(item.function.arguments);
               }
             }
             toolCallsByIndex.set(idx, current);
@@ -780,7 +826,7 @@ async function postJsonStreamOpenAINative(
 
     return { message, finishReason, usage };
   } finally {
-    clearTimeout(timeout);
+    timeout.clear();
     if (externalSignal && abortListener) {
       try {
         externalSignal.removeEventListener('abort', abortListener);
@@ -826,6 +872,10 @@ function getSupportedCodexApiModels(codexHome) {
   );
 }
 
+function isCodexSpecificModel(modelName) {
+  return String(modelName || '').toLowerCase().includes('codex');
+}
+
 function resolveCodexModel(codexHome, preferredModel) {
   const supported = getSupportedCodexApiModels(codexHome);
   const hasSupportData = supported.size > 0;
@@ -845,9 +895,13 @@ function loadCodexAuth() {
   if (!auth || typeof auth !== 'object') return null;
 
   const configModel = parseCodexConfigModel(readTextFile(configPath));
+  const preferredModel =
+    process.env.CODEX_MODEL ||
+    (isCodexSpecificModel(configModel) ? configModel : '') ||
+    DEFAULT_CODEX_MODEL;
   const resolvedModel = resolveCodexModel(
     codexHome,
-    process.env.CODEX_MODEL || configModel || DEFAULT_CODEX_MODEL
+    preferredModel
   );
   const openaiApiKey =
     typeof auth.OPENAI_API_KEY === 'string' ? auth.OPENAI_API_KEY : '';
@@ -1572,6 +1626,23 @@ export function getProvider(options = {}) {
             process.env.OPENROUTER_SITE_URL || 'https://piecode.local',
           'X-Title': process.env.OPENROUTER_APP_NAME || 'Piecode',
         },
+      });
+    }
+
+    if (provider === 'seed') {
+      const seedApiKey =
+        configuredApiKey || process.env.SEED_API_KEY || process.env.ARK_API_KEY;
+      if (!seedApiKey) {
+        throw new Error(
+          'Missing API key for seed provider. Set SEED_API_KEY or pass --api-key.'
+        );
+      }
+      return createOpenAICompatibleProvider({
+        kind: 'seed-openai-compatible',
+        model: configuredModel || DEFAULT_SEED_MODEL,
+        apiKey: seedApiKey,
+        baseUrl: configuredBaseUrl || DEFAULT_SEED_BASE_URL,
+        thinkingEffort: configuredThinkingEffort,
       });
     }
 

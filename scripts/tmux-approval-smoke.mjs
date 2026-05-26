@@ -52,6 +52,7 @@ writeFileSync(scriptPath, fixture, "utf8");
 
 try {
   requireOk(run("tmux", ["new-session", "-d", "-s", session, "-x", "80", "-y", "16", "node", scriptPath]), "tmux new-session");
+  await new Promise((resolve) => setTimeout(resolve, 500));
   const capture = run("tmux", ["capture-pane", "-p", "-e", "-t", session]);
   requireOk(capture, "tmux capture-pane");
   const plain = String(capture.stdout || "").replace(/\x1b(?:\[[0-9;?]*[ -/]*[@-~]|[%()][ -~])/g, "");

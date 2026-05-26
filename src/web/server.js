@@ -5,6 +5,7 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { Agent } from "../lib/agent.js";
+import { loadMemory } from "../lib/memory.js";
 import { getProvider } from "../lib/providers.js";
 import {
   addSkillByName,
@@ -621,6 +622,7 @@ export class WebAgentSession {
     this.activePluginsRef = { value: [] };
     this.pluginIndex = new Map();
     this.projectInstructionsRef = { value: null };
+    this.memoryRef = { value: null };
     this.mcpHub = null;
     this.approvals = new ApprovalBroker({ publish: (type, payload) => this.publish(type, payload) });
     this.clarifications = new ClarificationBroker({ publish: (type, payload) => this.publish(type, payload) });
@@ -642,6 +644,7 @@ export class WebAgentSession {
     const loadedPlugins = await loadActivePlugins(this.pluginIndex, requestedPlugins);
     this.activePluginsRef.value = loadedPlugins.active;
     this.projectInstructionsRef.value = await loadProjectInstructions(this.workspaceDir);
+    this.memoryRef.value = await loadMemory({ workspaceDir: this.workspaceDir });
     await autoLoadSkillsFromInstructions(this.projectInstructionsRef.value, this.activeSkillsRef, this.skillIndex);
 
     this.providerOptions = resolveProviderOptions(this.settings);
@@ -668,6 +671,7 @@ export class WebAgentSession {
       activeSkillsRef: this.activeSkillsRef,
       activePluginsRef: this.activePluginsRef,
       projectInstructionsRef: this.projectInstructionsRef,
+      memoryRef: this.memoryRef,
       mcpHub: this.mcpHub,
       getSteers: () => this.consumeSteers(),
       webSearch: this.settings?.webSearch || this.settings?.tools?.web?.search || null,

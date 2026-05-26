@@ -941,7 +941,6 @@ function makeTuiSymbols(useUnicode = true) {
         subheading: "›",
         up: "↑",
         down: "↓",
-        todoDoneNotice: "所有 TODO 已完成，可以结束了",
       }
     : {
         prompt: ">",
@@ -960,7 +959,6 @@ function makeTuiSymbols(useUnicode = true) {
         subheading: ">",
         up: "up:",
         down: "down:",
-        todoDoneNotice: "All TODO completed.",
       };
 }
 
@@ -1093,7 +1091,8 @@ export class SimpleTui {
     this.thinkingTick = 0;
     this.thinkingTimer = null;
     this.progressRefreshTimer = null;
-    this.animateThinking = String(process.env.PIECODE_TUI_ANIMATION || "").trim() === "1";
+    this.animateThinking = String(process.env.PIECODE_TUI_ANIMATION || "").trim() !== "0";
+    this.thinkingAnimationMs = Math.max(80, Number(process.env.PIECODE_TUI_ANIMATION_MS) || 120);
     this.progressRefreshMs = Math.max(1000, Number(process.env.PIECODE_TUI_PROGRESS_REFRESH_MS) || 5000);
     this.modelSuggestionsVisible = false;
     this.modelSuggestions = [];
@@ -1515,9 +1514,9 @@ export class SimpleTui {
     if (this.thinkingTimer) return;
     this.thinkingTimer = setInterval(() => {
       if (!this.active || !this.thinking) return;
-      this.thinkingTick = (this.thinkingTick + 1) % 5;
+      this.thinkingTick = (this.thinkingTick + 1) % 1000;
       this.render();
-    }, 900);
+    }, this.thinkingAnimationMs);
     this.thinkingTimer.unref?.();
   }
 
@@ -1594,7 +1593,6 @@ export class SimpleTui {
       nextDone === nextTotal &&
       !(previousTotal > 0 && previousDone === previousTotal);
     if (becameAllCompleted) {
-      this.transientStatusNotice = this.symbols.todoDoneNotice;
       this.lastStatus = "Task completed";
     }
     this.render();
@@ -1745,9 +1743,13 @@ export class SimpleTui {
   }
 
   openOverlay(title, text, options = {}) {
+    const maxOverlayChars = Math.max(2000, Number(process.env.PIECODE_TUI_OVERLAY_MAX_CHARS) || 120000);
+    const clipped = trimWorkspaceText(text, maxOverlayChars);
     this.overlayVisible = true;
     this.overlayTitle = String(title || "Details");
-    this.overlayText = String(text || "");
+    this.overlayText = clipped.trimmed > 0
+      ? `${clipped.text}\n\n[overlay clipped ${clipped.trimmed} chars; set PIECODE_TUI_OVERLAY_MAX_CHARS to adjust]`
+      : clipped.text;
     this.overlayScroll = 0;
     this.overlayMode = String(options?.mode || "");
     this.overlayHint = String(options?.hint || "");
@@ -2080,31 +2082,30 @@ export class SimpleTui {
       }
       if (!command && shellBody) command = shellBody;
       if (!detailsText && shellReason) detailsText = shellReason;
-      if (!riskText && detailsText && /danger/i.test(detailsText)) riskText = "dangerous";
-      question = "Approve shell command?";
+      question = "Approve command?";
     }
 
     if (!question && command) {
-      question = "Approve command execution?";
+      question = "Approve command?";
     }
 
-    const riskLabel = riskText ? ` ${riskText.toUpperCase()}` : "";
-    lines.push(color(` ? approval required${riskLabel}`, riskText === "dangerous" ? "1;31" : "1;33"));
-    if (question) {
-      lines.push(truncateLine(`   ${color("action:", "1;36")} ${question}`, width));
-    }
+    const risk = riskText ? riskText.toLowerCase() : "";
+    const title = ` ? Approval needed${risk ? ` · ${risk}` : ""}`;
+    lines.push(color(title, risk === "dangerous" ? "1;31" : "1;33"));
     if (command) {
-      lines.push(truncateLine(`   ${color("command:", "1;35")} ${color(command, "37")}`, width));
+      lines.push(truncateLine(`   ${color("$", "2;37")} ${color(command, "37")}`, width));
+    } else if (question) {
+      lines.push(truncateLine(`   ${question}`, width));
     }
     if (!detailsText && prompt && normalize(prompt) !== normalize(question) && normalize(prompt) !== normalize(command)) {
       detailsText = prompt;
     }
     if (detailsText && normalize(detailsText) !== normalize(question)) {
-      lines.push(truncateLine(`   ${color("why:", "1;35")} ${detailsText}`, width));
+      lines.push(truncateLine(`   ${color("Reason:", "2;37")} ${detailsText}`, width));
     }
-    lines.push(truncateLine(`   ${color("choose:", "1;36")} ${color("y", "1;32")}=allow once  ${color("r", "1;36")}=remember exact command  ${color("a", "1;33")}=allow all this session`, width));
-    const enterDecision = this.approvalDefaultYes ? color("allow once", "32") : color("deny", "31");
-    lines.push(truncateLine(`           ${color("n", "1;31")}=deny  ${color("enter", "1;33")}=${enterDecision}`, width));
+    const enterDecision = this.approvalDefaultYes ? "allow once" : "deny";
+    lines.push(truncateLine(`   ${color("y", "1;32")} allow once   ${color("n", "1;31")} deny   ${color("enter", "1;33")} ${enterDecision}`, width));
+    lines.push(truncateLine(`   ${color("r", "1;36")} remember command   ${color("a", "1;33")} allow all`, width));
     return lines;
   }
 
@@ -2469,10 +2470,11 @@ export class SimpleTui {
       const width = Math.max(20, (this.out?.columns || 100) - 1);
       const textWidth = Math.max(8, width - stringDisplayWidth(` ${this.symbols.prompt}  `));
       const taskLines = wrapText(line.slice(7).trim(), textWidth);
-      return taskLines.map((taskLine, index) => {
+      const renderedTaskLines = taskLines.map((taskLine, index) => {
         const prefix = index === 0 ? `${this.symbols.prompt} ` : "  ";
         return colorFullLine(` ${prefix}${taskLine} `, "1;37;48;5;236", width);
       });
+      return ["", ...renderedTaskLines, ""];
     }
     if (line.startsWith("[model] ")) {
       return [];
@@ -2798,6 +2800,14 @@ export class SimpleTui {
     this.render(this.currentInput, this.lastStatus || "waiting for input", cursorIndex);
   }
 
+  getModelStatusParts() {
+    const raw = String(this.modelName || this.providerLabel?.() || "").trim();
+    if (!raw) return { model: "unknown", thinkingEffort: "default" };
+    const model = raw.match(/^([^()]+)\s*(?:\(|$)/)?.[1]?.trim() || raw;
+    const thinkingEffort = raw.match(/(?:^|[,\s])think:([^,)\s]+)/i)?.[1]?.trim() || "default";
+    return { model, thinkingEffort };
+  }
+
   formatStatusLine(width) {
     const state =
       this.modelState === "running"
@@ -2814,11 +2824,13 @@ export class SimpleTui {
       this.contextLimit > 0
         ? ` | ctx: ${formatCompactNumber(this.contextUsed)}/${formatCompactNumber(this.contextLimit)} (${Math.min(999, Math.round((this.contextUsed / this.contextLimit) * 100))}%)`
         : "";
+    const todoDoneCount = this.todos.filter((t) => String(t?.status || "").toLowerCase() === "completed").length;
     const todoSummary =
-      this.todos.length > 0
-        ? ` | TODO(${this.todos.filter((t) => t.status === "completed").length}/${this.todos.length})`
+      this.todos.length > 0 && todoDoneCount < this.todos.length
+        ? ` | TODO(${todoDoneCount}/${this.todos.length})`
         : "";
-    const text = ` model: ${this.modelName || this.providerLabel()} | state: ${state} | last: ${time} | tool: ${tool}${ctx}${todoSummary}${phase}`;
+    const modelStatus = this.getModelStatusParts();
+    const text = ` model: ${modelStatus.model} | think: ${modelStatus.thinkingEffort} | state: ${state} | last: ${time} | tool: ${tool}${ctx}${todoSummary}${phase}`;
     return truncateLine(text, width);
   }
 
@@ -3002,24 +3014,29 @@ export class SimpleTui {
       this.contextLimit > 0
         ? `ctx:${formatCompactNumber(this.contextUsed)}/${formatCompactNumber(this.contextLimit)}(${Math.min(999, Math.round((this.contextUsed / this.contextLimit) * 100))}%)`
         : "";
+    const modelStatus = this.getModelStatusParts();
+    const modelLabel = `model:${modelStatus.model}`;
+    const thinkingEffortStatus = `think:${modelStatus.thinkingEffort}`;
     const todoDone = this.todos.filter((t) => String(t?.status || "").toLowerCase() === "completed").length;
-    const todoStatus = this.todos.length > 0 ? `TODO(${todoDone}/${this.todos.length})` : "";
+    const todoStatus = this.todos.length > 0 && todoDone < this.todos.length ? `TODO(${todoDone}/${this.todos.length})` : "";
     const planStatus = this.planModeEnabled ? "plan:on" : "";
     const bashMode = /^\s*!/.test(this.currentInput) ? "mode:bash" : "";
     const approvalLabel = typeof this.getApprovalLabel === "function" ? String(this.getApprovalLabel() || "").trim() : "";
     const approvalStatus = approvalLabel ? `approve:${approvalLabel}` : "";
     const verboseStatus = joinStatusParts([
-      this.lastStatus || "idle",
+      ctxStatus,
+      scrollLabel ? scrollLabel.replace(/^\s*\|\s*/, "") : "",
+      modelLabel,
+      thinkingEffortStatus,
       planStatus,
       approvalStatus,
-      ctxStatus,
       todoStatus,
       bashMode,
-      scrollLabel ? scrollLabel.replace(/^\s*\|\s*/, "") : "",
     ]);
     const compactStatus = joinStatusParts([
-      this.lastStatus || "idle",
       ctxStatus,
+      modelStatus.model,
+      thinkingEffortStatus,
       todoStatus,
       this.planModeEnabled ? "plan" : "",
       approvalLabel === "on" ? "approve:on" : "",
@@ -3038,10 +3055,11 @@ export class SimpleTui {
       promptStatus = `${left}${" ".repeat(pad)}${right}`;
     } else {
       const raw = promptStatusRaw;
+      const rawWithPinnedPrefix = raw;
       promptStatus =
-        stringDisplayWidth(raw) >= bottomWidth
+        stringDisplayWidth(rawWithPinnedPrefix) >= bottomWidth
           ? truncateLine(raw, bottomWidth)
-          : `${" ".repeat(Math.max(0, bottomWidth - stringDisplayWidth(raw)))}${raw}`;
+          : `${" ".repeat(Math.max(0, bottomWidth - stringDisplayWidth(rawWithPinnedPrefix)))}${rawWithPinnedPrefix}`;
     }
     const attentionSep = colorFullLine(" ! action needed ", "1;30;43", width);
     const approvalBlock = this.approvalPrompt ? [attentionSep, ...approvalContentLines] : [];
@@ -3053,9 +3071,10 @@ export class SimpleTui {
     const spinFrames = this.unicodeSymbols ? ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"] : ["-", "\\", "|", "/"];
     const spin = spinFrames[this.thinkingTick % spinFrames.length];
     const thought = String(this.thoughtStreamText || "").trim();
-    const thoughtSuffix = thought ? ` · ${truncateLine(thought.replace(/^Thinking:\s*/i, ""), Math.max(20, width - 46))}` : "";
+    const liveThought = thought.replace(/^Thinking:\s*/i, "").replace(/^Working\.{0,3}$/i, "");
+    const thoughtSuffix = liveThought ? ` · ${truncateLine(liveThought, Math.max(20, width - 46))}` : "";
     const activitySuffix = this.formatElapsedSinceLastActivity();
-    const runningLine = ` ${spin} thinking${this.thinkingStage ? `:${this.thinkingStage}` : ""} · ${this.formatElapsedSinceTurnStart()}${activitySuffix}${thoughtSuffix}`;
+    const runningLine = ` ${spin} Working · ${this.formatElapsedSinceTurnStart()}${activitySuffix}${thoughtSuffix}`;
     const runningBlock = this.thinking ? [color(truncateLine(runningLine, bottomWidth), `1;${thinkingColor}`)] : [];
     const thoughtStreamBlock = [];
 
@@ -3118,6 +3137,22 @@ export class SimpleTui {
         ]
       : [];
 
+    const nonAttentionWorkspaceHasContent =
+      Boolean(errorLine) ||
+      visibleLogs.length > 0 ||
+      todoLinesBlock.length > 0 ||
+      contextBlock.length > 0 ||
+      thoughtStreamBlock.length > 0;
+    const workspaceLinesWithoutAttention = [
+      ...(errorLine ? [`\x1b[31m${errorLine}\x1b[0m`] : []),
+      ...visibleLogs,
+      ...todoLinesBlock,
+      ...contextBlock,
+      ...thoughtStreamBlock,
+      ...(runningBlock.length > 0 && nonAttentionWorkspaceHasContent ? [""] : []),
+      ...runningBlock,
+      ...(runningBlock.length === 0 && nonAttentionWorkspaceHasContent ? [""] : []),
+    ];
     const beforeInputLines = [
       ...(errorLine ? [`\x1b[31m${errorLine}\x1b[0m`] : []),
       ...visibleLogs,
@@ -3160,7 +3195,7 @@ export class SimpleTui {
       this.layout.render({
         frameLines,
         cursorRow,
-        workspaceLines: beforeInputLines.slice(0, -1),
+        workspaceLines: workspaceLinesWithoutAttention,
         attentionLines,
         inputLines: inputComposite,
         statusLine: promptStatus,

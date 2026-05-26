@@ -6,6 +6,7 @@ import { shouldPlanTaskMessage } from "./plannedTaskRunner.js";
 import { AgentManager } from "./agentManager.js";
 import { TeamManager } from "./teamManager.js";
 import { appendMemory, renderMemoryForPrompt } from "./memory.js";
+import { runPluginToolHooks } from "./pluginHooks.js";
 
 function summarizeToolUseNames(events = [], maxItems = 12) {
   const counts = new Map();
@@ -388,6 +389,36 @@ export class Agent {
 
   getActivePlugins() {
     return Array.isArray(this.activePluginsRef?.value) ? this.activePluginsRef.value : [];
+  }
+
+  async applyPreToolHooks({ tool, input = {}, callId = "", turnId = "" } = {}) {
+    return await runPluginToolHooks({
+      event: "PreToolUse",
+      plugins: this.getActivePlugins(),
+      tool,
+      input,
+      workspaceDir: this.workspaceDir,
+      callId,
+      turnId,
+      model: this.provider?.model || "",
+      onEvent: (event) => this.onEvent?.(event),
+    });
+  }
+
+  async applyPostToolHooks({ tool, input = {}, result = null, error = null, callId = "", turnId = "" } = {}) {
+    return await runPluginToolHooks({
+      event: "PostToolUse",
+      plugins: this.getActivePlugins(),
+      tool,
+      input,
+      result,
+      error,
+      workspaceDir: this.workspaceDir,
+      callId,
+      turnId,
+      model: this.provider?.model || "",
+      onEvent: (event) => this.onEvent?.(event),
+    });
   }
 
   getAgentDefinitions() {

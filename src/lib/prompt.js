@@ -1572,6 +1572,13 @@ export function parseNativeResponse(response, format = "anthropic") {
 
   // OpenAI format
   const message = response.message || response;
+  if (message && typeof message === "object") {
+    const responseText = extractNativeTextContent(response.output_text || response.text || response.content, { compact: false });
+    const messageText = extractNativeTextContent(message.content, { compact: false });
+    if (!messageText && responseText) {
+      message.content = responseText;
+    }
+  }
   const toolCalls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
   const progressText = extractNativeTextContent(message.content);
   if (toolCalls.length > 0) {

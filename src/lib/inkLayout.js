@@ -251,7 +251,7 @@ export class InkTuiLayout {
     const row = clamp(this.cursorTarget?.row || 1, 1, rows);
     const col = clamp(this.cursorTarget?.col || 1, 1, width);
     try {
-      this.output.write(`\x1b[?25l\x1b[H${lines.join("\r\n")}\x1b[${row};${col}H\x1b[?25h`);
+      this.output.write(`\x1b[?25l\x1b[H\x1b[J${lines.join("\r\n")}\x1b[${row};${col}H\x1b[?25h`);
     } catch {
       // best effort
     }

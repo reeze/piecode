@@ -39,6 +39,7 @@ export class TurnEngine {
     this.commitStatusCheckedThisTurn = false;
     this.commitFinalizeNudgeGiven = false;
     this.commitCommandRequired = false;
+    this.consecutiveThoughtActions = 0;
   }
 
   detectTurnPolicy(userMessage) {
@@ -124,7 +125,7 @@ export class TurnEngine {
     return cmd.trim();
   }
 
-  isReadOnlyShellCommandForSummary(command) {
+  isRepoSummaryShellCommand(command) {
     const cmd = this.normalizeShellCommand(command).toLowerCase();
     if (!cmd) return false;
     if (/[;&]|&&|\|\||\|/.test(cmd)) return false;
@@ -134,6 +135,73 @@ export class TurnEngine {
       /^git\s+show(\s+.*)?$/.test(cmd) ||
       /^git\s+log(\s+.*)?$/.test(cmd)
     );
+  }
+
+  isReadOnlyShellCommandForSummary(command, { originalCommand = "" } = {}) {
+    const cmd = this.normalizeShellCommand(command);
+    if (!cmd) return false;
+    if (this.isRepoSummaryShellCommand(cmd)) return true;
+    const original = this.normalizeShellCommand(originalCommand);
+    if (!original || !this.isRepoSummaryShellCommand(original)) return false;
+    return classifyShellCommand(cmd).level === "safe";
+  }
+
+  appendPreToolContexts(result, contexts = []) {
+    let next = String(result ?? "");
+    for (const context of Array.isArray(contexts) ? contexts : []) {
+      const pluginName = typeof context === "string" ? "plugin" : String(context?.plugin || "plugin");
+      const text = typeof context === "string" ? context.trim() : String(context?.text || "").trim();
+      if (text) next = `${next}\n\n[HOOK CONTEXT from ${pluginName}]\n${text}`;
+    }
+    return next;
+  }
+
+  async prepareToolAction(action, { callId, turnId } = {}) {
+    let preparedAction = action;
+    let blocked = false;
+    let blockReason = "";
+    let contexts = [];
+    if (typeof this.agent.applyPreToolHooks === "function") {
+      const preHookResult = await this.agent.applyPreToolHooks({
+        tool: preparedAction.tool,
+        input: preparedAction.input || {},
+        callId,
+        turnId,
+      });
+      if (preHookResult?.input && typeof preHookResult.input === "object") {
+        preparedAction = { ...preparedAction, input: preHookResult.input };
+      }
+      blocked = Boolean(preHookResult?.blocked);
+      blockReason = String(preHookResult?.reason || "Tool call blocked by plugin hook.");
+      contexts = Array.isArray(preHookResult?.additionalContextDetails)
+        ? preHookResult.additionalContextDetails
+        : Array.isArray(preHookResult?.additionalContext)
+          ? preHookResult.additionalContext
+          : [];
+    }
+    return { action: preparedAction, blocked, blockReason, contexts };
+  }
+
+  async applyPostToolHooks(action, { result, toolError = null, callId = "", turnId = "" } = {}) {
+    let nextResult = result;
+    let nextToolError = toolError;
+    if (typeof this.agent.applyPostToolHooks === "function") {
+      const postHookResult = await this.agent.applyPostToolHooks({
+        tool: action.tool,
+        input: action.input || {},
+        result: nextResult,
+        error: nextToolError,
+        callId,
+        turnId,
+      });
+      if (postHookResult && Object.prototype.hasOwnProperty.call(postHookResult, "result")) {
+        nextResult = postHookResult.result;
+      }
+      if (postHookResult && Object.prototype.hasOwnProperty.call(postHookResult, "error")) {
+        nextToolError = postHookResult.error;
+      }
+    }
+    return { result: nextResult, toolError: nextToolError };
   }
 
   isAllowedShellCommandForCommitFlow(command) {
@@ -507,11 +575,23 @@ export class TurnEngine {
       if (!allowed.ok) return { done: true, message: allowed.message };
     }
 
-    const prepared = batch.map((action) => ({
-      action,
-      callId: action._callId || `call_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-      signature: this.buildToolSignature(action),
-    }));
+    const prepared = [];
+    for (let index = 0; index < batch.length; index += 1) {
+      const originalAction = batch[index];
+      const callId = originalAction._callId || `call_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const pre = await this.prepareToolAction(originalAction, {
+        callId,
+        turnId: String(this.toolCalls + index + 1),
+      });
+      prepared.push({
+        action: pre.action,
+        callId,
+        blocked: pre.blocked,
+        blockReason: pre.blockReason,
+        contexts: pre.contexts,
+        signature: this.buildToolSignature(pre.action),
+      });
+    }
 
     for (const item of prepared) {
       if (item.signature === this.lastToolSignature && this.repeatedNoProgressCount >= 2) {
@@ -572,14 +652,26 @@ export class TurnEngine {
         let result;
         let toolError = null;
         try {
-          const toolFn = this.agent.tools[item.action.tool];
-          result = await toolFn(item.action.input || {}, { signal });
+          if (item.blocked) {
+            result = `Tool blocked by plugin hook: ${item.blockReason}`;
+            toolError = item.blockReason;
+          } else {
+            const toolFn = this.agent.tools[item.action.tool];
+            result = await toolFn(item.action.input || {}, { signal });
+          }
         } catch (err) {
           if (err?.code === "ABORT_ERR" || err?.name === "AbortError") throw err;
           result = `Tool error: ${err.message}`;
           toolError = err.message;
         }
-        return { ...item, result, toolError };
+        result = this.appendPreToolContexts(result, item.contexts);
+        const post = await this.applyPostToolHooks(item.action, {
+          result,
+          toolError,
+          callId: item.callId,
+          turnId: String(this.toolCalls),
+        });
+        return { ...item, result: post.result, toolError: post.toolError };
       })
     );
     this.agent.throwIfAborted(signal);
@@ -848,6 +940,7 @@ export class TurnEngine {
       let { action, useNativeTools } = await this.nextModelAction(signal);
 
       if (action.type === "tool_uses") {
+        this.consecutiveThoughtActions = 0;
         const calls = Array.isArray(action.calls) ? action.calls : [];
         if (calls.length === 0) {
           const msg = "Model returned an empty tool call batch. Please retry with a final answer or a valid tool call.";
@@ -868,6 +961,7 @@ export class TurnEngine {
       }
 
       if (action.type === "final") {
+        this.consecutiveThoughtActions = 0;
         this.agent.onEvent?.({ type: "thinking_done" });
         const rawFinalMessage = String(action.message || "").trim();
         const recoveredMessage = rawFinalMessage ? rawFinalMessage : await this.recoverEmptyFinal({ signal });
@@ -883,8 +977,22 @@ export class TurnEngine {
           role: "assistant",
           content: JSON.stringify({ type: "thought", content: action.content }),
         });
+        this.consecutiveThoughtActions += 1;
+        if (this.consecutiveThoughtActions >= 2) {
+          const msg = String(action.content || "").trim()
+            ? `${String(action.content || "").trim()}\n\nThe model returned progress updates without taking an action or finalizing, so I stopped to avoid waiting indefinitely. Please ask me to continue if you want another attempt.`
+            : "The model returned progress updates without taking an action or finalizing, so I stopped to avoid waiting indefinitely. Please ask me to continue if you want another attempt.";
+          this.agent.history.push({ role: "assistant", content: msg });
+          return msg;
+        }
+        this.agent.history.push({
+          role: "user",
+          content: "Progress update received. Continue now with either a tool call or the final answer; do not send another progress-only thought.",
+        });
         continue;
       }
+
+      this.consecutiveThoughtActions = 0;
 
       const currentTurnMaxToolCalls = this.getCurrentTurnMaxToolCalls();
 
@@ -911,9 +1019,22 @@ export class TurnEngine {
         this.agent.history.push({ role: "assistant", content: msg });
         return msg;
       }
-      if (action.tool === "shell" && this.turnPolicy?.readOnlyShellOnly) {
+
+      const callId = action._callId || `call_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const originalAction = action;
+      const preTool = await this.prepareToolAction(action, {
+        callId,
+        turnId: String(this.toolCalls + 1),
+      });
+      action = preTool.action;
+      const preToolBlocked = preTool.blocked;
+      const preToolBlockReason = preTool.blockReason;
+      const preToolContexts = preTool.contexts;
+
+      if (!preToolBlocked && action.tool === "shell" && this.turnPolicy?.readOnlyShellOnly) {
         const cmd = String(action?.input?.command || "");
-        if (!this.isReadOnlyShellCommandForSummary(cmd)) {
+        const originalCmd = String(originalAction?.input?.command || "");
+        if (!this.isReadOnlyShellCommandForSummary(cmd, { originalCommand: originalCmd })) {
           const forced = await this.synthesizeFinalFromEvidence({
             requireCommitMessage: Boolean(this.turnPolicy?.requireCommitMessage),
             signal,
@@ -925,7 +1046,7 @@ export class TurnEngine {
           return msg;
         }
       }
-      if (this.planOnly && action.tool === "shell") {
+      if (!preToolBlocked && this.planOnly && action.tool === "shell") {
         const cmd = String(action?.input?.command || "");
         const classification = classifyShellCommand(cmd);
         if (classification.level !== "safe") {
@@ -939,7 +1060,7 @@ export class TurnEngine {
       let shellIsCommitFlowCommand = false;
       let shellIsCommitCommand = false;
       let shellIsStatusCommand = false;
-      if (action.tool === "shell") {
+      if (!preToolBlocked && action.tool === "shell") {
         const cmd = String(action?.input?.command || "");
         normalizedShellCmd = this.normalizeShellCommand(cmd).toLowerCase();
         shellIsCommitFlowCommand = this.isAllowedShellCommandForCommitFlow(cmd);
@@ -1004,7 +1125,6 @@ export class TurnEngine {
       }
 
       this.toolCalls += 1;
-      const callId = action._callId || `call_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
       const toolCallMessage = {
         type: "tool_use",
         tool: action.tool,
@@ -1032,7 +1152,10 @@ export class TurnEngine {
       let result;
       let toolError = null;
       try {
-        if (todoDisabledForTurn) {
+        if (preToolBlocked) {
+          result = `Tool blocked by plugin hook: ${preToolBlockReason}`;
+          toolError = preToolBlockReason;
+        } else if (todoDisabledForTurn) {
           result = todoDisabledResult;
           toolError = "todo_write disabled by turn policy";
         } else {
@@ -1050,6 +1173,16 @@ export class TurnEngine {
         toolError = err.message;
       }
       this.agent.throwIfAborted(signal);
+
+      result = this.appendPreToolContexts(result, preToolContexts);
+      const postTool = await this.applyPostToolHooks(action, {
+        result,
+        toolError,
+        callId,
+        turnId: String(this.toolCalls),
+      });
+      result = postTool.result;
+      toolError = postTool.toolError;
 
       const resultDigest = String(result || "").slice(0, 1000);
       this.agent.onEvent?.({

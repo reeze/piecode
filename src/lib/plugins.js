@@ -228,6 +228,108 @@ function normalizePermissions(frontmatter = {}) {
   return { tools: { allow } };
 }
 
+function isPlainObject(value) {
+  return value && typeof value === "object" && !Array.isArray(value);
+}
+
+function extractHooksObject(value) {
+  if (!isPlainObject(value)) return null;
+  if (isPlainObject(value.hooks)) return value.hooks;
+  return value;
+}
+
+async function readJsonFile(filePath, maxBytes = MAX_PLUGIN_BYTES) {
+  const content = await readSmallTextFile(filePath, maxBytes);
+  return JSON.parse(content);
+}
+
+async function maybeReadJsonFile(filePath) {
+  try {
+    if (!(await pathExists(filePath))) return null;
+    return await readJsonFile(filePath);
+  } catch {
+    return null;
+  }
+}
+
+function mergeHookConfigs(configs = []) {
+  const merged = {};
+  for (const raw of configs) {
+    const hooks = extractHooksObject(raw);
+    if (!hooks) continue;
+    for (const [event, groups] of Object.entries(hooks)) {
+      if (!groups) continue;
+      const list = Array.isArray(groups) ? groups : [groups];
+      if (!merged[event]) merged[event] = [];
+      merged[event].push(...list.filter((group) => isPlainObject(group)));
+    }
+  }
+  return merged;
+}
+
+async function loadHookConfigPath(baseDir, entry) {
+  const rawPath = String(entry || "").trim();
+  if (!rawPath) return null;
+  const absPath = path.resolve(baseDir, rawPath);
+  if (!absPath.startsWith(path.resolve(baseDir) + path.sep) && absPath !== path.resolve(baseDir)) return null;
+  return await maybeReadJsonFile(absPath);
+}
+
+async function loadManifestHooks(pluginDir, manifestDirName) {
+  const manifest = await maybeReadJsonFile(path.join(pluginDir, manifestDirName, "plugin.json"));
+  if (!manifest || manifest.hooks == null) return [];
+  if (typeof manifest.hooks === "string") {
+    const loaded = await loadHookConfigPath(pluginDir, manifest.hooks);
+    return loaded ? [loaded] : [];
+  }
+  if (Array.isArray(manifest.hooks)) {
+    const loaded = [];
+    for (const entry of manifest.hooks) {
+      if (typeof entry === "string") {
+        const config = await loadHookConfigPath(pluginDir, entry);
+        if (config) loaded.push(config);
+      } else if (isPlainObject(entry)) {
+        loaded.push(entry);
+      }
+    }
+    return loaded;
+  }
+  return isPlainObject(manifest.hooks) ? [manifest.hooks] : [];
+}
+
+async function discoverPluginHooks(frontmatter = {}, pluginFile) {
+  const base = pluginBaseDir(pluginFile);
+  const configs = [];
+  const frontmatterHooks = frontmatter?.hooks;
+
+  if (typeof frontmatterHooks === "string") {
+    const loaded = await loadHookConfigPath(base, frontmatterHooks);
+    if (loaded) configs.push(loaded);
+  } else if (Array.isArray(frontmatterHooks)) {
+    for (const entry of frontmatterHooks) {
+      if (typeof entry === "string") {
+        const loaded = await loadHookConfigPath(base, entry);
+        if (loaded) configs.push(loaded);
+      } else if (isPlainObject(entry)) {
+        configs.push(entry);
+      }
+    }
+  } else if (isPlainObject(frontmatterHooks)) {
+    configs.push(frontmatterHooks);
+  }
+
+  const manifestConfigs = [
+    ...(await loadManifestHooks(base, ".codex-plugin")),
+    ...(await loadManifestHooks(base, ".claude-plugin")),
+  ];
+  configs.push(...manifestConfigs);
+
+  const defaultConfig = await maybeReadJsonFile(path.join(base, "hooks", "hooks.json"));
+  if (defaultConfig) configs.push(defaultConfig);
+
+  return mergeHookConfigs(configs);
+}
+
 async function readPluginFile(pluginFile) {
   const stat = await fs.stat(pluginFile);
   if (stat.size > MAX_PLUGIN_BYTES) throw new Error(`Plugin file too large: ${pluginFile}`);
@@ -345,6 +447,7 @@ export async function discoverPlugins(pluginRoots = []) {
       const version = String(frontmatter.version || "").trim();
       const pluginSkills = await discoverPluginSkills(frontmatter, pluginFile, name);
       const pluginCommands = await discoverPluginCommandFiles(frontmatter, pluginFile, name);
+      const pluginHooks = await discoverPluginHooks(frontmatter, pluginFile);
       const triggers = [
         ...extractTriggers(frontmatter, parsed.body),
         ...pluginSkills.flatMap((skill) => skill.triggers || []),
@@ -365,6 +468,7 @@ export async function discoverPlugins(pluginRoots = []) {
         enabledByDefault: normalizeBool(frontmatter.enabledByDefault ?? frontmatter.enabled_by_default),
         context: normalizeContext(frontmatter),
         permissions: normalizePermissions(frontmatter),
+        hooks: pluginHooks,
       });
     }
   }

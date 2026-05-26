@@ -83,6 +83,20 @@ const DANGEROUS_GIT_SUBCOMMANDS = new Set([
   "fetch",
 ]);
 
+const SAFE_RTK_SUBCOMMANDS = new Set([
+  "ls",
+  "tree",
+  "read",
+  "smart",
+  "grep",
+  "find",
+  "diff",
+  "log",
+  "json",
+  "deps",
+  "wc",
+]);
+
 const DANGEROUS_COMMANDS = new Set([
   "rm",
   "rmdir",
@@ -200,6 +214,42 @@ function classifyGitSubcommand(args) {
   return { level: "unclassified", reason: "command is neither known safe nor explicitly dangerous" };
 }
 
+function classifyRtkSubcommand(args) {
+  let idx = 0;
+  while (idx < args.length) {
+    const token = stripOuterQuotes(args[idx]);
+    if (!token) {
+      idx += 1;
+      continue;
+    }
+    if (token === "--") {
+      idx += 1;
+      break;
+    }
+    if (token === "-u" || token === "--ultra-compact" || token === "--skip-env" || /^-v+$/.test(token)) {
+      idx += 1;
+      continue;
+    }
+    if (token.startsWith("-")) {
+      idx += 1;
+      continue;
+    }
+    break;
+  }
+
+  const subcommand = stripOuterQuotes(args[idx] || "").toLowerCase();
+  const rest = args.slice(idx + 1);
+  if (!subcommand) return { level: "unclassified", reason: "command is neither known safe nor explicitly dangerous" };
+  if (subcommand === "git") return classifyGitSubcommand(rest);
+  if (subcommand === "find" && hasArg(rest, "-delete")) {
+    return { level: "dangerous", reason: "rtk find -delete may remove files" };
+  }
+  if (SAFE_RTK_SUBCOMMANDS.has(subcommand)) {
+    return { level: "safe", reason: `rtk ${subcommand} is read-only` };
+  }
+  return { level: "unclassified", reason: "command is neither known safe nor explicitly dangerous" };
+}
+
 export function classifyShellCommand(command) {
   const raw = String(command || "");
   if (!raw.trim()) {
@@ -235,6 +285,12 @@ export function classifyShellCommand(command) {
       const gitClassification = classifyGitSubcommand(descriptor.args);
       if (gitClassification.level === "dangerous") return gitClassification;
       if (gitClassification.level === "unclassified") hasUnclassified = true;
+      continue;
+    }
+    if (descriptor.name === "rtk") {
+      const rtkClassification = classifyRtkSubcommand(descriptor.args);
+      if (rtkClassification.level === "dangerous") return rtkClassification;
+      if (rtkClassification.level === "unclassified") hasUnclassified = true;
       continue;
     }
     if (!SAFE_COMMANDS.has(descriptor.name)) {

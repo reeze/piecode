@@ -44,6 +44,7 @@ import { InkTuiLayout } from "./lib/inkLayout.js";
 import { buildInputHints } from "./lib/inputHints.js";
 import { Display } from "./lib/display.js";
 import { consumeMouseWheelDeltas, stripMouseInputNoise } from "./lib/mouse.js";
+import { applyCommandPickerSelectionForSubmit, isPickerCancelKey } from "./lib/cliTuiInteraction.js";
 import { TuiLineEditor } from "./lib/tuiLineEditor.js";
 import { filterUsableModelCatalog, getModelQueryFromInput, isModelProviderConfigured } from "./lib/modelInput.js";
 import { McpHub, mergeCommonMcpServers, resolveMcpServerConfigs } from "./lib/mcp.js";
@@ -1122,24 +1123,31 @@ function openLlmDebugOverlay({ tui, llmHistoryRef, llmLastRef, logLine }) {
   return true;
 }
 
-function createTuiKeypressSource({ input }) {
+export function createTuiKeypressSource({ input }) {
   readlineCore.emitKeypressEvents(input);
-  const wasRaw = Boolean(stdin.isRaw);
-  if (input?.isTTY && typeof input.setRawMode === "function") {
-    input.setRawMode(true);
-  }
+  const wasRaw = Boolean(input?.isRaw);
+  const setRawMode = (enabled) => {
+    try {
+      if (input?.isTTY && typeof input.setRawMode === "function") {
+        input.setRawMode(Boolean(enabled));
+      }
+    } catch {
+      // best effort
+    }
+  };
+  setRawMode(true);
   return {
     source: input,
+    suspend: () => setRawMode(false),
+    resume: () => setRawMode(true),
     destroy: () => {
-      try {
-        if (!wasRaw && input?.isTTY && typeof input.setRawMode === "function") {
-          input.setRawMode(false);
-        }
-      } catch {
-        // best effort
-      }
+      if (!wasRaw) setRawMode(false);
     },
   };
+}
+
+export function isSuspendKey(str, key = {}) {
+  return Boolean(key?.ctrl && String(key?.name || "").toLowerCase() === "z") || str === "\x1a";
 }
 
 function createLogger(tui, display, getInput = () => "", onLogLine = null, sessionBus = null) {
@@ -4476,7 +4484,7 @@ async function main() {
         shouldHandleKeypress: (str, key = {}) => {
           if (tui && tui.isOverlayOpen && tui.isOverlayOpen()) return false;
           const name = String(key?.name || "").toLowerCase();
-          if (key?.ctrl && name === "c") return false;
+          if (key?.ctrl && (name === "c" || name === "z")) return false;
           const tabLike = name === "tab" || str === "\t";
           const navLike = name === "up" || name === "down";
           const enterLike = name === "return" || name === "enter" || str === "\r" || str === "\n";
@@ -4688,6 +4696,8 @@ async function main() {
   let escAbortTimer = null;
   let onKeypress = null;
   let onSigint = null;
+  let onSigtstp = null;
+  let onSigcont = null;
   let onMouseData = null;
   let renderLiveInput = () => {};
   let requestCurrentTaskAbort = () => false;
@@ -4753,6 +4763,11 @@ async function main() {
           clearTimeout(escAbortTimer);
           escAbortTimer = null;
         }
+      }
+
+      if (isSuspendKey(str, key)) {
+        process.kill(process.pid, "SIGTSTP");
+        return;
       }
 
       if (isMultilineShortcut(str, key) && !(tui && tui.isOverlayOpen && tui.isOverlayOpen())) {
@@ -4940,7 +4955,7 @@ async function main() {
             return;
           }
         }
-        if (!key.ctrl && !key.meta && key.name === "escape" && (modelPickerRef.active || commandPickerRef.active)) {
+        if (isPickerCancelKey(str, key) && (modelPickerRef.active || commandPickerRef.active)) {
           modelPickerRef.active = false;
           modelPickerRef.query = "";
           modelPickerRef.options = [];
@@ -5216,6 +5231,13 @@ async function main() {
             return;
           }
           if (enterPressed) {
+            const selectedItem = commandPickerRef.options[commandPickerRef.index];
+            const nextLine = applyCommandPickerSelectionForSubmit({
+              currentLine,
+              mode: commandPickerRef.mode,
+              selectedItem,
+            });
+            if (nextLine !== currentLine) writeLineWithCursor(nextLine);
             commandPickerRef.active = false;
             commandPickerRef.mode = "command";
             commandPickerRef.options = [];
@@ -5629,6 +5651,41 @@ async function main() {
   };
   process.on("SIGINT", onSigint);
 
+  onSigtstp = () => {
+    if (process.platform === "win32") return;
+    const draft = stripMouseInputNoise(String(rl?.line || currentInputRef.value || ""));
+    currentInputRef.value = draft;
+    if (escAbortTimer) {
+      clearTimeout(escAbortTimer);
+      escAbortTimer = null;
+    }
+    escAbortArmedRef.value = false;
+    try {
+      if (tui) tui.stop();
+    } catch {
+      // best effort
+    }
+    try {
+      destroyKeypressSource.suspend?.();
+    } catch {
+      // best effort
+    }
+    process.once("SIGCONT", onSigcont);
+    process.kill(process.pid, "SIGSTOP");
+  };
+  onSigcont = () => {
+    try {
+      destroyKeypressSource.resume?.();
+    } catch {
+      // best effort
+    }
+    if (tui) {
+      tui.start();
+      tui.render(currentInputRef.value, taskRunningRef.value ? "resumed; task still running" : "resumed");
+    }
+  };
+  if (useTui && process.platform !== "win32") process.on("SIGTSTP", onSigtstp);
+
   if (startupResumeSession) {
     agent.history = Array.isArray(startupResumeSession.agentHistory) ? startupResumeSession.agentHistory : [];
     applyTodoState(todosRef, Array.isArray(startupResumeSession.todos) ? startupResumeSession.todos : [], {
@@ -5697,6 +5754,12 @@ async function main() {
       }
       if (onSigint) {
         process.off("SIGINT", onSigint);
+      }
+      if (onSigtstp) {
+        process.off("SIGTSTP", onSigtstp);
+      }
+      if (onSigcont) {
+        process.off("SIGCONT", onSigcont);
       }
       if (tui) tui.stop();
       rl.close();

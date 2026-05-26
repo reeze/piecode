@@ -141,7 +141,8 @@ describe("tui usability", () => {
     const last = layout.frames[layout.frames.length - 1];
     expect(last.workspaceLines.join("\n")).toContain("checking the render path");
     expect(last.inputLines.join("\n")).toContain("hello");
-    expect(last.statusLine).toContain("Ready. Type /help for commands.");
+    expect(last.statusLine).toContain("model:seed:model");
+    expect(last.statusLine).toContain("think:default");
 
     tui.stop();
     expect(layout.destroyed).toBe(true);
@@ -351,7 +352,7 @@ describe("tui usability", () => {
     tui.render();
 
     const frameLines = latestFrame(out).split("\n");
-    const responseLines = frameLines.filter((line) => line.includes("alpha") || /^\s{4,}\S/.test(line));
+    const responseLines = frameLines.filter((line) => line.includes("alpha") || /^\s{2,}\S/.test(line));
     expect(responseLines.length).toBeGreaterThan(1);
     expect(responseLines[0]).toMatch(/^\s*(?:•|\*)\s/);
     expect(responseLines.slice(1).some((line) => /^\s{2,}\S/.test(line))).toBe(true);
@@ -372,7 +373,7 @@ describe("tui usability", () => {
     tui.render();
     const lines = latestFrame(out).split("\n");
     const first = lines.find((line) => line.includes("1."));
-    const continuation = lines.find((line) => /^\s{7,}\S/.test(line));
+    const continuation = lines.find((line) => /^\s{3,}\S/.test(line));
     expect(first).toBeTruthy();
     expect(continuation).toBeTruthy();
   });
@@ -627,18 +628,49 @@ describe("tui usability", () => {
     );
 
     const lines = tui.formatApprovalLines(220).map((line) => stripAnsi(line));
-    expect(lines.join("\n")).toContain("? approval required DANGEROUS");
-    expect(lines.join("\n")).toContain("action: Approve shell command?");
-    expect(lines.join("\n")).toContain('command: curl -sL "https://agentskills.io/specification"');
-    expect(lines.join("\n")).toContain("why: command is neither known safe nor explicitly dangerous");
-    expect(lines.join("\n")).toContain("choose: y=allow once");
-    expect(lines.join("\n")).toContain("r=remember exact command");
-    expect(lines.join("\n")).toContain("a=allow all this session");
-    expect(lines.join("\n")).toContain("n=deny");
-    expect(lines.join("\n")).toContain("enter=deny");
+    expect(lines.join("\n")).toContain("? Approval needed");
+    expect(lines.join("\n")).toContain('$ curl -sL "https://agentskills.io/specification"');
+    expect(lines.join("\n")).toContain("Reason: command is neither known safe nor explicitly dangerous");
+    expect(lines.join("\n")).toContain("y allow once");
+    expect(lines.join("\n")).toContain("n deny");
+    expect(lines.join("\n")).toContain("enter deny");
+    expect(lines.join("\n")).toContain("r remember command");
+    expect(lines.join("\n")).toContain("a allow all");
     expect(lines.join("\n")).not.toContain(
       'Details: shell: curl -sL "https://agentskills.io/specification" (command is neither known safe nor explicitly dangerous)'
     );
+  });
+
+  test("layout adapter receives approval dialog only through attention lines", () => {
+    const out = createOut(100, 24);
+    const layout = {
+      frames: [],
+      render(frame) {
+        this.frames.push(frame);
+      },
+    };
+    const tui = new SimpleTui({
+      out,
+      workspaceDir: "/tmp/work",
+      providerLabel: () => "seed:model",
+      getSkillsLabel: () => "none",
+      getApprovalLabel: () => "off",
+      layout,
+    });
+
+    tui.start();
+    tui.event("[progress] reviewing command");
+    tui.setApprovalPrompt("shell: echo hi (needs approval)", false);
+
+    const frame = layout.frames[layout.frames.length - 1];
+    const workspaceText = frame.workspaceLines.map(stripAnsi).join("\n");
+    const attentionText = frame.attentionLines.map(stripAnsi).join("\n");
+    expect(workspaceText).toContain("reviewing command");
+    expect(workspaceText).not.toContain("Approval needed");
+    expect(workspaceText).not.toContain("action needed");
+    expect(attentionText).toContain("action needed");
+    expect(attentionText).toContain("Approval needed");
+    expect((attentionText.match(/Approval needed/g) || [])).toHaveLength(1);
   });
 
   test("overlay renders section labels and hint text", () => {
@@ -664,6 +696,27 @@ describe("tui usability", () => {
     expect(frame).toContain("Thinking Output:");
     expect(frame).toContain("n/p: switch entry");
     expect(stripAnsi(frame)).toContain("LLM debug");
+  });
+
+  test("overlay clips very large debug payloads before rendering", () => {
+    withEnv("PIECODE_TUI_OVERLAY_MAX_CHARS", "2400", () => {
+      const out = createOut(100, 24);
+      const tui = new SimpleTui({
+        out,
+        workspaceDir: "/tmp/work",
+        providerLabel: () => "seed:model",
+        getSkillsLabel: () => "none",
+        getApprovalLabel: () => "off",
+      });
+
+      tui.start();
+      tui.openOverlay("LLM Debug 1/1", `Request:\n${"x".repeat(10000)}\nResponse: done`, { mode: "llm-debug" });
+
+      expect(tui.overlayTitle).toBe("LLM Debug 1/1");
+      expect(tui.overlayText.length).toBeLessThan(2800);
+      expect(tui.overlayText).toContain("[overlay clipped");
+      expect(latestFrame(out)).toContain("LLM debug");
+    });
   });
 
   test("help overlay text renders immediately after startup content", () => {
@@ -1013,7 +1066,8 @@ describe("tui usability", () => {
 
     tui.start();
     const frame = latestFrame(out);
-    expect(frame).toContain("Ready. Type /help for commands.");
+    expect(frame).toContain("model:seed:model");
+    expect(frame).toContain("think:default");
     expect((frame.match(/[-─]{10,}/g) || []).length).toBeGreaterThanOrEqual(2);
     expect(frame).not.toContain("status:");
     expect(frame).not.toContain("llm:");
@@ -1038,7 +1092,8 @@ describe("tui usability", () => {
     const raw = out.writes[out.writes.length - 1] || "";
     const frame = stripAnsi(raw);
     expect(frame.split("\n").length).toBeGreaterThanOrEqual(out.rows);
-    expect(frame).toContain("thinking...");
+    expect(frame).toContain("model:seed:model");
+    expect(frame).toContain("think:default");
     expect(frame).not.toContain("Using tool: edit_file");
   });
 
@@ -1142,19 +1197,18 @@ describe("tui usability", () => {
 
     const frame = latestFrame(out);
     expect(frame).toContain("ctx:88/100(88%)");
-    expect(frame).toContain("Task completed");
     expect(frame).toContain("Goal: Running · optimize UI design in tui · 2/4 · 50%");
     expect(frame).not.toContain("goal:continue");
     expect(frame).not.toContain("mode:bash");
     expect(frame).not.toContain("plan:on");
   });
 
-  test("wide status row exposes approval and avoids duplicate mode labels", () => {
+  test("wide status row exposes approval, model, thinking effort, and avoids duplicate mode labels", () => {
     const out = createOut(120, 24);
     const tui = new SimpleTui({
       out,
       workspaceDir: "/tmp/work",
-      providerLabel: () => "seed:model",
+      providerLabel: () => "gpt-5.3-codex(codex, tools:native, chatgpt, think:high)",
       getSkillsLabel: () => "none",
       getApprovalLabel: () => "on",
     });
@@ -1163,6 +1217,8 @@ describe("tui usability", () => {
     tui.renderInput("!echo hi", 8);
 
     const frame = stripAnsi(latestFrame(out));
+    expect(frame).toContain("model:gpt-5.3-codex");
+    expect(frame).toContain("think:high");
     expect(frame).toContain("approve:on");
     expect(frame.match(/mode:bash/g)).toHaveLength(1);
   });
@@ -1207,7 +1263,7 @@ describe("tui usability", () => {
       { id: "todo-2", content: "step two", status: "completed" },
     ]);
     frame = latestFrame(out);
-    expect(frame).toContain("TODO(2/2)");
+    expect(frame).not.toContain("TODO(");
 
     tui.setTodos([]);
     frame = latestFrame(out);
@@ -1238,8 +1294,8 @@ describe("tui usability", () => {
 
     tui.onThinking("turn");
     frame = latestFrame(out);
-    expect(frame.indexOf("Goal: Running · add goal status indicator")).toBeLessThan(frame.indexOf("thinking"));
-    expect(frame.indexOf("thinking")).toBeLessThan(frame.indexOf("❯"));
+    expect(frame.indexOf("Goal: Running · add goal status indicator")).toBeLessThan(frame.indexOf("Working"));
+    expect(frame.indexOf("Working")).toBeLessThan(frame.indexOf("❯"));
     tui.onThinkingDone();
 
     tui.setGoalStatus({
@@ -1295,7 +1351,7 @@ describe("tui usability", () => {
     expect(frame).toContain("Goal: Running · ship goal mode · 2/9 · 22%");
   });
 
-  test("all completed todos show status-bar notice without timeline completion event", () => {
+  test("all completed todos update status without a transient completion notice", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
       out,
@@ -1308,18 +1364,21 @@ describe("tui usability", () => {
     tui.start();
     tui.setTodos([{ id: "todo-1", content: "finish", status: "completed" }]);
     let frame = latestFrame(out);
-    expect(frame).toContain(tui.symbols.todoDoneNotice);
-    expect(frame).toContain("Task completed");
-    expect(frame).toContain("TODO(1/1)");
+    expect(frame).toContain("model:seed:model");
+    expect(frame).not.toContain("所有 TODO 已完成，可以结束了");
+    expect(frame).not.toContain("All TODO completed.");
+    expect(frame).not.toContain("Task completed");
+    expect(frame).not.toContain("TODO(");
     expect(tui.timeline.map(stripAnsi).join("\n")).not.toContain("Task completed");
 
     tui.beginTurn();
     frame = latestFrame(out);
-    expect(frame).not.toContain(tui.symbols.todoDoneNotice);
-    expect(frame).toContain("TODO(1/1)");
+    expect(frame).not.toContain("所有 TODO 已完成，可以结束了");
+    expect(frame).not.toContain("All TODO completed.");
+    expect(frame).not.toContain("TODO(");
   });
 
-  test("explicit status message persists across input rerenders", () => {
+  test("explicit status messages do not render in the status bar", () => {
     const out = createOut(100, 28);
     const tui = new SimpleTui({
       out,
@@ -1332,11 +1391,13 @@ describe("tui usability", () => {
     tui.start();
     tui.render("", "plan mode: off | normal execution enabled");
     let frame = latestFrame(out);
-    expect(frame).toContain("plan mode: off | normal execution enabled");
+    expect(frame).not.toContain("plan mode: off | normal execution enabled");
+    expect(frame).toContain("model:seed:model");
 
     tui.renderInput("/plan", 5);
     frame = latestFrame(out);
-    expect(frame).toContain("plan mode: off | normal execution enabled");
+    expect(frame).not.toContain("plan mode: off | normal execution enabled");
+    expect(frame).toContain("think:default");
   });
 
   test("plan mode status is shown only when enabled", () => {
@@ -1444,7 +1505,8 @@ describe("tui usability", () => {
     tui.onToolUse("write_file");
     let frame = latestFrame(out);
     expect(frame).toContain("create a small CLI calculator");
-    expect(frame).toContain("Using tool: write_file");
+    expect(frame).toContain("model:seed:model");
+    expect(frame).not.toContain("Using tool: write_file");
     expect(frame).not.toContain("Done");
     let rawTaskContextLine = (out.writes[out.writes.length - 1] || "")
       .split("\n")
@@ -1557,17 +1619,18 @@ describe("tui usability", () => {
     tui.onThinking("turn");
     const frame = latestFrame(out);
     expect(frame).toContain(`${tui.symbols.prompt} inspect repo`);
-    expect(frame).toContain("thinking");
+    expect(frame).toContain("Working");
+    expect(frame).not.toContain("thinking:");
     const lines = frame.split("\n").map((line) => stripAnsi(line));
-    const thinkingLineIndex = lines.findIndex((line) => line.includes("thinking"));
+    const workingLineIndex = lines.findIndex((line) => line.includes("Working"));
     const taskLineIndex = lines.findIndex((line) => line.includes(`${tui.symbols.prompt} inspect repo`));
     const inputLineIndex = lines.findIndex((line) => line.includes("继续描述你想改什么"));
-    const relevantLines = lines.filter((line) => line.includes("thinking") || line.includes(`${tui.symbols.prompt} inspect repo`) || line.includes("继续描述你想改什么"));
+    const relevantLines = lines.filter((line) => line.includes("Working") || line.includes(`${tui.symbols.prompt} inspect repo`) || line.includes("继续描述你想改什么"));
     expect(relevantLines[0]).toContain(`${tui.symbols.prompt} inspect repo`);
-    expect(thinkingLineIndex).toBeLessThan(inputLineIndex);
-    expect(thinkingLineIndex).toBeGreaterThan(taskLineIndex + 1);
-    expect(lines[thinkingLineIndex - 1].trim()).toBe("");
-    expect(lines[thinkingLineIndex + 1]).toMatch(/[-─]{8,}/);
+    expect(workingLineIndex).toBeLessThan(inputLineIndex);
+    expect(workingLineIndex).toBeGreaterThan(taskLineIndex + 1);
+    expect(lines[workingLineIndex - 1].trim()).toBe("");
+    expect(lines[workingLineIndex + 1]).toMatch(/[-─]{8,}/);
     expect(frame).not.toContain("↳ | ");
     expect(frame).not.toContain(" | tok ↑0 ↓0");
     tui.onThinkingDone();
@@ -1686,7 +1749,8 @@ describe("tui usability", () => {
     tui.onThinking("turn");
     tui.setLiveThought("inspect files first");
     let frame = latestFrame(out);
-    expect(frame).toContain("thinking");
+    expect(frame).toContain("Working");
+    expect(frame).not.toContain("thinking:");
     expect(frame).toContain("inspect files first");
     expect(tui.timeline.map(stripAnsi).join("\n")).not.toContain("inspect files first");
     expect(tui.thoughtStreamVisible).toBe(false);
@@ -1810,7 +1874,8 @@ describe("tui usability", () => {
     const frame = latestFrame(out);
     expect(frame).toContain("commands");
     expect(frame).toContain("> /model");
-    expect(frame).toContain("Ready. Type /help for commands.");
+    expect(frame).toContain("model:seed:model");
+    expect(frame).toContain("think:default");
     expect(frame).not.toContain("keys: CTRL+L logs | CTRL+T todos");
     expect(frame).not.toContain("Press CTRL+D again to exit.");
   });
@@ -1935,7 +2000,8 @@ describe("tui usability", () => {
     }
 
     const frame = latestFrame(out);
-    expect(frame).toContain("Ready. Type /help for commands.");
+    expect(frame).toContain("seed:model");
+    expect(frame).toContain("think:default");
     expect(frame).toContain("请实现在退出的时候");
   });
 

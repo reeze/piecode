@@ -1,0 +1,18 @@
+{
+  "description": "RTK token saver hook for PieCode/Claude/Codex-compatible PreToolUse command rewrites",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Bash|shell",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node \"${PLUGIN_ROOT}/hooks/pretooluse.mjs\"",
+            "timeout": 5,
+            "statusMessage": "Checking RTK rewrite"
+          }
+        ]
+      }
+    ]
+  }
+}

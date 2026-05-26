@@ -57,7 +57,7 @@ describe('provider selection', () => {
     global.fetch = async () => {
       const chunks = [
         'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"read_file","arguments":"{\\"path\\":\\"src/"}}]}}]}\n',
-        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"arguments":"cli.js\\"}"}}]}}]}\n',
+        'data: {"choices":[{"delta":{"tool_calls":[{"index":0,"function":{"name":"read_file","arguments":"cli.js\\"}"}}]}}]}\n',
         'data: {"choices":[{"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":123,"completion_tokens":17,"total_tokens":140}}\n',
         'data: [DONE]\n',
       ];
@@ -119,7 +119,7 @@ describe('provider selection', () => {
         output_tokens: 17,
         total_tokens: 140,
       });
-      expect(deltas.join('')).toContain('"path":"src/cli.js"');
+      expect(deltas.join('')).toBe('');
     } finally {
       global.fetch = originalFetch;
     }
@@ -216,6 +216,79 @@ describe('provider selection', () => {
       });
     } finally {
       global.fetch = originalFetch;
+    }
+  });
+
+  test('openai-compatible stream failures include endpoint context', async () => {
+    const originalFetch = global.fetch;
+    const err = new TypeError('fetch failed');
+    err.cause = { code: 'ENOTFOUND', hostname: 'api.example.test' };
+    global.fetch = async () => {
+      throw err;
+    };
+
+    try {
+      const provider = getProvider({
+        provider: 'openai',
+        apiKey: 'openai-test-key',
+        model: 'gpt-4.1-mini',
+        baseUrl: 'https://api.example.test/v1',
+      });
+
+      await expect(
+        provider.completeStream({
+          systemPrompt: 'sys',
+          prompt: 'hello',
+        })
+      ).rejects.toThrow(
+        'Model stream failed while connecting to https://api.example.test/v1/chat/completions: fetch failed ENOTFOUND api.example.test'
+      );
+    } finally {
+      global.fetch = originalFetch;
+    }
+  });
+
+  test('codex auth ignores generic config model and starts with codex model', async () => {
+    const originalCodexHome = process.env.CODEX_HOME;
+    const originalDisableCli = process.env.PIECODE_DISABLE_CODEX_CLI;
+    const originalCodexModel = process.env.CODEX_MODEL;
+    const tmp = await fs.mkdtemp(
+      path.join(os.tmpdir(), 'piecode-provider-test-')
+    );
+
+    process.env.CODEX_HOME = tmp;
+    process.env.PIECODE_DISABLE_CODEX_CLI = '1';
+    delete process.env.CODEX_MODEL;
+    await fs.writeFile(
+      path.join(tmp, 'auth.json'),
+      JSON.stringify({ tokens: { access_token: createCodexTestToken() } }),
+      'utf8'
+    );
+    await fs.writeFile(path.join(tmp, 'config.toml'), 'model = "gpt-5.5"\n', 'utf8');
+    await fs.writeFile(
+      path.join(tmp, 'models_cache.json'),
+      JSON.stringify({
+        models: [
+          { slug: 'gpt-5.5', supported_in_api: true },
+          { slug: 'gpt-5.3-codex', supported_in_api: true },
+        ],
+      }),
+      'utf8'
+    );
+
+    try {
+      const provider = getProvider({ provider: 'codex' });
+      expect(provider.kind).toBe('codex-auth-token');
+      expect(provider.model).toBe('gpt-5.3-codex');
+    } finally {
+      if (originalCodexHome === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = originalCodexHome;
+      if (originalDisableCli === undefined)
+        delete process.env.PIECODE_DISABLE_CODEX_CLI;
+      else process.env.PIECODE_DISABLE_CODEX_CLI = originalDisableCli;
+      if (originalCodexModel === undefined) delete process.env.CODEX_MODEL;
+      else process.env.CODEX_MODEL = originalCodexModel;
+      await fs.rm(tmp, { recursive: true, force: true });
     }
   });
 

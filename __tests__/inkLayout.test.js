@@ -173,6 +173,32 @@ describe("InkTuiLayout", () => {
     layout.destroy();
   });
 
+  test("clears the terminal before repainting after a resize", async () => {
+    const input = createInput();
+    const output = new CaptureOutput({ columns: 100, rows: 12 });
+    const layout = new InkTuiLayout({ input, output, error: output });
+
+    layout.render({
+      workspaceLines: ["wide workspace line"],
+      inputLines: ["❯ ask"],
+      statusLine: "idle",
+      separatorGlyph: "-",
+      cursorCol: 4,
+    });
+    output.columns = 60;
+    layout.render({
+      workspaceLines: ["narrow workspace line"],
+      inputLines: ["❯ ask"],
+      statusLine: "idle",
+      separatorGlyph: "-",
+      cursorCol: 4,
+    });
+
+    const writes = output.chunks.join("");
+    expect(writes).toContain("\x1b[H\x1b[J");
+    layout.destroy();
+  });
+
   test("keeps approval prompts visible above input even when workspace output overflows", async () => {
     const input = createInput();
     const output = new CaptureOutput({ columns: 52, rows: 10 });
@@ -182,10 +208,10 @@ describe("InkTuiLayout", () => {
       workspaceLines: Array.from({ length: 30 }, (_v, index) => `workspace line ${index + 1}`),
       attentionLines: [
         "! action needed",
-        "? approval required UNCLASSIFIED",
-        "action: Approve shell command?",
-        "command: npm test",
-        "choose: y=allow once  r=remember exact command  a=allow all this session  n=deny  enter=deny",
+        "? Approval needed",
+        "$ npm test",
+        "y allow once   n deny   enter deny",
+        "r remember command   a allow all",
       ],
       inputLines: ["❯ "],
       statusLine: "Awaiting approval | approve:off",
@@ -194,11 +220,10 @@ describe("InkTuiLayout", () => {
       cursorRowOffset: 0,
       cursorCol: 4,
     });
-    const cursor = await waitForCursor(output, (candidate) => candidate.lines.some((line) => line.includes("approval required")));
+    const cursor = await waitForCursor(output, (candidate) => candidate.lines.some((line) => line.includes("Approval needed")));
     const plain = cursor.lines.join("\n");
-    expect(plain).toContain("approval required");
-    expect(plain).toContain("Approve shell command");
-    expect(plain).toContain("npm test");
+    expect(plain).toContain("Approval needed");
+    expect(plain).toContain("$ npm test");
     expect(plain).toContain("Awaiting approval");
     expect(plain).toContain("workspace line 30");
     expect(plain).not.toContain("workspace line 1");

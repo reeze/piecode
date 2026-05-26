@@ -770,6 +770,21 @@ describe('Prompt functions', () => {
       expect(parseNativeResponse(undefined, 'openai').type).toBe('final');
     });
 
+    test('uses top-level OpenAI response text when message content is empty', () => {
+      const response = {
+        message: {
+          role: 'assistant',
+          content: '',
+        },
+        output_text: 'Recovered final answer.',
+        finishReason: 'stop',
+      };
+
+      const action = parseNativeResponse(response, 'openai');
+      expect(action.type).toBe('final');
+      expect(action.message).toBe('Recovered final answer.');
+    });
+
     test('handles malformed OpenAI arguments gracefully', () => {
       const response = {
         message: {
