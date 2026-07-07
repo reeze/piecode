@@ -9,7 +9,13 @@ export function isPickerCancelKey(str = "", key = {}) {
 }
 
 export function applyCommandPickerSelectionForSubmit({ currentLine = "", mode = "command", selectedItem = "" } = {}) {
+  const line = String(currentLine || "");
   const selected = String(selectedItem || "");
-  if (String(mode || "command") !== "command") return String(currentLine || "");
-  return selected || String(currentLine || "");
+  if (String(mode || "command") !== "command") return line;
+  if (!selected) return line;
+  // Only let the highlighted suggestion replace the line while the user is still
+  // completing the command word. Once they've typed arguments (e.g. "/task start x"),
+  // the picker's fallback suggestion is stale — submit what they actually typed.
+  // ponytail: prefix check, swap for fuzzy match only if suggestions go fuzzy.
+  return selected.startsWith(line.trimStart()) ? selected : line;
 }

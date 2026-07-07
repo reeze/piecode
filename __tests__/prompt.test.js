@@ -145,6 +145,8 @@ describe('Prompt functions', () => {
       expect(prompt).toContain('The harness will show that sentence as progress');
       expect(prompt).toContain('changed files, validation, blockers, and next step');
       expect(prompt).toContain('brief progress syncs');
+      expect(prompt).toContain('shell background:true or task start');
+      expect(prompt).toContain('task status/read/stop');
       expect(prompt).toContain('Do not expand file diffs by default');
       expect(prompt).toContain('Treat uncommitted changes as user-owned');
     });
@@ -370,6 +372,12 @@ describe('Prompt functions', () => {
       expect(shell).toBeDefined();
       expect(shell.input_schema).toBeDefined();
       expect(shell.input_schema.properties.command).toBeDefined();
+      expect(shell.input_schema.properties.background).toBeDefined();
+
+      const task = tools.find((t) => t.name === 'task');
+      expect(task).toBeDefined();
+      expect(task.input_schema.properties.action.enum).toContain('start');
+      expect(task.input_schema.properties.id).toBeDefined();
 
       const readFile = tools.find((t) => t.name === 'read_file');
       expect(readFile).toBeDefined();
@@ -388,6 +396,11 @@ describe('Prompt functions', () => {
       expect(shell).toBeDefined();
       expect(shell.type).toBe('function');
       expect(shell.function.parameters.properties.command).toBeDefined();
+      expect(shell.function.parameters.properties.background).toBeDefined();
+
+      const task = tools.find((t) => t.function?.name === 'task');
+      expect(task).toBeDefined();
+      expect(task.function.parameters.properties.action.enum).toContain('stop');
 
       const writeFile = tools.find((t) => t.function?.name === 'write_file');
       expect(writeFile).toBeDefined();

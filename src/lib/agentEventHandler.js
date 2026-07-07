@@ -233,7 +233,9 @@ export function createAgentEventHandler(deps = {}) {
         llmStreamRef.value[evt.stage] += String(evt.delta || "");
       }
       if (tui && evt.stage === "turn" && typeof extractReadableThinkingPreview === "function") {
-        const source = llmStreamRef.value?.turn || evt.delta || "";
+        // ponytail: preview only surfaces the latest readable text, so scanning
+        // the whole accumulated stream per delta is O(n²) for nothing — keep the tail.
+        const source = String(llmStreamRef.value?.turn || evt.delta || "").slice(-16000);
         const preview = extractReadableThinkingPreview(source);
         if (preview) {
           // Keep streaming model text transient. Persisting every partial preview

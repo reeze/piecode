@@ -1,4 +1,4 @@
-import { createToolset } from "./tools.js";
+import { createBackgroundTaskManager, createToolset } from "./tools.js";
 import { buildSystemPrompt, formatHistory } from "./prompt.js";
 import { TaskPlanner } from "./taskPlanner.js";
 import { TurnEngine } from "./turnEngine.js";
@@ -45,6 +45,7 @@ export class Agent {
     agentDefinitionsRef = null,
     currentAgentDefinition = null,
     getSteers = null,
+    backgroundTaskManager = null,
   }) {
     this.provider = provider;
     this.workspaceDir = workspaceDir;
@@ -68,6 +69,10 @@ export class Agent {
     this.agentDefinitionsRef = agentDefinitionsRef && typeof agentDefinitionsRef === "object" ? agentDefinitionsRef : { value: [] };
     this.currentAgentDefinition = currentAgentDefinition && typeof currentAgentDefinition === "object" ? currentAgentDefinition : null;
     this.getSteers = typeof getSteers === "function" ? getSteers : null;
+    this.backgroundTaskManager =
+      backgroundTaskManager && typeof backgroundTaskManager.start === "function"
+        ? backgroundTaskManager
+        : createBackgroundTaskManager({ workspaceDir: this.workspaceDir });
     this.history = [];
     this.rebuildToolset();
     this.enablePlanner = process.env.PIECODE_ENABLE_PLANNER === "1";
@@ -104,6 +109,7 @@ export class Agent {
       runSubagent: (input, options) => this.runSubagent(input, options),
       runCollaboration: (input, options) => this.runCollaboration(input, options),
       writeMemory: (input) => this.writeMemory(input),
+      backgroundTaskManager: this.backgroundTaskManager,
     });
   }
 

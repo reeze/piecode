@@ -1,4 +1,4 @@
-import { exec as execCb, execFile as execFileCb } from "node:child_process";
+import { exec as execCb, execFile as execFileCb, spawn } from "node:child_process";
 import { promises as fs } from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -8,6 +8,8 @@ const exec = promisify(execCb);
 const execFile = promisify(execFileCb);
 const SHELL_INLINE_MAX_CHARS = 12000;
 const SHELL_PREVIEW_CHARS = 1800;
+const BACKGROUND_TASK_BUFFER_CHARS = 120000;
+const BACKGROUND_TASK_READ_CHARS = 12000;
 const IGNORE_DIRS = new Set(["node_modules", ".git", "dist", "build", ".next", "coverage", ".cache"]);
 
 const SAFE_COMMANDS = new Set([
@@ -464,6 +466,241 @@ async function formatShellResult({
   return `Result too long (chars: ${rendered.length}), saved to ${relPath}\nPreview:\n${preview}`;
 }
 
+function normalizeTaskAction(action) {
+  const raw = String(action || "list").trim().toLowerCase();
+  if (!raw) return "list";
+  if (raw === "run") return "start";
+  if (raw === "ls") return "list";
+  if (raw === "show") return "status";
+  if (raw === "logs" || raw === "log") return "read";
+  if (raw === "kill" || raw === "cancel") return "stop";
+  return raw;
+}
+
+function formatReadableTaskDuration(ms) {
+  const total = Math.max(0, Math.floor(Number(ms) || 0));
+  if (total < 1000) return `${total}ms`;
+  const seconds = Math.floor(total / 1000);
+  if (seconds < 60) return `${seconds}s`;
+  const minutes = Math.floor(seconds / 60);
+  const rest = seconds % 60;
+  if (minutes < 60) return rest ? `${minutes}m ${rest}s` : `${minutes}m`;
+  const hours = Math.floor(minutes / 60);
+  const minuteRest = minutes % 60;
+  return minuteRest ? `${hours}h ${minuteRest}m` : `${hours}h`;
+}
+
+function truncateTaskOutput(text, maxChars = BACKGROUND_TASK_READ_CHARS) {
+  const source = String(text || "");
+  const limit = Math.max(0, Number(maxChars) || BACKGROUND_TASK_READ_CHARS);
+  if (!limit || source.length <= limit) return source;
+  return `... output truncated to last ${limit} chars ...\n${source.slice(-limit)}`;
+}
+
+function formatBackgroundTaskSummary(task, workspaceDir) {
+  if (!task) return "";
+  const runtime = formatReadableTaskDuration((task.endedAt || Date.now()) - task.startedAt);
+  const relLog = task.logPath ? path.relative(workspaceDir, task.logPath).split(path.sep).join("/") : "";
+  return [
+    `task: ${task.id}`,
+    `name: ${task.name || "-"}`,
+    `status: ${task.status}`,
+    `pid: ${task.pid || "-"}`,
+    `runtime: ${runtime}`,
+    `exit_code: ${task.exitCode ?? "-"}`,
+    `signal: ${task.signal || "-"}`,
+    `log: ${relLog || "-"}`,
+    `command: ${task.command}`,
+  ].join("\n");
+}
+
+function formatBackgroundTaskList(tasks, workspaceDir) {
+  const items = Array.isArray(tasks) ? tasks : [];
+  if (items.length === 0) return "No background tasks.";
+  return items
+    .map((task) => {
+      const runtime = formatReadableTaskDuration((task.endedAt || Date.now()) - task.startedAt);
+      const relLog = task.logPath ? path.relative(workspaceDir, task.logPath).split(path.sep).join("/") : "-";
+      const label = task.name ? `${task.id} ${task.name}` : task.id;
+      const exit = task.exitCode == null ? "" : ` exit=${task.exitCode}`;
+      return `- ${label}: ${task.status}${exit} pid=${task.pid || "-"} runtime=${runtime} log=${relLog}`;
+    })
+    .join("\n");
+}
+
+function signalProcessGroup(pid, signal) {
+  if (!pid) return false;
+  try {
+    if (process.platform !== "win32") {
+      process.kill(-pid, signal);
+    } else {
+      process.kill(pid, signal);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function isProcessGroupAlive(pid) {
+  if (!pid) return false;
+  try {
+    if (process.platform !== "win32") {
+      process.kill(-pid, 0);
+    } else {
+      process.kill(pid, 0);
+    }
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+export function createBackgroundTaskManager({ workspaceDir } = {}) {
+  const root = path.resolve(workspaceDir || process.cwd());
+  const tasks = new Map();
+  let seq = 0;
+
+  const get = (id) => {
+    const key = String(id || "").trim();
+    if (!key) return null;
+    return tasks.get(key) || null;
+  };
+
+  const appendOutput = (task, stream, chunk) => {
+    const text = String(chunk || "");
+    if (!text) return;
+    const stamped = text
+      .split(/(\n)/)
+      .map((part) => (part === "\n" || !part ? part : `[${stream}] ${part}`))
+      .join("");
+    task.output = `${task.output || ""}${stamped}`;
+    if (task.output.length > BACKGROUND_TASK_BUFFER_CHARS) {
+      task.output = task.output.slice(-BACKGROUND_TASK_BUFFER_CHARS);
+    }
+    if (task.logPath) {
+      fs.appendFile(task.logPath, stamped, "utf8").catch(() => {});
+    }
+  };
+
+  const start = async ({ command, name = "" } = {}) => {
+    const cmd = String(command || "").trim();
+    if (!cmd) throw new Error("Missing required parameter: command");
+    const id = `bg-${++seq}`;
+    const taskDir = path.join(root, ".piecode", "tasks");
+    await fs.mkdir(taskDir, { recursive: true });
+    const logPath = path.join(taskDir, `${id}.log`);
+    const task = {
+      id,
+      name: String(name || "").trim(),
+      command: cmd,
+      status: "running",
+      pid: null,
+      startedAt: Date.now(),
+      endedAt: null,
+      exitCode: null,
+      signal: "",
+      output: "",
+      logPath,
+      process: null,
+      stopRequested: false,
+    };
+    await fs.writeFile(logPath, `[task] ${id} started ${new Date(task.startedAt).toISOString()}\n[command] ${cmd}\n`, "utf8");
+    const child = spawn(cmd, {
+      cwd: root,
+      shell: true,
+      detached: true,
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    task.process = child;
+    task.pid = child.pid || null;
+    tasks.set(id, task);
+
+    child.stdout?.setEncoding?.("utf8");
+    child.stderr?.setEncoding?.("utf8");
+    child.stdout?.on("data", (chunk) => appendOutput(task, "stdout", chunk));
+    child.stderr?.on("data", (chunk) => appendOutput(task, "stderr", chunk));
+    child.on("error", (err) => {
+      task.status = "failed";
+      task.endedAt = Date.now();
+      task.exitCode = 1;
+      appendOutput(task, "stderr", String(err?.message || err));
+    });
+    child.on("exit", (code, signal) => {
+      task.endedAt = Date.now();
+      task.exitCode = typeof code === "number" ? code : null;
+      task.signal = signal || "";
+      if (task.stopRequested) {
+        task.status = task.status === "stopping" ? "stopping" : "stopped";
+      } else if (code === 0) {
+        task.status = "done";
+      } else {
+        task.status = "failed";
+      }
+      task.process = null;
+      const footer = `[task] ${id} ${task.status} exit=${task.exitCode ?? "-"} signal=${task.signal || "-"} ${new Date(task.endedAt).toISOString()}\n`;
+      fs.appendFile(logPath, footer, "utf8").catch(() => {});
+    });
+    child.unref?.();
+    child.stdout?.unref?.();
+    child.stderr?.unref?.();
+
+    return task;
+  };
+
+  const list = () => [...tasks.values()].sort((a, b) => a.startedAt - b.startedAt);
+
+  const read = async ({ id, limit = BACKGROUND_TASK_READ_CHARS } = {}) => {
+    const task = get(id);
+    if (!task) throw new Error(`Background task not found: ${id || ""}`);
+    const maxChars = Math.min(Math.max(Number(limit) || BACKGROUND_TASK_READ_CHARS, 1000), 60000);
+    let output = String(task.output || "");
+    if (task.logPath) {
+      try {
+        output = await fs.readFile(task.logPath, "utf8");
+      } catch {
+        output = String(task.output || "");
+      }
+    }
+    return [formatBackgroundTaskSummary(task, root), "output:", truncateTaskOutput(output, maxChars)].join("\n");
+  };
+
+  const stop = async ({ id, signal = "SIGTERM", graceMs = 500 } = {}) => {
+    const task = get(id);
+    if (!task) throw new Error(`Background task not found: ${id || ""}`);
+    if (task.status !== "running" && task.status !== "stopping") return task;
+    task.stopRequested = true;
+    task.status = "stopping";
+    const normalizedSignal = String(signal || "SIGTERM").trim().toUpperCase();
+    if (!signalProcessGroup(task.pid, normalizedSignal)) {
+      appendOutput(task, "stderr", `failed to stop task: unable to signal pid ${task.pid || "-"}\n`);
+    }
+    const grace = Math.min(Math.max(Number(graceMs) || 500, 10), 10000);
+    await new Promise((resolve) => setTimeout(resolve, grace));
+    if (normalizedSignal !== "SIGKILL" && isProcessGroupAlive(task.pid)) {
+      signalProcessGroup(task.pid, "SIGKILL");
+      await new Promise((resolve) => setTimeout(resolve, 50));
+    }
+    task.status = "stopped";
+    task.endedAt = task.endedAt || Date.now();
+    if (task.logPath) {
+      const footer = `[task] ${task.id} stopped exit=${task.exitCode ?? "-"} signal=${task.signal || normalizedSignal || "-"} ${new Date(task.endedAt).toISOString()}\n`;
+      fs.appendFile(task.logPath, footer, "utf8").catch(() => {});
+    }
+    return task;
+  };
+
+  return {
+    start,
+    list,
+    get,
+    read,
+    stop,
+    formatList: () => formatBackgroundTaskList(list(), root),
+    formatSummary: (task) => formatBackgroundTaskSummary(task, root),
+  };
+}
+
 function normalizeRelPathForMatch(relPath) {
   return String(relPath || "").split(path.sep).join("/");
 }
@@ -777,8 +1014,13 @@ export function createToolset({
   runSubagent = null,
   runCollaboration = null,
   writeMemory = null,
+  backgroundTaskManager = null,
 }) {
   let lastTodoSignature = "";
+  const taskManager =
+    backgroundTaskManager && typeof backgroundTaskManager.start === "function"
+      ? backgroundTaskManager
+      : createBackgroundTaskManager({ workspaceDir });
   const mcpAvailable = () => Boolean(mcpHub && typeof mcpHub.hasServers === "function" && mcpHub.hasServers());
 
   const ensureMcp = () => {
@@ -924,11 +1166,14 @@ export function createToolset({
     return { stdout, stderr, exitCode };
   };
 
-  const runShell = async ({ command, timeout } = {}) => {
+  const runShell = async ({ command, timeout, background = false, name = "" } = {}) => {
     onToolStart?.("shell", { command });
     const cmd = String(command || "").trim();
     if (!cmd) {
       throw new Error("Empty command");
+    }
+    if (background) {
+      return await manageTask({ action: "start", command: cmd, name });
     }
     const { approved } = await approveShellCommand(cmd);
     if (!approved) {
@@ -941,6 +1186,35 @@ export function createToolset({
       timeoutMs: Number.isFinite(shellTimeout) && shellTimeout > 0 ? shellTimeout : null,
     });
     return formatShellResult({ workspaceDir, command: cmd, exitCode, stdout, stderr });
+  };
+
+  const manageTask = async ({ action = "list", command = "", id = "", name = "", signal = "SIGTERM", limit, grace_ms: graceMs } = {}) => {
+    const normalizedAction = normalizeTaskAction(action);
+    onToolStart?.("task", { action: normalizedAction, command, id, name });
+    if (normalizedAction === "start") {
+      const cmd = String(command || "").trim();
+      if (!cmd) throw new Error("Missing required parameter: command");
+      const { approved } = await approveShellCommand(cmd);
+      if (!approved) return "Command was not approved by the user.";
+      const task = await taskManager.start({ command: cmd, name });
+      return taskManager.formatSummary(task);
+    }
+    if (normalizedAction === "list") {
+      return taskManager.formatList();
+    }
+    if (normalizedAction === "status") {
+      const task = taskManager.get(id);
+      if (!task) throw new Error(`Background task not found: ${id || ""}`);
+      return taskManager.formatSummary(task);
+    }
+    if (normalizedAction === "read") {
+      return await taskManager.read({ id, limit });
+    }
+    if (normalizedAction === "stop") {
+      const task = await taskManager.stop({ id, signal, graceMs });
+      return taskManager.formatSummary(task);
+    }
+    throw new Error("Unknown task action. Use start, list, status, read, or stop.");
   };
 
   const readFile = async ({ path: relPath } = {}) => {
@@ -1797,6 +2071,7 @@ export function createToolset({
   return {
     clarify_user: clarifyUser,
     shell: runShell,
+    task: manageTask,
     read_file: readFile,
     read_files: readFiles,
     write_file: writeFile,

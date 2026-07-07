@@ -1481,7 +1481,20 @@ export class SimpleTui {
     this.thoughtStreamText = text ? `Thinking: ${text}` : "";
     if (text && text !== previous) this.markActivity("model update");
     if (text) this.lastStatus = "thinking...";
-    this.render();
+    // ponytail: streaming deltas can arrive hundreds of times per second;
+    // paint immediately when idle, coalesce bursts to ~20fps.
+    const now = Date.now();
+    if (now - (this.liveThoughtRenderAt || 0) >= 50) {
+      this.liveThoughtRenderAt = now;
+      this.render();
+    } else if (!this.liveThoughtRenderTimer) {
+      this.liveThoughtRenderTimer = setTimeout(() => {
+        this.liveThoughtRenderTimer = null;
+        this.liveThoughtRenderAt = Date.now();
+        this.render();
+      }, 50);
+      this.liveThoughtRenderTimer.unref?.();
+    }
   }
 
   clearLiveThought() {
@@ -2128,12 +2141,24 @@ export class SimpleTui {
     ) {
       return cache.lines;
     }
+    // ponytail: per-line memo keyed by content — appending one timeline line
+    // used to re-measure ANSI/emoji widths for the whole history every render.
+    let memo = cache?.memo;
+    if (!memo || cache.memoWidth !== targetWidth) memo = new Map();
+    if (memo.size > lines.length * 4 + 500) memo.clear();
     const wrapped = [];
     for (const line of lines) {
-      const chunks = wrapLine(line, targetWidth);
-      if (Array.isArray(chunks) && chunks.length > 0) wrapped.push(...chunks);
+      let chunks = memo.get(line);
+      if (!chunks) {
+        chunks = wrapLine(line, targetWidth);
+        memo.set(line, Array.isArray(chunks) ? chunks : []);
+        chunks = memo.get(line);
+      }
+      if (chunks.length > 0) wrapped.push(...chunks);
     }
     if (cache) {
+      cache.memo = memo;
+      cache.memoWidth = targetWidth;
       cache.source = lines;
       cache.length = lines.length;
       cache.width = targetWidth;

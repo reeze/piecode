@@ -99,12 +99,12 @@
           <div id="eventStrip" class="event-strip"></div>
           <form id="composer" class="composer">
             <div class="input-shell">
-              <textarea id="messageInput" rows="3" placeholder="Ask PieCode to inspect files, edit code, run tests, explain behavior, or review a diff..."></textarea>
+              <textarea id="messageInput" rows="3" placeholder="Ask PieCode to inspect files, edit code, run tests, explain behavior, or review a diff..." aria-controls="slashSuggestions" aria-expanded="false" aria-autocomplete="list"></textarea>
               <button id="attachBtn" class="attach-btn" type="button" aria-label="Attach image">＋</button>
               <button id="sendBtn" type="submit" aria-label="Send message">↑</button>
               <input id="imageInput" type="file" accept="image/png,image/jpeg,image/gif,image/webp" multiple hidden />
               <div id="attachmentTray" class="attachment-tray" hidden></div>
-              <div id="slashSuggestions" class="slash-suggestions" hidden></div>
+              <div id="slashSuggestions" class="slash-suggestions" role="listbox" aria-label="Slash command suggestions" hidden></div>
             </div>
           </form>
           <div class="composer-meta">
@@ -134,7 +134,7 @@
     </div>
 
     <div id="diffOverlay" class="diff-overlay" hidden>
-      <div class="diff-dialog" role="dialog" aria-modal="true" aria-labelledby="diffTitle">
+      <div class="diff-dialog" role="dialog" aria-modal="true" aria-labelledby="diffTitle" tabindex="-1">
         <div class="diff-header">
           <div>
             <h3 id="diffTitle">Current session diff</h3>

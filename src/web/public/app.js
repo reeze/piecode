@@ -26,6 +26,7 @@ const state = {
 };
 
 const el = {
+  app: document.getElementById("app"),
   statusDot: document.getElementById("statusDot"),
   statusText: document.getElementById("statusText"),
   activeTask: document.getElementById("activeTask"),
@@ -70,6 +71,8 @@ const el = {
   mobileApprovalList: document.getElementById("mobileApprovalList"),
   contextUsage: document.getElementById("contextUsage"),
 };
+
+let diffPreviousFocus = null;
 
 function escapeHtml(value) {
   return String(value ?? "")
@@ -279,7 +282,12 @@ function renderTimelineItem(item) {
 function renderMessages() {
   const shouldStick = isMessagesNearBottom();
   if (!state.timeline.length) {
-    el.messages.innerHTML = `<div class="empty-state"><div><h3>Ready</h3><p>Ask PieCode to inspect the workspace, make a focused edit, or run verification.</p></div></div>`;
+    el.messages.innerHTML = `<div class="empty-state"><div><p class="eyebrow">Solo dev assistant</p><h3>Ready when you are</h3><p>Move fast with a focused prompt, or start with one of these common checks.</p><div class="starter-prompts">
+      <button type="button" data-starter-prompt="Review my current diff and suggest the safest next steps.">Review current diff</button>
+      <button type="button" data-starter-prompt="Inspect this repo and tell me the highest-leverage next improvement.">Inspect the repo</button>
+      <button type="button" data-starter-prompt="Find failing or missing tests and recommend the fastest verification path.">Find test gaps</button>
+      <button type="button" data-starter-prompt="Plan the next focused edit, then wait for approval before changing files.">Plan a focused edit</button>
+    </div></div></div>`;
     return;
   }
   el.messages.innerHTML = state.timeline.map(renderTimelineItem).join("");
@@ -297,20 +305,32 @@ function scrollMessagesToBottom() {
   el.messages.scrollTop = el.messages.scrollHeight;
 }
 
+// Rebuilding the whole timeline innerHTML per SSE event freezes the page during
+// bursts; coalesce to one rebuild per animation frame.
+let renderMessagesScheduled = false;
+function scheduleRenderMessages() {
+  if (renderMessagesScheduled) return;
+  renderMessagesScheduled = true;
+  requestAnimationFrame(() => {
+    renderMessagesScheduled = false;
+    renderMessages();
+  });
+}
+
 function upsertTimeline(item) {
   const id = String(item?.id || "");
   if (!id) return;
   const idx = state.timeline.findIndex((entry) => entry.id === id);
   if (idx >= 0) state.timeline[idx] = { ...state.timeline[idx], ...item };
   else state.timeline.push(item);
-  renderMessages();
+  scheduleRenderMessages();
 }
 
 function patchTimeline(id, patch) {
   const idx = state.timeline.findIndex((entry) => entry.id === id);
   if (idx < 0) return;
   state.timeline[idx] = { ...state.timeline[idx], ...(patch || {}) };
-  renderMessages();
+  scheduleRenderMessages();
 }
 
 function approvalTitle(item) {
@@ -387,12 +407,18 @@ function renderApprovals() {
       <strong>${escapeHtml(approvalTitle(item))}</strong>
       <code>${escapeHtml(approvalCommand(item))}</code>
       <div class="muted">${escapeHtml(approvalReason(item))}</div>
-      <div class="approval-actions">
+      <div class="approval-actions approval-primary-actions">
         <button class="good" data-approval="${escapeHtml(item.id)}" data-decision="allow_once">Allow once</button>
-        <button class="secondary" data-approval="${escapeHtml(item.id)}" data-decision="remember_command">Remember command</button>
-        <button class="secondary" data-approval="${escapeHtml(item.id)}" data-decision="allow_all_session">Allow all session</button>
         <button class="danger" data-approval="${escapeHtml(item.id)}" data-decision="deny">Deny</button>
       </div>
+      <details class="approval-more">
+        <summary>Trust this command faster</summary>
+        <p>Use these when you recognize the command and want fewer prompts this session.</p>
+        <div class="approval-actions">
+          <button class="secondary" data-approval="${escapeHtml(item.id)}" data-decision="remember_command">Remember command</button>
+          <button class="secondary" data-approval="${escapeHtml(item.id)}" data-decision="allow_all_session">Allow all session</button>
+        </div>
+      </details>
     </div>`)
     .join("");
 
@@ -469,6 +495,8 @@ function renderSlashSuggestions() {
   if (query === null) {
     el.slashSuggestions.hidden = true;
     el.slashSuggestions.innerHTML = "";
+    el.messageInput.setAttribute("aria-expanded", "false");
+    el.messageInput.removeAttribute("aria-activedescendant");
     return;
   }
   const commands = state.slashCommands.length ? state.slashCommands : [
@@ -483,11 +511,15 @@ function renderSlashSuggestions() {
   if (!hits.length) {
     el.slashSuggestions.hidden = true;
     el.slashSuggestions.innerHTML = "";
+    el.messageInput.setAttribute("aria-expanded", "false");
+    el.messageInput.removeAttribute("aria-activedescendant");
     return;
   }
   state.selectedSuggestion = Math.min(state.selectedSuggestion, hits.length - 1);
   el.slashSuggestions.hidden = false;
-  el.slashSuggestions.innerHTML = hits.map((command, index) => `<button type="button" class="suggestion ${index === state.selectedSuggestion ? "active" : ""}" data-command="${escapeHtml(commandInsertText(command))}">
+  el.messageInput.setAttribute("aria-expanded", "true");
+  el.messageInput.setAttribute("aria-activedescendant", `slash-suggestion-${state.selectedSuggestion}`);
+  el.slashSuggestions.innerHTML = hits.map((command, index) => `<button id="slash-suggestion-${index}" type="button" role="option" aria-selected="${index === state.selectedSuggestion ? "true" : "false"}" class="suggestion ${index === state.selectedSuggestion ? "active" : ""}" data-command="${escapeHtml(commandInsertText(command))}">
     <span>${escapeHtml(command.name)}</span>
     <small>${escapeHtml(command.description || command.pluginName || command.skillName || "")}</small>
   </button>`).join("");
@@ -686,12 +718,26 @@ function runMobileAction(action) {
   }
 }
 
+function setAppInert(inert) {
+  if (!el.app) return;
+  if (inert) el.app.setAttribute("aria-hidden", "true");
+  else el.app.removeAttribute("aria-hidden");
+  if ("inert" in el.app) el.app.inert = Boolean(inert);
+}
+
 function closeDiffOverlay() {
+  if (el.diffOverlay.hidden) return;
   el.diffOverlay.hidden = true;
+  setAppInert(false);
+  diffPreviousFocus?.focus?.();
+  diffPreviousFocus = null;
 }
 
 async function openDiffOverlay() {
+  if (el.diffOverlay.hidden) diffPreviousFocus = document.activeElement;
   el.diffOverlay.hidden = false;
+  setAppInert(true);
+  el.closeDiffBtn?.focus();
   el.diffMeta.textContent = "Loading working tree changes...";
   el.diffBody.innerHTML = `<div class="diff-loading">Loading diff...</div>`;
   try {
@@ -957,6 +1003,12 @@ el.slashSuggestions.addEventListener("click", (evt) => {
   applySuggestion(button.dataset.command);
 });
 
+el.messages.addEventListener("click", (evt) => {
+  const button = evt.target.closest("button[data-starter-prompt]");
+  if (!button) return;
+  applySuggestion(button.dataset.starterPrompt);
+});
+
 el.attachBtn?.addEventListener("click", () => el.imageInput?.click());
 el.imageInput?.addEventListener("change", () => addAttachmentFiles(el.imageInput.files));
 el.attachmentTray?.addEventListener("click", (evt) => {
@@ -1152,7 +1204,24 @@ el.diffOverlay.addEventListener("click", (evt) => {
   if (evt.target === el.diffOverlay) closeDiffOverlay();
 });
 
+function trapDiffDialogFocus(evt) {
+  if (evt.key !== "Tab" || el.diffOverlay.hidden) return;
+  const focusable = [...el.diffOverlay.querySelectorAll("button, [href], textarea, input, select, [tabindex]:not([tabindex='-1'])")]
+    .filter((node) => !node.disabled && !node.hidden);
+  if (!focusable.length) return;
+  const first = focusable[0];
+  const last = focusable[focusable.length - 1];
+  if (evt.shiftKey && document.activeElement === first) {
+    evt.preventDefault();
+    last.focus();
+  } else if (!evt.shiftKey && document.activeElement === last) {
+    evt.preventDefault();
+    first.focus();
+  }
+}
+
 document.addEventListener("keydown", (evt) => {
+  trapDiffDialogFocus(evt);
   if (evt.key === "Escape" && !el.diffOverlay.hidden) closeDiffOverlay();
   if (evt.key === "Escape") closeMobileActionSheet();
   if (evt.key === "Escape") document.body.classList.remove("sidebar-open");

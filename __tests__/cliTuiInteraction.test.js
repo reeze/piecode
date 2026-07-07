@@ -12,6 +12,14 @@ describe("CLI TUI picker interactions", () => {
     })).toBe("/model");
   });
 
+  test("submitting a slash command with arguments keeps the typed line, not the stale suggestion", () => {
+    expect(applyCommandPickerSelectionForSubmit({
+      currentLine: "/task start demo -- node bg.js",
+      mode: "command",
+      selectedItem: "/help",
+    })).toBe("/task start demo -- node bg.js");
+  });
+
   test("bare Escape from tmux cancels pickers even when Node marks it meta", () => {
     expect(isPickerCancelKey("\x1b", {
       name: "escape",
