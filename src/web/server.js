@@ -64,6 +64,7 @@ const WEB_SLASH_COMMANDS = [
   { name: "/sessions", description: "List recent resumable sessions" },
   { name: "/resume", description: "Resume a previous session by short or full ID" },
   { name: "/clear", description: "Clear conversation timeline and todos" },
+  { name: "/task", description: "List, start, read, or stop background shell tasks" },
   { name: "/btw", description: "Run a background strict-read-only side question" },
   { name: "/detail", description: "Toggle expanded tool details" },
   { name: "/plan", description: "Show or change plan mode" },
@@ -462,10 +463,9 @@ function publicAttachments(attachments = []) {
   }));
 }
 
-function sendSse(res, event) {
-  res.write(`id: ${event.id}\n`);
-  res.write(`event: ${event.type}\n`);
-  res.write(`data: ${JSON.stringify(event)}\n\n`);
+function sendSse(res, event, serialized = null) {
+  // Single write per event; serialized lets broadcasters stringify once for all clients.
+  res.write(`id: ${event.id}\nevent: ${event.type}\ndata: ${serialized || JSON.stringify(event)}\n\n`);
 }
 
 export class ApprovalBroker {
@@ -714,9 +714,10 @@ export class WebAgentSession {
     const event = makePublicEvent(type, payload);
     this.events.push(event);
     if (this.events.length > this.maxEvents) this.events = this.events.slice(this.events.length - this.maxEvents);
+    const serialized = JSON.stringify(event);
     for (const client of this.clients) {
       try {
-        sendSse(client, event);
+        sendSse(client, event, serialized);
       } catch {
         this.clients.delete(client);
       }
@@ -1012,6 +1013,45 @@ export class WebAgentSession {
     return started;
   }
 
+  parseTaskCommand(input) {
+    const raw = String(input || "").trim();
+    const body = raw.replace(/^\/tasks?(?:\s+|$)/i, "").trim();
+    if (!body) return { action: "list" };
+    const match = body.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+    const verb = String(match?.[1] || "list").toLowerCase();
+    const rest = String(match?.[2] || "").trim();
+    const action = verb === "run" ? "start" : verb === "ls" ? "list" : verb === "logs" || verb === "log" ? "read" : verb;
+    if (action === "list") return { action: "list" };
+    if (action === "start") {
+      const split = rest.match(/^(.+?)\s+--\s+([\s\S]+)$/);
+      if (split) return { action: "start", name: split[1].trim(), command: split[2].trim() };
+      return { action: "start", command: rest };
+    }
+    const [id = "", second = ""] = rest.split(/\s+/, 2);
+    if (action === "read") {
+      const limit = Number.parseInt(second, 10);
+      return { action: "read", id, ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}) };
+    }
+    if (action === "stop") return { action: "stop", id, ...(second ? { signal: second } : {}) };
+    if (action === "status" || action === "show") return { action: "status", id };
+    return { action };
+  }
+
+  async handleTaskCommand(input) {
+    const taskTool = this.agent?.tools?.task;
+    if (typeof taskTool !== "function") return "/task unavailable: background task support is not configured.";
+    const parsed = this.parseTaskCommand(input);
+    if (parsed.action === "start" && !parsed.command) return "Usage: `/task start [name --] <shell command>`.";
+    if ((parsed.action === "status" || parsed.action === "read" || parsed.action === "stop") && !parsed.id) {
+      return `Usage: \`/task ${parsed.action} <task-id>\`.`;
+    }
+    try {
+      return await taskTool(parsed);
+    } catch (err) {
+      return `Task command failed: ${String(err?.message || err)}`;
+    }
+  }
+
   formatSessionList(sessions) {
     const list = Array.isArray(sessions) ? sessions : [];
     if (list.length === 0) return "No resumable sessions yet.";
@@ -1270,6 +1310,9 @@ export class WebAgentSession {
       this.publish("snapshot", this.snapshot());
       return { handled: true, message: "Conversation context cleared." };
     }
+    if (lower === "/task" || lower === "/tasks" || lower.startsWith("/task ") || lower.startsWith("/tasks ")) {
+      return { handled: true, message: await this.handleTaskCommand(raw) };
+    }
     if (lower === "/btw" || lower.startsWith("/btw ")) {
       return { handled: true, message: this.startBtwTask(raw) };
     }
@@ -1470,7 +1513,8 @@ export class WebAgentSession {
     if (!text) throw new Error("Message is required");
     if (attachments.length > 0 && text.startsWith("/")) throw new Error("Attachments cannot be used with slash commands.");
     const isBtw = /^\/btw(?:\s+|$)/i.test(text);
-    if (this.running && !isBtw && !options.fromQueue) throw new Error("A task is already running");
+    const isTaskCommand = /^\/tasks?(?:\s+|$)/i.test(text);
+    if (this.running && !isBtw && !isTaskCommand && !options.fromQueue) throw new Error("A task is already running");
 
     if (text.startsWith("/")) {
       const slash = await this.handleSlashCommand(text);

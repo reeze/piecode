@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { promises as fs } from "node:fs";
+import { promises as fs, appendFileSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import process from "node:process";
@@ -90,6 +90,8 @@ const SLASH_COMMANDS = [
   "/sessions",
   "/resume",
   "/status",
+  "/task",
+  "/tasks",
   "/agents",
   "/plan",
   "/goal",
@@ -454,6 +456,7 @@ function formatDebugStatus({
   const llmEntries = Array.isArray(llmHistoryRef?.value?.entries) ? llmHistoryRef.value.entries.length : 0;
   const activeSubagents = subagentsRef?.value?.active instanceof Map ? subagentsRef.value.active.size : 0;
   const completedSubagents = Array.isArray(subagentsRef?.value?.completed) ? subagentsRef.value.completed.length : 0;
+  const backgroundTasks = getBackgroundTaskCounts(agent);
   const todos = Array.isArray(todosRef?.value) ? todosRef.value : [];
   const doneTodos = todos.filter((todo) => String(todo?.status || "").toLowerCase() === "completed").length;
   const historyMessages = Array.isArray(agent?.history) ? agent.history.length : 0;
@@ -465,6 +468,7 @@ function formatDebugStatus({
     `model: ${providerRef?.value ? formatProviderModel(providerRef.value) : "unknown"}`,
     `context: ${formatCompactNumber(historyTokens)}/${formatCompactNumber(contextWindowRef?.value || 0)} estimated tokens (${historyMessages} messages)`,
     `task: ${active ? `${active.id} running ${formatReadableDuration(Date.now() - Date.parse(active.startedAt || Date.now()))}` : "idle"}`,
+    `background tasks: ${backgroundTasks.running} running, ${backgroundTasks.total} total`,
     `last trace: ${saved ? `${saved.id} ${saved.status || "-"}` : "none"}`,
     `llm debug entries: ${llmEntries}`,
     `subagents: ${activeSubagents} active, ${completedSubagents} recent completed`,
@@ -476,6 +480,32 @@ function formatDebugStatus({
   return lines.join("\n");
 }
 
+function getBackgroundTaskCounts(agent) {
+  const manager = agent?.backgroundTaskManager;
+  const list = typeof manager?.list === "function" ? manager.list() : [];
+  const tasks = Array.isArray(list) ? list : [];
+  return {
+    total: tasks.length,
+    running: tasks.filter((task) => task?.status === "running").length,
+  };
+}
+
+// ponytail: streaming deltas fire hundreds of appendFile calls per turn;
+// buffer per file and flush every 200ms (plus a sync flush on exit).
+const llmEventBuffers = new Map();
+let llmEventExitFlushInstalled = false;
+
+function flushLlmEventBuffersSync() {
+  for (const [llmPath, buf] of llmEventBuffers) {
+    if (buf.lines.length === 0) continue;
+    const payload = buf.lines.join("");
+    buf.lines = [];
+    try {
+      appendFileSync(llmPath, payload, "utf8");
+    } catch {}
+  }
+}
+
 async function persistLlmSessionEvent(taskTraceRef, workspaceDir, entry) {
   if (!entry || typeof entry !== "object") return;
   try {
@@ -484,7 +514,27 @@ async function persistLlmSessionEvent(taskTraceRef, workspaceDir, entry) {
       (await ensureSessionStoreDir(workspaceDir, taskTraceRef.sessionId));
     taskTraceRef.sessionDir = sessionDir;
     const llmPath = path.join(sessionDir, "llm.jsonl");
-    await fs.appendFile(llmPath, `${JSON.stringify(entry)}\n`, "utf8");
+    let buf = llmEventBuffers.get(llmPath);
+    if (!buf) {
+      buf = { lines: [], timer: null };
+      llmEventBuffers.set(llmPath, buf);
+    }
+    buf.lines.push(`${JSON.stringify(entry)}\n`);
+    if (!llmEventExitFlushInstalled) {
+      llmEventExitFlushInstalled = true;
+      process.once("exit", flushLlmEventBuffersSync);
+    }
+    if (!buf.timer) {
+      buf.timer = setTimeout(async () => {
+        buf.timer = null;
+        const payload = buf.lines.join("");
+        buf.lines = [];
+        try {
+          await fs.appendFile(llmPath, payload, "utf8");
+        } catch {}
+      }, 200);
+      buf.timer.unref?.();
+    }
   } catch {
     // Best effort only; runtime should continue even if logging fails.
   }
@@ -587,7 +637,7 @@ function getInteractiveHelpLines() {
     "- `/sessions`, `/resume <id>` - continue previous work",
     "",
     "### Agent workflow",
-    "- `/btw <question>`, `/plan`, `/goal <task>`, `/agents` - steer long tasks",
+    "- `/task`, `/btw <question>`, `/plan`, `/goal <task>`, `/agents` - manage long-running work",
     "- `/approve on|off` - control shell command approval",
     "",
     "### Model and runtime",
@@ -612,7 +662,7 @@ function getTimelineHelpLines() {
     "[help] item: /help, /status, /clear, /compact, /exit - session basics",
     "[help] item: /sessions, /resume <id> - continue previous work",
     "[help] section: Agent workflow",
-    "[help] item: /btw <question>, /plan, /goal <task>, /agents - steer long tasks",
+    "[help] item: /task, /btw <question>, /plan, /goal <task>, /agents - manage long-running work",
     "[help] item: /approve on|off - control shell command approval",
     "[help] section: Model and runtime",
     "[help] item: /model, /model list - switch or inspect models",
@@ -720,6 +770,12 @@ Slash commands in interactive mode:
   /sessions            List recent saved sessions
   /resume <id>         Resume a saved session by full or short id
   /status              Show current task/model/subagent status
+  /task                List background shell tasks
+  /task start [name --] <cmd>
+                       Run a shell command in the background
+  /task status <id>    Show one background task
+  /task read <id>      Show recent background task output
+  /task stop <id>      Stop a running background task
   /btw <question>      Run a background strict-read-only side question while the main task continues
   /agents              Show active and recent subagents
   /plan on|off         Toggle plan mode (safe read-only tools allowed; no file changes)
@@ -2914,7 +2970,12 @@ async function handleNonInterruptingCommand(input, ctx = {}) {
   if (lower === "/status") {
     const active = ctx.subagentsRef?.value?.active instanceof Map ? ctx.subagentsRef.value.active.size : 0;
     const model = ctx.providerRef?.value ? formatProviderModel(ctx.providerRef.value) : "unknown";
-    logLine(`status: task running | model=${model} | subagents=${active} active`);
+    const backgroundTasks = getBackgroundTaskCounts(ctx.agent);
+    logLine(`status: task running | model=${model} | subagents=${active} active | background=${backgroundTasks.running}/${backgroundTasks.total}`);
+    return true;
+  }
+  if (lower === "/task" || lower === "/tasks" || lower.startsWith("/task ") || lower.startsWith("/tasks ")) {
+    await handleTaskSlashCommand(raw, ctx);
     return true;
   }
   if (lower === "/btw" || lower.startsWith("/btw ")) {
@@ -2922,7 +2983,7 @@ async function handleNonInterruptingCommand(input, ctx = {}) {
     return true;
   }
   if (lower === "/help") {
-    logLine("running commands: /btw <question>, /status, /agents, /debug, /debug status, /debug llm, /help");
+    logLine("running commands: /task, /btw <question>, /status, /agents, /debug, /debug status, /debug llm, /help");
     logLine("other commands are deferred until the current task finishes");
     return true;
   }
@@ -2952,7 +3013,7 @@ async function handleNonInterruptingCommand(input, ctx = {}) {
     return true;
   }
   logLine(`command not available while task is running: ${raw}`);
-  logLine("available now: plain text to steer, /btw <question>, /status, /agents, /debug, /debug llm, /help");
+  logLine("available now: plain text to steer, /task, /btw <question>, /status, /agents, /debug, /debug llm, /help");
   return true;
 }
 
@@ -2998,6 +3059,57 @@ function startBtwTask(input, ctx = {}) {
     .catch((err) => {
       logLine(`[btw] failed: ${String(err?.message || err)}`);
     });
+  return true;
+}
+
+function parseTaskSlashCommand(input) {
+  const raw = String(input || "").trim();
+  const body = raw.replace(/^\/tasks?(?:\s+|$)/i, "").trim();
+  if (!body) return { action: "list" };
+  const match = body.match(/^(\S+)(?:\s+([\s\S]*))?$/);
+  const verb = String(match?.[1] || "list").toLowerCase();
+  const rest = String(match?.[2] || "").trim();
+  const action = verb === "run" ? "start" : verb === "ls" ? "list" : verb === "logs" || verb === "log" ? "read" : verb;
+  if (action === "list") return { action: "list" };
+  if (action === "start") {
+    const split = rest.match(/^(.+?)\s+--\s+([\s\S]+)$/);
+    if (split) return { action: "start", name: split[1].trim(), command: split[2].trim() };
+    return { action: "start", command: rest };
+  }
+  const [id = "", second = ""] = rest.split(/\s+/, 2);
+  if (action === "read") {
+    const limit = Number.parseInt(second, 10);
+    return { action: "read", id, ...(Number.isFinite(limit) && limit > 0 ? { limit } : {}) };
+  }
+  if (action === "stop") {
+    return { action: "stop", id, ...(second ? { signal: second } : {}) };
+  }
+  if (action === "status" || action === "show") return { action: "status", id };
+  return { action };
+}
+
+async function handleTaskSlashCommand(input, ctx = {}) {
+  const logLine = ctx.logLine || (() => {});
+  const taskTool = ctx.agent?.tools?.task;
+  if (typeof taskTool !== "function") {
+    logLine("/task unavailable: background task support is not configured");
+    return true;
+  }
+  const parsed = parseTaskSlashCommand(input);
+  if (parsed.action === "start" && !parsed.command) {
+    logLine("usage: /task start [name --] <shell command>");
+    return true;
+  }
+  if ((parsed.action === "status" || parsed.action === "read" || parsed.action === "stop") && !parsed.id) {
+    logLine(`usage: /task ${parsed.action} <task-id>`);
+    return true;
+  }
+  try {
+    const result = await taskTool(parsed);
+    for (const line of String(result || "").split("\n")) logLine(line);
+  } catch (err) {
+    logLine(`task command failed: ${String(err?.message || err)}`);
+  }
   return true;
 }
 
@@ -3165,7 +3277,16 @@ async function handleSlashCommand(input, ctx) {
   }
   if (lower === "/status") {
     const active = ctx.subagentsRef?.value?.active instanceof Map ? ctx.subagentsRef.value.active.size : 0;
-    logLine(`status: idle | model=${formatProviderModel(providerRef.value)} | subagents=${active} active`);
+    const backgroundTasks = getBackgroundTaskCounts(agent);
+    logLine(`status: idle | model=${formatProviderModel(providerRef.value)} | subagents=${active} active | background=${backgroundTasks.running}/${backgroundTasks.total}`);
+    return { done: false, handled: true };
+  }
+  if (lower === "/task" || lower === "/tasks" || lower.startsWith("/task ") || lower.startsWith("/tasks ")) {
+    await handleTaskSlashCommand(raw, {
+      ...ctx,
+      agent,
+      logLine,
+    });
     return { done: false, handled: true };
   }
   if (lower === "/think" || lower === "/thinking" || lower === "/reasoning" || lower.startsWith("/think ") || lower.startsWith("/thinking ") || lower.startsWith("/reasoning ")) {

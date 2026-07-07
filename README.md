@@ -5,7 +5,7 @@ A Claude Code-like command line coding agent.
 ## Features
 
 - Interactive terminal agent loop
-- Model-driven tool use (`shell`, `read_file`, `read_files`, `write_file`, `apply_patch`, `replace_in_files`, `list_files`, `glob_files`, `find_files`, `search_files`, `git_status`, `git_diff`, `run_tests`)
+- Model-driven tool use (`shell`, `task`, `read_file`, `read_files`, `write_file`, `apply_patch`, `replace_in_files`, `list_files`, `glob_files`, `find_files`, `search_files`, `git_status`, `git_diff`, `run_tests`)
 - MCP support via `mcpServers` settings and shared agent MCP configs (list/call tools, list/read resources)
 - Workspace path sandboxing for file operations
 - Shell command approval mode (`/approve on|off`)
@@ -176,6 +176,11 @@ DOCKER_HOST=unix:///Users/$USER/.orbstack/run/docker.sock ./scripts/run-terminal
 - `/clear` clear conversation memory
 - `/plan on|off` toggle plan mode (generate plans, allow safe read-only tools, no file changes)
 - `/goal <task>` run a goal-driven loop that keeps planning, executing, and verifying until completion, blockage, or the turn limit
+- `/task` list background shell tasks
+- `/task start [name --] <cmd>` run a shell command in the background
+- `/task status <id>` show one background task
+- `/task read <id>` show recent task output
+- `/task stop <id>` stop a running background task
 - `/approve on|off` toggle shell auto approval
 - `/model` show active provider/model
 - `/mcp` show MCP status/usage
@@ -198,6 +203,7 @@ You can also mention `$skill-name` in a prompt to auto-enable that skill for the
 ## Notes
 
 - `shell` tool runs commands from the current working directory.
+- Use `/task start [name --] <cmd>` or the model-facing `shell` tool with `background: true` for long-running servers, watchers, and parallel workloads.
 - File tools are restricted to the current workspace root.
 - Shell tool is approval-gated by default for safety.
 - MCP can be configured in `~/.piecode/settings.json` with `mcpServers` (or `mcp.servers`).

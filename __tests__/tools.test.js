@@ -3,6 +3,20 @@ import path from "node:path";
 import { promises as fs } from "node:fs";
 import { classifyShellCommand, createToolset } from "../src/lib/tools.js";
 
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+async function waitForTaskStatus(tools, id, status, attempts = 20) {
+  let latest = "";
+  for (let i = 0; i < attempts; i += 1) {
+    latest = await tools.task({ action: "status", id });
+    if (latest.includes(`status: ${status}`)) return latest;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return latest;
+}
+
 describe("tools usability", () => {
   test("exposes todo_write and todowrite aliases", async () => {
     const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-tools-"));
@@ -115,12 +129,146 @@ describe("tools usability", () => {
     expect(typeof tools.web_search).toBe("function");
     expect(typeof tools.search_web).toBe("function");
     expect(typeof tools.subagent).toBe("function");
+    expect(typeof tools.task).toBe("function");
     expect(typeof tools.edit_file).toBe("function");
     expect(typeof tools.apply_patch).toBe("function");
     expect(typeof tools.replace_in_files).toBe("function");
     expect(typeof tools.git_status).toBe("function");
     expect(typeof tools.git_diff).toBe("function");
     expect(typeof tools.run_tests).toBe("function");
+  });
+
+  test("task tool starts, lists, reads, and stops a background command", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-bg-task-"));
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+    });
+    const command = `${shellQuote(process.execPath)} -e ${shellQuote("console.log('ready'); setInterval(() => {}, 1000);")}`;
+
+    const started = await tools.task({ action: "start", name: "dev-server", command });
+    const id = /task:\s+(bg-\d+)/.exec(started)?.[1];
+    expect(id).toBeTruthy();
+    expect(started).toContain("status: running");
+
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const listed = await tools.task({ action: "list" });
+    expect(listed).toContain(id);
+    expect(listed).toContain("dev-server");
+    expect(listed).toContain("running");
+
+    const logs = await tools.task({ action: "read", id });
+    expect(logs).toContain("ready");
+
+    const stopped = await tools.task({ action: "stop", id });
+    expect(stopped).toContain(`task: ${id}`);
+    expect(stopped).toContain("status: stopped");
+  });
+
+  test("shell tool can start a managed background task", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-shell-bg-task-"));
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+    });
+    const command = `${shellQuote(process.execPath)} -e ${shellQuote("console.log('shell-bg'); setInterval(() => {}, 1000);")}`;
+
+    const started = await tools.shell({ command, background: true, name: "shell-server" });
+    const id = /task:\s+(bg-\d+)/.exec(started)?.[1];
+    expect(id).toBeTruthy();
+    expect(started).toContain("status: running");
+
+    const listed = await tools.task({ action: "list" });
+    expect(listed).toContain(id);
+    expect(listed).toContain("shell-server");
+
+    const stopped = await tools.task({ action: "stop", id, grace_ms: 50 });
+    expect(stopped).toContain("status: stopped");
+  });
+
+  test("task tool manages multiple background commands in parallel", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-bg-task-parallel-"));
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+    });
+    const firstCommand = `${shellQuote(process.execPath)} -e ${shellQuote("console.log('first-ready'); setInterval(() => {}, 1000);")}`;
+    const secondCommand = `${shellQuote(process.execPath)} -e ${shellQuote("console.log('second-ready'); setInterval(() => {}, 1000);")}`;
+
+    const first = await tools.task({ action: "start", name: "first-server", command: firstCommand });
+    const second = await tools.task({ action: "start", name: "second-server", command: secondCommand });
+    const firstId = /task:\s+(bg-\d+)/.exec(first)?.[1];
+    const secondId = /task:\s+(bg-\d+)/.exec(second)?.[1];
+    expect(firstId).toBeTruthy();
+    expect(secondId).toBeTruthy();
+    expect(firstId).not.toBe(secondId);
+
+    const listed = await tools.task({ action: "list" });
+    expect(listed).toContain(`${firstId} first-server: running`);
+    expect(listed).toContain(`${secondId} second-server: running`);
+
+    await tools.task({ action: "stop", id: firstId, grace_ms: 50 });
+    await tools.task({ action: "stop", id: secondId, grace_ms: 50 });
+  });
+
+  test("task tool records completed background command output", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-bg-task-done-"));
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+    });
+    const command = `${shellQuote(process.execPath)} -e ${shellQuote("console.log('done')")}`;
+
+    const started = await tools.task({ action: "start", command });
+    const id = /task:\s+(bg-\d+)/.exec(started)?.[1];
+    expect(id).toBeTruthy();
+
+    const status = await waitForTaskStatus(tools, id, "done");
+    expect(status).toContain(`task: ${id}`);
+    expect(status).toContain("status: done");
+
+    const logs = await tools.task({ action: "read", id });
+    expect(logs).toContain("done");
+  });
+
+  test("task stop escalates when a background process ignores SIGTERM", async () => {
+    const dir = await fs.mkdtemp(path.join(os.tmpdir(), "piecode-bg-task-stop-"));
+    const tools = createToolset({
+      workspaceDir: dir,
+      autoApproveRef: { value: true },
+      askApproval: async () => true,
+    });
+    const script = [
+      "process.on('SIGTERM', () => {});",
+      "console.log(`child:${process.pid}`);",
+      "setInterval(() => {}, 1000);",
+    ].join(" ");
+    const command = `${shellQuote(process.execPath)} -e ${shellQuote(script)}`;
+
+    const started = await tools.task({ action: "start", name: "ignores-term", command });
+    const id = /task:\s+(bg-\d+)/.exec(started)?.[1];
+    expect(id).toBeTruthy();
+
+    let childPid = null;
+    for (let i = 0; i < 20; i += 1) {
+      const logs = await tools.task({ action: "read", id });
+      childPid = Number(/child:(\d+)/.exec(logs)?.[1] || 0) || null;
+      if (childPid) break;
+      await new Promise((resolve) => setTimeout(resolve, 25));
+    }
+    expect(childPid).toBeTruthy();
+
+    const stopped = await tools.task({ action: "stop", id, grace_ms: 50 });
+    expect(stopped).toContain(`task: ${id}`);
+    expect(stopped).toContain("status: stopped");
+
+    await new Promise((resolve) => setTimeout(resolve, 50));
+    expect(() => process.kill(childPid, 0)).toThrow();
   });
 
   test("subagent delegates to configured runner with normalized input", async () => {

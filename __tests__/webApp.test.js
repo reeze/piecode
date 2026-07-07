@@ -106,4 +106,47 @@ describe("web app approval and clarification contract", () => {
     expect(script).toContain('const files = await clipboardItemsToFiles(evt.clipboardData);');
     expect(script).toContain('evt.preventDefault();');
   });
+
+  test("empty state offers fast assistant starter prompts", async () => {
+    const script = await fs.readFile("src/web/public/app.js", "utf8");
+
+    expect(script).toContain('class="starter-prompts"');
+    expect(script).toContain('data-starter-prompt="Review my current diff and suggest the safest next steps."');
+    expect(script).toContain('el.messages.addEventListener("click"');
+    expect(script).toContain('applySuggestion(button.dataset.starterPrompt);');
+  });
+
+  test("approval actions keep fast allow visible while nesting persistent trust options", async () => {
+    const script = await fs.readFile("src/web/public/app.js", "utf8");
+
+    expect(script).toContain('approval-primary-actions');
+    expect(script).toContain('data-decision="allow_once">Allow once</button>');
+    expect(script).toContain('class="approval-more"');
+    expect(script).toContain('<summary>Trust this command faster</summary>');
+    expect(script).toContain('data-decision="remember_command"');
+    expect(script).toContain('data-decision="allow_all_session"');
+  });
+
+  test("slash suggestions expose listbox semantics to assistive tech", async () => {
+    const html = await fs.readFile("src/web/public/index.html", "utf8");
+    const script = await fs.readFile("src/web/public/app.js", "utf8");
+
+    expect(html).toContain('aria-controls="slashSuggestions"');
+    expect(html).toContain('aria-expanded="false"');
+    expect(html).toContain('role="listbox"');
+    expect(script).toContain('el.messageInput.setAttribute("aria-expanded", "true")');
+    expect(script).toContain('role="option"');
+    expect(script).toContain('aria-selected="${index === state.selectedSuggestion ? "true" : "false"}"');
+  });
+
+  test("diff dialog manages focus while open and restores it when closed", async () => {
+    const script = await fs.readFile("src/web/public/app.js", "utf8");
+
+    expect(script).toContain('let diffPreviousFocus = null;');
+    expect(script).toContain('function setAppInert(inert)');
+    expect(script).toContain('diffPreviousFocus = document.activeElement;');
+    expect(script).toContain('el.closeDiffBtn?.focus();');
+    expect(script).toContain('diffPreviousFocus?.focus?.();');
+    expect(script).toContain('function trapDiffDialogFocus(evt)');
+  });
 });

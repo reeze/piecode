@@ -180,6 +180,7 @@ export function buildSystemPrompt({
     "LONG TASK LOOP:",
     "- Keep a compact working state: goal, constraints, repo facts, changed files, validation, blockers, and next step.",
     "- Work in coherent slices: inspect, change, validate, summarize; reassess after tool results and update strategy when evidence changes.",
+    "- Before running a shell command that may stay alive or run for a long time (dev server, watcher, long test loop, build monitor, or parallel workload), start it as managed background work with shell background:true or task start, then use task status/read/stop to inspect or clean it up.",
     "- Between slices, provide brief progress syncs: current state, what changed/was found, and the next action.",
     "- Before major transitions (large edit, validation, final answer), reconcile the todo list/working state against user requirements and discovered constraints.",
     "- Preserve enough context in summaries so work can continue after compaction, interruption, or resume.",
@@ -205,6 +206,7 @@ export function buildSystemPrompt({
     const textToolNames = [
       "clarify_user",
       "shell",
+      "task",
       "read_file",
       "read_files",
       "edit_file",
@@ -254,7 +256,8 @@ export function buildSystemPrompt({
       "TOOLS:",
       "- Clarify: clarify_user asks the user to choose one option or multiple options through the harness when a decision is blocked or materially ambiguous. Input: {question, options:[{label,value?,description?}], multiple?:boolean}.",
       "- Inspect/search: read_file, read_files, list_files, glob_files, find_files, rg/search_files/grep, git_status, git_diff.",
-      "- Change/validate: edit_file, write_file, replace_in_files, shell, run_tests.",
+      "- Change/validate: edit_file, write_file, replace_in_files, shell, task, run_tests.",
+      "- Background work: use shell with background:true or task start/list/status/read/stop for long-running servers, watchers, and parallel shell commands without blocking the turn.",
       "- Delegate/context: subagent, collaborate, todo_write/todowrite, memory_write/remember, web_search/search_web.",
       "- Prefer rg for code search; prefer edit_file for existing-file edits; write_file is for new files or explicit rewrites.",
       "- memory_write scope is project or global; never store secrets.",
@@ -360,6 +363,7 @@ export function buildSystemPrompt({
 const KNOWN_TOOL_NAMES = new Set([
   "clarify_user",
   "shell",
+  "task",
   "read_file",
   "read_files",
   "write_file",
@@ -782,8 +786,33 @@ export function buildToolDefinitions(nativeTools = false, options = {}) {
         type: "object",
         properties: {
           command: { type: "string", description: "Shell command to execute" },
+          timeout: { type: "integer", description: "Optional foreground timeout in milliseconds." },
+          background: { type: "boolean", description: "Run command as a managed background task instead of waiting for it." },
+          name: { type: "string", description: "Optional name when background is true." },
         },
         required: ["command"],
+      },
+    },
+    {
+      name: "task",
+      description:
+        "Start and manage background shell tasks in the workspace. Use for long-running servers, watchers, test loops, or parallel shell workloads that should not block the agent turn.",
+      input_schema: {
+        type: "object",
+        properties: {
+          action: {
+            type: "string",
+            enum: ["start", "list", "status", "read", "stop"],
+            description: "Task operation. Use start to run a command in the background.",
+          },
+          command: { type: "string", description: "Shell command for action=start." },
+          name: { type: "string", description: "Optional short label for a started task, e.g. dev-server." },
+          id: { type: "string", description: "Task id for status/read/stop, e.g. bg-1." },
+          limit: { type: "integer", description: "Maximum log characters for read (default 12000)." },
+          signal: { type: "string", description: "Signal for stop (default SIGTERM)." },
+          grace_ms: { type: "integer", description: "Milliseconds to wait before escalating stop to SIGKILL (default 500)." },
+        },
+        required: ["action"],
       },
     },
     {
