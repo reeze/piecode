@@ -239,9 +239,13 @@ export function buildDoctorReport({
     problems.push('No active model. Run `/model` to pick one.');
   }
 
+  // Doctor stays offline, so this counts the curated catalog only; providers
+  // that serve models the registry has not seen are queried by --list-models.
   const models = buildModelCatalog({ settings, env });
   lines.push('');
-  lines.push(`models available: ${models.length}`);
+  lines.push(
+    `curated models for ready providers: ${models.length}  (run \`piecode --list-models\` to query providers directly)`
+  );
 
   for (const check of Array.isArray(extraChecks) ? extraChecks : []) {
     if (!check || typeof check !== 'object') continue;

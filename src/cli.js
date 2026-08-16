@@ -5818,26 +5818,29 @@ async function main() {
 
   // Durable working state for long-horizon runs: loaded once, then written
   // back on a short debounce so a crashed or resumed session keeps its plan.
+  // The file is small and updates are infrequent, so writes go out immediately.
+  // Concurrent updates are coalesced: a write in flight marks the state dirty
+  // and is followed by exactly one more write, so no update is lost and the
+  // process never exits with a stale ledger on disk.
   const ledgerRef = { value: await loadLedger(workspaceDir) };
-  let ledgerSaveTimer = null;
-  let ledgerSavePending = false;
-  const flushLedgerSave = async () => {
-    if (ledgerSaveTimer) {
-      clearTimeout(ledgerSaveTimer);
-      ledgerSaveTimer = null;
-    }
-    if (!ledgerSavePending) return;
-    ledgerSavePending = false;
-    await saveLedger(workspaceDir, ledgerRef.value);
-  };
+  let ledgerWriteInFlight = null;
+  let ledgerDirty = false;
   const scheduleLedgerSave = () => {
-    ledgerSavePending = true;
-    if (ledgerSaveTimer) return;
-    ledgerSaveTimer = setTimeout(() => {
-      ledgerSaveTimer = null;
-      flushLedgerSave().catch(() => {});
-    }, 400);
-    if (typeof ledgerSaveTimer.unref === "function") ledgerSaveTimer.unref();
+    if (ledgerWriteInFlight) {
+      ledgerDirty = true;
+      return ledgerWriteInFlight;
+    }
+    ledgerWriteInFlight = (async () => {
+      try {
+        do {
+          ledgerDirty = false;
+          await saveLedger(workspaceDir, ledgerRef.value);
+        } while (ledgerDirty);
+      } finally {
+        ledgerWriteInFlight = null;
+      }
+    })();
+    return ledgerWriteInFlight;
   };
 
   const logMcpConfiguredServers = (hub) => {
