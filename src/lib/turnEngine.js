@@ -201,6 +201,18 @@ export class TurnEngine {
         nextToolError = postHookResult.error;
       }
     }
+    // Keep the durable ledger current from real tool outcomes, so long runs
+    // retain their plan and evidence even after context compaction.
+    try {
+      this.agent.recordToolInLedger?.({
+        tool: action.tool,
+        input: action.input || {},
+        result: nextResult,
+        error: nextToolError,
+      });
+    } catch {
+      // Ledger bookkeeping must never fail a tool call.
+    }
     return { result: nextResult, toolError: nextToolError };
   }
 
@@ -802,6 +814,7 @@ export class TurnEngine {
       mcpEnabled: this.mcpEnabled,
       mcpServerNames: this.mcpServerNames,
       agentDefinitions: this.agent.getAgentDefinitions(),
+      taskLedger: this.agent.getLedgerPrompt?.() || null,
     });
 
     this.agent.onEvent?.({ type: "model_call", provider: this.agent.provider.kind, model: this.agent.provider.model });

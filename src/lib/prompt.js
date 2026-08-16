@@ -135,6 +135,7 @@ export function buildSystemPrompt({
   mcpEnabled = false,
   mcpServerNames = [],
   agentDefinitions = [],
+  taskLedger = null,
 }) {
   const sections = [
     "You are a general-purpose command-line agent. Adapt to the user's task, whether it is coding, writing, research, analysis, planning, or troubleshooting.",
@@ -315,6 +316,16 @@ export function buildSystemPrompt({
   sections.push(...renderAgentDefinitionsSection(agentDefinitions));
 
   sections.push(...renderMemorySection(memory));
+
+  // Durable working state for long-horizon runs. Placed after memory so it is
+  // the most recent authoritative context the model sees before the plan.
+  const ledgerText = typeof taskLedger === "string" ? taskLedger.trim() : "";
+  if (ledgerText) {
+    sections.push(ledgerText);
+    sections.push(
+      "Ledger upkeep: keep the todo list and next step accurate as work lands. Do not redo work the ledger records as completed and validated; re-verify only when new evidence contradicts it."
+    );
+  }
 
   if (activePlan) {
     sections.push(...renderActivePlanSection(activePlan));

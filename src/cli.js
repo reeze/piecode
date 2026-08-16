@@ -46,11 +46,10 @@ import { Display } from "./lib/display.js";
 import { consumeMouseWheelDeltas, stripMouseInputNoise } from "./lib/mouse.js";
 import { applyCommandPickerSelectionForSubmit, isPickerCancelKey } from "./lib/cliTuiInteraction.js";
 import { TuiLineEditor } from "./lib/tuiLineEditor.js";
-import { filterUsableModelCatalog, getModelQueryFromInput, isModelProviderConfigured } from "./lib/modelInput.js";
+import { filterUsableModelCatalog, getModelQueryFromInput } from "./lib/modelInput.js";
 import {
   buildModelCatalog,
   describeProviderSetup,
-  describeProviderStatuses,
   discoverAllProviderModels,
   formatModelRef,
   getCatalogContextWindow,
@@ -79,6 +78,13 @@ import { applyFileMentionSelection, getFileMentionSuggestions, isGitRelatedPath 
 import { buildFileMentionContext } from "./lib/fileMentionContext.js";
 import { formatAttachmentSummary, readClipboardImage } from "./lib/attachments.js";
 import { loadMemory } from "./lib/memory.js";
+import {
+  clearLedger,
+  createEmptyLedger,
+  formatLedgerForDisplay,
+  loadLedger,
+  saveLedger,
+} from "./lib/taskLedger.js";
 import { loadAgentDefinitions } from "./lib/agentDefinitions.js";
 import {
   listResumableSessions,
@@ -127,6 +133,8 @@ const SLASH_COMMANDS = [
   "/provider",
   "/providers",
   "/doctor",
+  "/ledger",
+  "/ledger clear",
   "/think",
   "/thinking",
   "/reasoning",
@@ -163,11 +171,6 @@ const DEFAULT_CONTEXT_WINDOW = 128000;
 // Seed suggestions come from the shared model registry so every provider the
 // registry knows about shows up in the picker without a second hard-coded list.
 const MODEL_SUGGESTIONS = buildModelCatalog({ includeUnconfigured: true }).map((row) => row.ref);
-
-// Metadata for the picker, keyed by `provider:model`.
-const MODEL_INFO_BY_REF = new Map(
-  buildModelCatalog({ includeUnconfigured: true }).map((row) => [row.ref, row])
-);
 
 function createMutedTtyOutput(baseOut) {
   const muted = new Writable({
@@ -3166,6 +3169,7 @@ async function handleSlashCommand(input, ctx) {
     llmHistoryRef,
     sessionBus,
     refreshTuiContextUsage,
+    ledgerRef,
     pendingAttachmentsRef,
   } = ctx;
 
@@ -3596,6 +3600,20 @@ async function handleSlashCommand(input, ctx) {
       logLine(line);
     }
     logLine("usage: /provider <id> to switch  |  /models to browse models");
+    return { done: false, handled: true };
+  }
+  if (lower === "/ledger" || lower === "/ledger clear") {
+    if (lower === "/ledger clear") {
+      await clearLedger(workspaceDir);
+      if (ledgerRef) ledgerRef.value = createEmptyLedger();
+      if (agent) agent.systemPromptCache?.clear?.();
+      logLine("task ledger cleared");
+      return { done: false, handled: true };
+    }
+    for (const line of formatLedgerForDisplay(ledgerRef?.value || agent?.getLedger?.())) {
+      logLine(line);
+    }
+    logLine("usage: /ledger clear to reset durable task state");
     return { done: false, handled: true };
   }
   if (lower === "/doctor") {
@@ -4303,10 +4321,6 @@ function mergeModelCatalog(baseCatalog, popular, latest, localSettingsModels = [
 
 function getUsableModelCatalog(baseCatalog, settings, alwaysInclude = []) {
   return filterUsableModelCatalog(baseCatalog, settings, process.env, alwaysInclude);
-}
-
-function isConfiguredModelProvider(provider, settings) {
-  return isModelProviderConfigured(provider, settings, process.env);
 }
 
 async function probeAvailableModels({
@@ -5773,6 +5787,30 @@ async function main() {
     return "deny";
   };
 
+  // Durable working state for long-horizon runs: loaded once, then written
+  // back on a short debounce so a crashed or resumed session keeps its plan.
+  const ledgerRef = { value: await loadLedger(workspaceDir) };
+  let ledgerSaveTimer = null;
+  let ledgerSavePending = false;
+  const flushLedgerSave = async () => {
+    if (ledgerSaveTimer) {
+      clearTimeout(ledgerSaveTimer);
+      ledgerSaveTimer = null;
+    }
+    if (!ledgerSavePending) return;
+    ledgerSavePending = false;
+    await saveLedger(workspaceDir, ledgerRef.value);
+  };
+  const scheduleLedgerSave = () => {
+    ledgerSavePending = true;
+    if (ledgerSaveTimer) return;
+    ledgerSaveTimer = setTimeout(() => {
+      ledgerSaveTimer = null;
+      flushLedgerSave().catch(() => {});
+    }, 400);
+    if (typeof ledgerSaveTimer.unref === "function") ledgerSaveTimer.unref();
+  };
+
   const logMcpConfiguredServers = (hub) => {
     if (!hub || typeof hub.hasServers !== "function" || !hub.hasServers()) {
       logLine("[mcp] no configured servers");
@@ -5815,6 +5853,8 @@ async function main() {
     webSearch: settings?.webSearch || settings?.tools?.web?.search || null,
     contextWindowRef,
     shellPermissionRef,
+    ledgerRef,
+    onLedgerUpdate: scheduleLedgerSave,
     onTodoWrite: (nextTodos) => {
       applyTodoState(todosRef, nextTodos, {
         sessionBus,
@@ -6351,6 +6391,7 @@ async function main() {
       commandRunRef,
       subagentsRef,
       pendingAttachmentsRef,
+      ledgerRef,
     });
     if (slash.done) {
       await saveCliResumableSession({

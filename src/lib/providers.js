@@ -20,14 +20,6 @@ import {
 const DEFAULT_ANTHROPIC_MODEL =
   process.env.ANTHROPIC_MODEL || 'claude-3-5-sonnet-latest';
 const DEFAULT_OPENAI_MODEL = process.env.OPENAI_MODEL || 'gpt-4.1-mini';
-const DEFAULT_OPENROUTER_MODEL =
-  process.env.OPENROUTER_MODEL || 'openai/gpt-4.1-mini';
-const DEFAULT_OPENROUTER_BASE_URL =
-  process.env.OPENROUTER_BASE_URL || 'https://openrouter.ai/api/v1';
-const DEFAULT_SEED_MODEL =
-  process.env.SEED_MODEL || 'doubao-seed-code-preview-latest';
-const DEFAULT_SEED_BASE_URL =
-  process.env.SEED_BASE_URL || 'https://ark.cn-beijing.volces.com/api/coding';
 const DEFAULT_CODEX_MODEL = process.env.CODEX_MODEL || 'gpt-5.3-codex';
 const DEFAULT_CODEX_BACKEND_BASE_URL = 'https://chatgpt.com/backend-api';
 const CODEX_ACCOUNT_CLAIM = 'https://api.openai.com/auth';

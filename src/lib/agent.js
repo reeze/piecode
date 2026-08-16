@@ -7,6 +7,13 @@ import { AgentManager } from "./agentManager.js";
 import { TeamManager } from "./teamManager.js";
 import { appendMemory, renderMemoryForPrompt } from "./memory.js";
 import { runPluginToolHooks } from "./pluginHooks.js";
+import {
+  applyLedgerUpdate,
+  createEmptyLedger,
+  deriveLedgerUpdateFromTool,
+  isLedgerEmpty,
+  renderLedgerForPrompt,
+} from "./taskLedger.js";
 
 function summarizeToolUseNames(events = [], maxItems = 12) {
   const counts = new Map();
@@ -46,6 +53,8 @@ export class Agent {
     currentAgentDefinition = null,
     getSteers = null,
     backgroundTaskManager = null,
+    ledgerRef = null,
+    onLedgerUpdate = null,
   }) {
     this.provider = provider;
     this.workspaceDir = workspaceDir;
@@ -73,6 +82,9 @@ export class Agent {
       backgroundTaskManager && typeof backgroundTaskManager.start === "function"
         ? backgroundTaskManager
         : createBackgroundTaskManager({ workspaceDir: this.workspaceDir });
+    this.ledgerRef = ledgerRef && typeof ledgerRef === "object" ? ledgerRef : { value: createEmptyLedger() };
+    if (!this.ledgerRef.value) this.ledgerRef.value = createEmptyLedger();
+    this.onLedgerUpdate = typeof onLedgerUpdate === "function" ? onLedgerUpdate : null;
     this.history = [];
     this.rebuildToolset();
     this.enablePlanner = process.env.PIECODE_ENABLE_PLANNER === "1";
@@ -129,6 +141,45 @@ export class Agent {
 
   getMemoryPrompt() {
     return renderMemoryForPrompt(this.memoryRef?.value || null);
+  }
+
+  getLedger() {
+    return this.ledgerRef?.value || createEmptyLedger();
+  }
+
+  getLedgerPrompt() {
+    return renderLedgerForPrompt(this.getLedger());
+  }
+
+  hasLedgerState() {
+    return !isLedgerEmpty(this.getLedger());
+  }
+
+  /**
+   * Fold an update into the durable ledger and notify the host so it can
+   * persist and render it. No-ops when the update carries nothing new.
+   */
+  updateLedger(update) {
+    if (!update || typeof update !== "object") return null;
+    const before = this.getLedger();
+    const next = applyLedgerUpdate(before, update);
+    if (JSON.stringify(next) === JSON.stringify(before)) return null;
+    this.ledgerRef.value = next;
+    // The ledger is part of the system prompt, so cached prompts are stale now.
+    this.systemPromptCache.clear();
+    this.onEvent?.({ type: "ledger_update", ledger: next });
+    try {
+      this.onLedgerUpdate?.(next);
+    } catch {
+      // Persistence is best effort and must not break a turn.
+    }
+    return next;
+  }
+
+  /** Record what a finished tool call implies about durable task state. */
+  recordToolInLedger({ tool, input, result, error } = {}) {
+    const update = deriveLedgerUpdateFromTool({ tool, input, result, error });
+    return update ? this.updateLedger(update) : null;
   }
 
   async writeMemory({ scope = "project", content } = {}) {
@@ -458,6 +509,7 @@ export class Agent {
       `Task:\n${String(task || "")}`,
       context ? `Additional context:\n${String(context)}` : "",
       this.getMemoryPrompt() ? `Durable memory:\n${this.getMemoryPrompt()}` : "",
+      this.getLedgerPrompt() ? `Parent task state:\n${this.getLedgerPrompt()}` : "",
       recentContext ? `Recent parent context:\n${recentContext}` : "",
       "",
       "Return findings with file paths, relevant symbols, and any uncertainty. Do not make changes.",
@@ -566,6 +618,8 @@ export class Agent {
       agentManager: this.agentManager,
       agentDefinitionsRef: this.agentDefinitionsRef,
       currentAgentDefinition: definition,
+      // Subagents read the parent's working state but never write to it.
+      ledgerRef: { value: this.getLedger() },
     });
 
     const blockedReadOnlyTool = async () => "Tool error: subagent is read-only and cannot modify files or todos.";
@@ -685,6 +739,14 @@ export class Agent {
 
   async runTurn(userMessage, options = {}) {
     this.activeAbortController = new AbortController();
+    // The first substantive request of a run becomes the ledger objective, so a
+    // resumed or compacted session still knows what it set out to do.
+    if (this.subagentDepth === 0) {
+      const message = String(userMessage || "").trim();
+      const update = { incrementTurn: true };
+      if (!this.getLedger().objective && message.length >= 12) update.objective = message;
+      this.updateLedger(update);
+    }
     try {
       const engine = new TurnEngine(this, { userMessage, options });
       return await engine.run();
