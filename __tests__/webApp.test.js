@@ -147,6 +147,31 @@ describe("web app approval and clarification contract", () => {
     expect(script).toContain('diffPreviousFocus = document.activeElement;');
     expect(script).toContain('el.closeDiffBtn?.focus();');
     expect(script).toContain('diffPreviousFocus?.focus?.();');
-    expect(script).toContain('function trapDiffDialogFocus(evt)');
+    // One shared focus trap now serves the diff and model dialogs.
+    expect(script).toContain('function trapDialogFocus(evt, overlay)');
+    expect(script).toContain('trapDialogFocus(evt, el.diffOverlay);');
+  });
+
+  test("model picker dialog is reachable, filterable, and restores focus", async () => {
+    const [markup, script, styles] = await Promise.all([
+      fs.readFile("src/web/public/index.html", "utf8"),
+      fs.readFile("src/web/public/app.js", "utf8"),
+      fs.readFile("src/web/public/styles.css", "utf8"),
+    ]);
+
+    expect(markup).toContain('id="modelPickerBtn"');
+    expect(markup).toContain('aria-haspopup="dialog"');
+    expect(markup).toContain('id="modelOverlay"');
+    expect(markup).toContain('id="modelSearch"');
+
+    expect(script).toContain('async function openModelOverlay(');
+    expect(script).toContain('function closeModelOverlay()');
+    expect(script).toContain('modelPreviousFocus?.focus?.();');
+    expect(script).toContain('trapDialogFocus(evt, el.modelOverlay);');
+    expect(script).toContain('postJson("/api/model", { model: target })');
+    expect(script).toContain('apiUrl(`/api/models${refresh ? "?refresh=1" : ""}`)');
+
+    expect(styles).toContain(".model-option");
+    expect(styles).toContain(".model-dialog");
   });
 });

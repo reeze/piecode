@@ -8,6 +8,21 @@ import { Agent } from "../lib/agent.js";
 import { loadMemory } from "../lib/memory.js";
 import { getProvider } from "../lib/providers.js";
 import {
+  buildModelCatalog,
+  describeProviderSetup,
+  describeProviderStatuses,
+  discoverAllProviderModels,
+  formatModelRef,
+  getCatalogContextWindow,
+  getProviderSpec,
+  inferProviderForModel,
+  isKnownProvider,
+  normalizeProviderId,
+  parseModelRef,
+  resolveProviderConfig,
+} from "../lib/modelCatalog.js";
+import { formatContextTokens } from "../lib/providerStatus.js";
+import {
   addSkillByName,
   autoEnableSkills,
   autoLoadSkillsFromInstructions,
@@ -107,13 +122,21 @@ async function loadSettings(filePath) {
   }
 }
 
+async function saveSettings(filePath, settings) {
+  if (!filePath) return false;
+  await fs.mkdir(path.dirname(filePath), { recursive: true });
+  await fs.writeFile(filePath, `${JSON.stringify(settings, null, 2)}\n`, "utf8");
+  return true;
+}
+
 function resolveProviderOptions(settings) {
-  const provider = settings.provider || null;
+  const modelRef = parseModelRef(settings.model || "");
+  const provider = normalizeProviderId(settings.provider || modelRef.provider || "") || null;
   const providerSettings = provider && settings.providers && typeof settings.providers === "object" ? settings.providers[provider] || {} : {};
-  const model = settings.model || providerSettings.model || null;
+  const model = modelRef.model || settings.model || providerSettings.model || null;
   const endpoint = providerSettings.endpoint || providerSettings.baseUrl || settings.endpoint || settings.baseUrl || null;
   const apiKey = providerSettings.apiKey || settings.apiKey || null;
-  return { provider, apiKey, model, baseUrl: endpoint, endpoint };
+  return { provider, apiKey, model, baseUrl: endpoint, endpoint, settings };
 }
 
 async function loadProjectInstructions(workspaceDir) {
@@ -129,12 +152,17 @@ async function loadProjectInstructions(workspaceDir) {
 
 function providerPrefix(kind) {
   const k = String(kind || "").toLowerCase();
+  if (!k) return "model";
+  // Registry kinds are "<provider>-openai-compatible"; take the provider part
+  // so a Moonshot or DeepSeek session is not mislabelled as "openai".
+  const registryMatch = k.match(/^(.*)-openai-compatible$/);
+  if (registryMatch && isKnownProvider(registryMatch[1])) return normalizeProviderId(registryMatch[1]);
   if (k.includes("openrouter")) return "openrouter";
   if (k.includes("seed")) return "seed";
+  if (k.includes("codex")) return "codex";
   if (k.includes("anthropic")) return "anthropic";
   if (k.includes("openai")) return "openai";
-  if (k.includes("codex")) return "codex";
-  return k || "model";
+  return k;
 }
 
 function providerToolMode(provider) {
@@ -153,6 +181,14 @@ function formatProviderModel(provider) {
   const prefix = providerPrefix(provider?.kind);
   const model = String(provider?.model || "").trim() || "unknown";
   return `${model}(${prefix}, tools:${providerToolMode(provider)}, ${providerTransport(provider)})`;
+}
+
+/** `provider:model` for the live provider, for picker highlighting. */
+function formatActiveModelRef(provider) {
+  const model = String(provider?.model || "").trim();
+  if (!model) return "";
+  const providerId = normalizeProviderId(provider?.providerId || providerPrefix(provider?.kind));
+  return providerId ? formatModelRef({ provider: providerId, model }) : model;
 }
 
 function normalizeBoolean(value) {
@@ -822,13 +858,81 @@ export class WebAgentSession {
     this.providerOptions = nextOptions;
     this.provider = nextProvider;
     if (this.agent) this.agent.provider = nextProvider;
-    this.contextWindowRef.value = resolveConfiguredContextWindow(this.settings, nextOptions);
+    this.contextWindowRef.value =
+      resolveConfiguredContextWindow(this.settings, nextOptions) ||
+      getCatalogContextWindow(formatActiveModelRef(nextProvider));
     this.publish("provider.update", {
       provider: nextProvider?.kind || "",
       model: nextProvider?.model || "",
       providerLabel: formatProviderModel(nextProvider),
     });
     return nextProvider;
+  }
+
+  /**
+   * Switch to `provider:model` (or a bare model id whose provider can be
+   * inferred), persist the choice, and rebuild the live provider.
+   */
+  async setModel(target) {
+    const parsed = parseModelRef(target);
+    const model = parsed.model;
+    if (!model) throw new Error("Model id is required");
+
+    const providerId =
+      normalizeProviderId(parsed.provider || inferProviderForModel(model) || this.settings.provider || "") || null;
+    if (providerId && isKnownProvider(providerId)) {
+      const config = resolveProviderConfig(providerId, { settings: this.settings });
+      if (!config.configured) {
+        throw new Error(
+          `${config.spec.label} is not configured — ${describeProviderSetup(providerId)}, then retry.`
+        );
+      }
+    }
+
+    this.settings.model = model;
+    if (providerId) {
+      this.settings.provider = providerId;
+      if (!this.settings.providers || typeof this.settings.providers !== "object") this.settings.providers = {};
+      this.settings.providers[providerId] = { ...(this.settings.providers[providerId] || {}), model };
+    }
+    const nextProvider = this.refreshProvider();
+    try {
+      await saveSettings(this.settingsFile, this.settings);
+    } catch {
+      // Persisting the preference is best effort; the live switch already took.
+    }
+    return nextProvider;
+  }
+
+  /** Provider readiness plus the models the user can actually pick right now. */
+  async listModels({ refresh = false } = {}) {
+    let discovered = [];
+    if (refresh) {
+      try {
+        discovered = (await discoverAllProviderModels({ settings: this.settings })).models;
+      } catch {
+        discovered = [];
+      }
+    }
+    const catalog = buildModelCatalog({ settings: this.settings, discovered });
+    const activeRef = formatActiveModelRef(this.provider);
+    return {
+      active: activeRef,
+      providers: describeProviderStatuses({ settings: this.settings }).map((row) => ({
+        ...row,
+        active: row.id === normalizeProviderId(this.provider?.providerId || ""),
+      })),
+      models: catalog.map((row) => ({
+        ref: row.ref,
+        id: row.id,
+        provider: row.provider,
+        providerLabel: getProviderSpec(row.provider)?.label || row.provider,
+        context: row.context || 0,
+        contextLabel: formatContextTokens(row.context),
+        tags: (row.tags || []).filter((tag) => tag !== "discovered" && tag !== "user"),
+        active: row.ref === activeRef,
+      })),
+    };
   }
 
   async processQueue() {
@@ -1726,6 +1830,23 @@ export async function main() {
         const loaded = await session.resumeSession(body.id || body.sessionId || body.query);
         session.addAssistantMessage(`Resumed session \`${shortSessionId(loaded.sessionId)}\`: ${loaded.summary || loaded.sessionId}`);
         jsonResponse(res, 200, { ok: true, session: loaded });
+        return;
+      }
+      if (req.method === "GET" && url.pathname === "/api/models") {
+        const refresh = url.searchParams.get("refresh") === "1";
+        jsonResponse(res, 200, await session.listModels({ refresh }));
+        return;
+      }
+      if (req.method === "POST" && url.pathname === "/api/model") {
+        const body = await readJsonBody(req);
+        const nextProvider = await session.setModel(body.model || body.ref || "");
+        session.addAssistantMessage(`Switched model to \`${formatActiveModelRef(nextProvider)}\`.`);
+        jsonResponse(res, 200, {
+          ok: true,
+          model: nextProvider?.model || "",
+          ref: formatActiveModelRef(nextProvider),
+          providerLabel: formatProviderModel(nextProvider),
+        });
         return;
       }
       if (req.method === "POST" && url.pathname === "/api/approve-mode") {

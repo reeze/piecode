@@ -4,6 +4,10 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>PieCode Dev Console</title>
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%2311130f'/%3E%3Ctext x='16' y='23' font-size='20' font-family='serif' fill='%23d78a39' text-anchor='middle'%3E%CF%80%3C/text%3E%3C/svg%3E"
+    />
     <link rel="stylesheet" href="/styles.css" />
   </head>
   <body>
@@ -28,7 +32,13 @@
             </div>
           </div>
           <div class="meta-grid">
-            <span>Model</span><b id="modelLabel">-</b>
+            <span>Model</span
+            ><b
+              ><button id="modelPickerBtn" class="model-chip" type="button" aria-haspopup="dialog" aria-expanded="false">
+                <span id="modelLabel">-</span>
+                <span class="model-chip-caret" aria-hidden="true">▾</span>
+              </button></b
+            >
             <span>Workspace</span><b id="workspaceLabel">-</b>
             <span>MCP</span><b id="mcpLabel">-</b>
             <span>Plugins</span><b id="pluginsLabel">-</b>
@@ -146,6 +156,33 @@
           </div>
         </div>
         <div id="diffBody" class="diff-body">Loading diff...</div>
+      </div>
+    </div>
+
+    <div id="modelOverlay" class="diff-overlay" hidden>
+      <div class="diff-dialog model-dialog" role="dialog" aria-modal="true" aria-labelledby="modelTitle" tabindex="-1">
+        <div class="diff-header">
+          <div>
+            <h3 id="modelTitle">Switch model</h3>
+            <p id="modelMeta">Providers configured on this machine.</p>
+          </div>
+          <div class="diff-actions">
+            <button id="refreshModelsBtn" class="secondary compact" type="button">Refresh</button>
+            <button id="closeModelBtn" class="ghost compact" type="button">Close</button>
+          </div>
+        </div>
+        <div class="model-search-row">
+          <input
+            id="modelSearch"
+            class="model-search"
+            type="search"
+            placeholder="Filter by provider or model…"
+            autocomplete="off"
+            aria-label="Filter models"
+          />
+        </div>
+        <div id="modelBody" class="model-body">Loading models…</div>
+        <div id="modelProviders" class="model-providers"></div>
       </div>
     </div>
 

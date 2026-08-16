@@ -278,6 +278,71 @@ describe("web server security helpers", () => {
   });
 });
 
+describe("web model switching", () => {
+  const makeSession = (settings = {}) => {
+    const calls = [];
+    const providerFactory = (options) => {
+      calls.push(options);
+      return {
+        kind: `${options.provider || "unknown"}-openai-compatible`,
+        providerId: options.provider || "",
+        model: options.model || "",
+        supportsNativeTools: true,
+      };
+    };
+    const session = new WebAgentSession({
+      workspaceDir: process.cwd(),
+      settings,
+      settingsFile: "",
+      providerFactory,
+    });
+    return { session, calls };
+  };
+
+  test("switching to a provider-qualified model rebuilds the provider and persists the choice", async () => {
+    const { session, calls } = makeSession({ providers: { deepseek: { apiKey: "k" } } });
+    const provider = await session.setModel("deepseek:deepseek-reasoner");
+
+    expect(provider.model).toBe("deepseek-reasoner");
+    expect(provider.providerId).toBe("deepseek");
+    expect(session.settings.model).toBe("deepseek-reasoner");
+    expect(session.settings.provider).toBe("deepseek");
+    expect(session.settings.providers.deepseek.model).toBe("deepseek-reasoner");
+    expect(calls[calls.length - 1].provider).toBe("deepseek");
+  });
+
+  test("a bare model id resolves to its owning provider", async () => {
+    const { session } = makeSession({ providers: { moonshot: { apiKey: "k" } } });
+    const provider = await session.setModel("kimi-k2-turbo-preview");
+    expect(provider.providerId).toBe("moonshot");
+  });
+
+  test("switching to an unconfigured provider fails with the setup step", async () => {
+    const { session } = makeSession({});
+    await expect(session.setModel("xai:grok-4")).rejects.toThrow(/set XAI_API_KEY/);
+  });
+
+  test("an empty model id is rejected", async () => {
+    const { session } = makeSession({});
+    await expect(session.setModel("   ")).rejects.toThrow(/Model id is required/);
+  });
+
+  test("listModels reports readiness, setup hints, and the active model", async () => {
+    const { session } = makeSession({ providers: { deepseek: { apiKey: "k" } } });
+    await session.setModel("deepseek:deepseek-chat");
+    const result = await session.listModels();
+
+    expect(result.active).toBe("deepseek:deepseek-chat");
+    expect(result.models.some((row) => row.ref === "deepseek:deepseek-chat" && row.active)).toBe(true);
+    expect(result.models.every((row) => row.provider === "deepseek")).toBe(true);
+    expect(result.models[0].contextLabel).toBe("128k");
+
+    const openai = result.providers.find((row) => row.id === "openai");
+    expect(openai.configured).toBe(false);
+    expect(openai.setupHint).toBe("set OPENAI_API_KEY");
+  });
+});
+
 describe("web core helpers", () => {
   test("summarizes edit_file results with expandable diffs", () => {
     const result = parseToolResultDetails("edit_file", JSON.stringify({

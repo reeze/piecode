@@ -60,6 +60,14 @@ const el = {
   diffMeta: document.getElementById("diffMeta"),
   refreshDiffBtn: document.getElementById("refreshDiffBtn"),
   closeDiffBtn: document.getElementById("closeDiffBtn"),
+  modelPickerBtn: document.getElementById("modelPickerBtn"),
+  modelOverlay: document.getElementById("modelOverlay"),
+  modelBody: document.getElementById("modelBody"),
+  modelMeta: document.getElementById("modelMeta"),
+  modelSearch: document.getElementById("modelSearch"),
+  modelProviders: document.getElementById("modelProviders"),
+  refreshModelsBtn: document.getElementById("refreshModelsBtn"),
+  closeModelBtn: document.getElementById("closeModelBtn"),
   mobileMenuBtn: document.getElementById("mobileMenuBtn"),
   mobileMoreBtn: document.getElementById("mobileMoreBtn"),
   mobileNewBtn: document.getElementById("mobileNewBtn"),
@@ -761,6 +769,109 @@ async function openDiffOverlay() {
   }
 }
 
+let modelPreviousFocus = null;
+let modelCatalogCache = null;
+
+function closeModelOverlay() {
+  if (el.modelOverlay.hidden) return;
+  el.modelOverlay.hidden = true;
+  el.modelPickerBtn?.setAttribute("aria-expanded", "false");
+  setAppInert(false);
+  modelPreviousFocus?.focus?.();
+  modelPreviousFocus = null;
+}
+
+function renderModelCatalog(filter = "") {
+  const data = modelCatalogCache;
+  if (!data) return;
+  const needle = String(filter || "").trim().toLowerCase();
+  const models = data.models.filter(
+    (row) => !needle || row.ref.toLowerCase().includes(needle) || row.providerLabel.toLowerCase().includes(needle)
+  );
+
+  if (models.length === 0) {
+    el.modelBody.innerHTML = needle
+      ? `<div class="diff-empty">No model matches “${escapeHtml(filter)}”.</div>`
+      : `<div class="diff-empty">No provider is configured yet. Set an API key, or run <code>codex login</code>, then refresh.</div>`;
+  } else {
+    // Group by provider so a long aggregator list stays scannable.
+    const groups = new Map();
+    for (const row of models) {
+      if (!groups.has(row.provider)) groups.set(row.provider, []);
+      groups.get(row.provider).push(row);
+    }
+    el.modelBody.innerHTML = [...groups.entries()]
+      .map(([provider, rows]) => {
+        const items = rows
+          .map(
+            (row) => `
+            <button class="model-option${row.active ? " active" : ""}" type="button" data-model="${escapeHtml(row.ref)}">
+              <span class="model-option-id">${escapeHtml(row.id)}</span>
+              <span class="model-option-meta">${[row.contextLabel ? `${escapeHtml(row.contextLabel)} ctx` : "", ...row.tags.map(escapeHtml)]
+                .filter(Boolean)
+                .join(" · ")}</span>
+            </button>`
+          )
+          .join("");
+        return `<div class="model-group"><div class="model-group-title">${escapeHtml(
+          rows[0].providerLabel
+        )} <code>${escapeHtml(provider)}</code></div>${items}</div>`;
+      })
+      .join("");
+  }
+
+  const ready = data.providers.filter((row) => row.configured);
+  el.modelMeta.textContent = `${models.length} model${models.length === 1 ? "" : "s"} · ${ready.length}/${
+    data.providers.length
+  } providers ready`;
+  el.modelProviders.innerHTML = data.providers
+    .filter((row) => !row.configured)
+    .map(
+      (row) =>
+        `<div class="model-provider-hint"><b>${escapeHtml(row.label)}</b> ${escapeHtml(row.setupHint)}</div>`
+    )
+    .join("");
+}
+
+async function openModelOverlay({ refresh = false } = {}) {
+  if (el.modelOverlay.hidden) modelPreviousFocus = document.activeElement;
+  el.modelOverlay.hidden = false;
+  el.modelPickerBtn?.setAttribute("aria-expanded", "true");
+  setAppInert(true);
+  el.modelSearch?.focus();
+  if (!modelCatalogCache || refresh) {
+    el.modelBody.innerHTML = `<div class="diff-loading">Loading models…</div>`;
+    el.modelMeta.textContent = refresh ? "Querying providers…" : "Loading providers…";
+    try {
+      const res = await fetch(apiUrl(`/api/models${refresh ? "?refresh=1" : ""}`), {
+        headers: authToken ? { "x-piecode-token": authToken } : {},
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
+      modelCatalogCache = data;
+    } catch (err) {
+      el.modelMeta.textContent = "Model list unavailable.";
+      el.modelBody.innerHTML = `<div class="diff-empty error">${escapeHtml(err.message)}</div>`;
+      return;
+    }
+  }
+  renderModelCatalog(el.modelSearch?.value || "");
+}
+
+async function selectModel(ref) {
+  const target = String(ref || "").trim();
+  if (!target) return;
+  el.modelMeta.textContent = `Switching to ${target}…`;
+  try {
+    const result = await postJson("/api/model", { model: target });
+    if (el.modelLabel) el.modelLabel.textContent = result.providerLabel || result.ref || target;
+    modelCatalogCache = null;
+    closeModelOverlay();
+  } catch (err) {
+    el.modelMeta.textContent = err.message;
+  }
+}
+
 function applySnapshot(snapshot) {
   state.sessionId = snapshot.shortSessionId || snapshot.sessionId || state.sessionId;
   if (Array.isArray(snapshot.recentSessions)) state.recentSessions = snapshot.recentSessions;
@@ -1204,9 +1315,32 @@ el.diffOverlay.addEventListener("click", (evt) => {
   if (evt.target === el.diffOverlay) closeDiffOverlay();
 });
 
-function trapDiffDialogFocus(evt) {
-  if (evt.key !== "Tab" || el.diffOverlay.hidden) return;
-  const focusable = [...el.diffOverlay.querySelectorAll("button, [href], textarea, input, select, [tabindex]:not([tabindex='-1'])")]
+el.modelPickerBtn?.addEventListener("click", () => {
+  if (el.modelOverlay.hidden) openModelOverlay();
+  else closeModelOverlay();
+});
+
+el.refreshModelsBtn?.addEventListener("click", () => {
+  openModelOverlay({ refresh: true });
+});
+
+el.closeModelBtn?.addEventListener("click", () => {
+  closeModelOverlay();
+});
+
+el.modelOverlay?.addEventListener("click", (evt) => {
+  if (evt.target === el.modelOverlay) closeModelOverlay();
+  const option = evt.target.closest?.("[data-model]");
+  if (option) selectModel(option.getAttribute("data-model"));
+});
+
+el.modelSearch?.addEventListener("input", () => {
+  renderModelCatalog(el.modelSearch.value);
+});
+
+function trapDialogFocus(evt, overlay) {
+  if (evt.key !== "Tab" || overlay.hidden) return;
+  const focusable = [...overlay.querySelectorAll("button, [href], textarea, input, select, [tabindex]:not([tabindex='-1'])")]
     .filter((node) => !node.disabled && !node.hidden);
   if (!focusable.length) return;
   const first = focusable[0];
@@ -1221,8 +1355,10 @@ function trapDiffDialogFocus(evt) {
 }
 
 document.addEventListener("keydown", (evt) => {
-  trapDiffDialogFocus(evt);
+  trapDialogFocus(evt, el.diffOverlay);
+  if (el.modelOverlay) trapDialogFocus(evt, el.modelOverlay);
   if (evt.key === "Escape" && !el.diffOverlay.hidden) closeDiffOverlay();
+  if (evt.key === "Escape" && el.modelOverlay && !el.modelOverlay.hidden) closeModelOverlay();
   if (evt.key === "Escape") closeMobileActionSheet();
   if (evt.key === "Escape") document.body.classList.remove("sidebar-open");
 });

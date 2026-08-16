@@ -2394,11 +2394,16 @@ function printSkillCommandList(skillIndex, logLine) {
 
 function providerPrefix(kind) {
   const k = String(kind || "").toLowerCase();
+  if (!k) return "model";
+  // Registry kinds are "<provider>-openai-compatible"; take the provider part
+  // so a Moonshot or DeepSeek session is not mislabelled as "openai".
+  const registryMatch = k.match(/^(.*)-openai-compatible$/);
+  if (registryMatch && isKnownProvider(registryMatch[1])) return normalizeProviderId(registryMatch[1]);
   if (k.includes("openrouter")) return "openrouter";
+  if (k.includes("codex")) return "codex";
   if (k.includes("anthropic")) return "anthropic";
   if (k.includes("openai")) return "openai";
-  if (k.includes("codex")) return "codex";
-  return k || "model";
+  return k;
 }
 
 function providerTransport(provider) {
