@@ -136,7 +136,11 @@ function resolveProviderOptions(settings) {
   const model = modelRef.model || settings.model || providerSettings.model || null;
   const endpoint = providerSettings.endpoint || providerSettings.baseUrl || settings.endpoint || settings.baseUrl || null;
   const apiKey = providerSettings.apiKey || settings.apiKey || null;
-  return { provider, apiKey, model, baseUrl: endpoint, endpoint, settings };
+  const options = { provider, apiKey, model, baseUrl: endpoint, endpoint };
+  // Non-enumerable so settings (and their API keys) cannot be serialized into
+  // published events or session snapshots by accident.
+  Object.defineProperty(options, "settings", { value: settings, enumerable: false, writable: true });
+  return options;
 }
 
 async function loadProjectInstructions(workspaceDir) {

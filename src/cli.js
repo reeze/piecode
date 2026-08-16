@@ -261,16 +261,29 @@ function resolveProviderOptions(args, settings) {
     process.env.PIECODE_REASONING_EFFORT ||
     null;
 
-  return {
+  const options = {
     provider,
     apiKey,
     model,
     baseUrl: endpoint,
     endpoint,
     thinkingEffort,
-    // The provider registry resolves credentials/endpoints from settings too.
-    settings,
   };
+  return withProviderOptions(options, {}, settings);
+}
+
+/**
+ * Merge a patch into provider options, keeping the settings handle attached.
+ *
+ * `settings` is non-enumerable so it (and the API keys inside it) can never be
+ * swept into a log line, a session trace, or a debug payload — but that also
+ * means a plain spread drops it, so every update goes through here.
+ */
+function withProviderOptions(base, patch = {}, settings = undefined) {
+  const merged = { ...base, ...patch };
+  const carried = settings === undefined ? base?.settings : settings;
+  Object.defineProperty(merged, "settings", { value: carried, enumerable: false, writable: true });
+  return merged;
 }
 
 function getHistoryFilePath() {
@@ -3341,10 +3354,9 @@ async function handleSlashCommand(input, ctx) {
     }
 
     const previous = getCurrentThinkingEffort() || "default";
-    providerOptionsRef.value = {
-      ...providerOptionsRef.value,
+    providerOptionsRef.value = withProviderOptions(providerOptionsRef.value, {
       thinkingEffort: parsedEffort.value || null,
-    };
+    });
     if (parsedEffort.value) {
       settings.thinkingEffort = parsedEffort.value;
     } else {
@@ -5664,11 +5676,9 @@ async function main() {
       ? resolveProviderConfig(nextProviderName, { settings })
       : null;
 
-    providerOptionsRef.value = {
-      ...providerOptionsRef.value,
+    const nextOptions = withProviderOptions(providerOptionsRef.value, {
       provider: nextProviderName,
       model: selectedModel,
-      settings,
       thinkingEffort:
         providerOptionsRef.value.thinkingEffort ??
         (providerSettings.thinkingEffort ||
@@ -5680,7 +5690,8 @@ async function main() {
           settings.reasoningEffort ||
           settings.reasoning_effort ||
           null),
-    };
+    }, settings);
+    providerOptionsRef.value = nextOptions;
     if (inferredProvider) {
       // Switching providers must not carry the previous provider's credentials.
       providerOptionsRef.value.apiKey = resolved?.apiKey || null;
