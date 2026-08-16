@@ -708,7 +708,7 @@ Options:
   --prompt, -p         One-shot prompt to run
   --resume, -r         Resume a saved session by full or short id
   --help, -h           Show this help
-  --provider, -P       Model provider: anthropic, openai, openrouter, codex
+  --provider, -P       Model provider id (see --list-providers for all 20)
   --api-key, -K        API key for the provider
   --model, -M          Model name to use
   --base-url, -B       Base URL for OpenAI-compatible endpoints (default: https://api.openai.com/v1)
@@ -720,6 +720,9 @@ Options:
   --plugin-install-project Install plugin into .piecode/plugins instead of ~/.piecode/plugins
   --list-skills        List discovered skills and exit
   --list-plugins       List discovered plugins and exit
+  --list-providers     List every provider with its readiness and setup step
+  --list-models        List selectable models grouped by provider
+  --doctor             Check providers, model and extensions; exit 1 if unhealthy
   --tui                Start simple full-screen TUI mode (default for interactive use)
   --web                Start browser-based Web UI
   --tmux-subagents     Open a tmux window for each subagent event stream
@@ -796,8 +799,14 @@ Slash commands in interactive mode:
   /debug llm           Dump latest LLM request/response payloads
   /debug last          Show the last task summary with error and trace file paths
   /debug save          Force-save the current session trace/log files
-  /model               Show active provider/model
-                       Tip: use /model codex:gpt-5.3-codex to force Codex provider
+  /model               Show active provider/model and open the model picker
+                       Accepts provider:model, e.g. /model deepseek:deepseek-chat
+  /models              List selectable models grouped by provider
+  /provider            Show every provider with readiness and setup steps
+  /provider <id>       Switch to that provider's default model
+  /doctor              Diagnose providers, model, MCP and extensions
+  /ledger              Show durable task state (objective, todos, evidence)
+  /ledger clear        Reset durable task state
   /think <none|minimal|low|medium|high|xhigh|off>
                        Show or set model thinking/reasoning effort and save it to settings
   /mcp                 Show MCP status and usage

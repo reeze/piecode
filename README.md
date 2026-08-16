@@ -9,7 +9,8 @@ A Claude Code-like command line coding agent.
 - MCP support via `mcpServers` settings and shared agent MCP configs (list/call tools, list/read resources)
 - Workspace path sandboxing for file operations
 - Shell command approval mode (`/approve on|off`)
-- Works with Anthropic (preferred) or OpenAI-compatible APIs
+- 20 built-in model providers with live model discovery, one-command switching, and a `/doctor` health check
+- Durable task ledger that survives context compaction, so long-running work keeps its plan and evidence
 
 ## Setup
 
@@ -17,31 +18,34 @@ Requirements:
 
 - Node.js 22+
 
-Configure one provider:
+Configure at least one provider. Setting a single API key is enough — piecode
+picks up any provider it recognises:
 
 ```bash
-# Preferred: Anthropic
-export ANTHROPIC_API_KEY="..."
-export ANTHROPIC_MODEL="claude-3-5-sonnet-latest"   # optional
+export ANTHROPIC_API_KEY="..."     # Anthropic
+export OPENAI_API_KEY="..."        # OpenAI
+export DEEPSEEK_API_KEY="..."      # DeepSeek
+export MOONSHOT_API_KEY="..."      # Moonshot / Kimi
+export ZHIPU_API_KEY="..."         # Z.ai / GLM
+export DASHSCOPE_API_KEY="..."     # Qwen
+export OPENROUTER_API_KEY="..."    # OpenRouter (any aggregated model)
+codex login                        # Codex, via ~/.codex login state
 
-# Or OpenAI-compatible
-export OPENAI_API_KEY="..."
-export OPENAI_BASE_URL="https://api.openai.com/v1"  # optional
-export OPENAI_MODEL="gpt-4.1-mini"                  # optional
-
-# Or Seed / Volcengine (OpenAI-compatible endpoint)
-export SEED_API_KEY="..."
-export SEED_BASE_URL="https://ark.cn-beijing.volces.com/api/coding"  # optional
-export SEED_MODEL="doubao-seed-code-preview-latest"                  # optional
-
-# Or rely on Codex login state
-# (reads ~/.codex/auth.json automatically)
-codex login
-export CODEX_MODEL="gpt-5-codex"                    # optional
-
-# Optional thinking/reasoning effort for supported models/providers
-export PIECODE_THINKING_EFFORT="high"                # none/minimal/low/medium/high/xhigh (provider-dependent)
+# Optional thinking/reasoning effort, where the provider supports one
+export PIECODE_THINKING_EFFORT="high"   # none/minimal/low/medium/high/xhigh
 ```
+
+Not sure what is configured? Ask:
+
+```bash
+piecode --doctor            # providers, active model, extensions, next steps
+piecode --list-providers    # every provider, whether it is ready, how to set it up
+piecode --list-models       # selectable models grouped by provider
+```
+
+See [docs/providers.md](docs/providers.md) for the full provider list, the model
+reference syntax, local runtimes (Ollama, LM Studio, vLLM, local Codex), and how
+to add a model the registry does not know about yet.
 
 Or use persistent settings in `~/.piecode/settings.json`:
 
@@ -182,7 +186,14 @@ DOCKER_HOST=unix:///Users/$USER/.orbstack/run/docker.sock ./scripts/run-terminal
 - `/task read <id>` show recent task output
 - `/task stop <id>` stop a running background task
 - `/approve on|off` toggle shell auto approval
-- `/model` show active provider/model
+- `/model` show the active model and open the model picker
+- `/model <provider>:<model>` switch model, e.g. `/model deepseek:deepseek-reasoner`
+- `/models` list selectable models grouped by provider
+- `/provider` show every provider with readiness and setup steps
+- `/provider <id>` switch to that provider's default model
+- `/doctor` diagnose providers, active model, MCP and extensions
+- `/ledger` show durable task state (objective, todos, evidence, next step)
+- `/ledger clear` reset durable task state
 - `/mcp` show MCP status/usage
 - `/mcp list` list active MCP servers
 - `/mcp show <name>` show server config
@@ -209,6 +220,11 @@ You can also mention `$skill-name` in a prompt to auto-enable that skill for the
 - MCP can be configured in `~/.piecode/settings.json` with `mcpServers` (or `mcp.servers`).
 - PieCode also imports MCP servers from common agent config paths (for example Cursor/Claude-style JSON configs).
 - Local `~/.piecode/settings.json` MCP entries override imported server entries with the same name.
+
+## Documentation
+
+- [docs/providers.md](docs/providers.md) — every provider, model reference syntax, local runtimes (Ollama, LM Studio, vLLM, local Codex), model discovery, reasoning effort.
+- [docs/long-horizon.md](docs/long-horizon.md) — the durable task ledger, how it survives context compaction, and how it relates to memory, compaction and goal mode.
 - Set `PIECODE_MCP_IMPORT=0` to disable shared MCP import.
 - Set `PIECODE_MCP_CONFIG_PATHS` for extra JSON config files (comma-separated).
 - Stdio protocol is auto-detected per server (tries `content-length` then `line`); you can force with `stdioProtocol: "content-length"` or `stdioProtocol: "line"`.
