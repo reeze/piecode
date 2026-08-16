@@ -21,7 +21,7 @@ import {
   parseModelRef,
   resolveProviderConfig,
 } from "../lib/modelCatalog.js";
-import { formatContextTokens } from "../lib/providerStatus.js";
+import { formatContextTokens, formatOnboardingLines } from "../lib/providerStatus.js";
 import {
   addSkillByName,
   autoEnableSkills,
@@ -1902,6 +1902,13 @@ export async function main() {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   main().catch((err) => {
+    // A brand-new machine should get a setup path, not a bare failure.
+    if (/No model provider configured/i.test(String(err?.message || ""))) {
+      for (const line of formatOnboardingLines({ settingsFile: getSettingsFilePath() })) {
+        console.error(line);
+      }
+      process.exit(1);
+    }
     console.error(`fatal: ${err.message}`);
     process.exit(1);
   });

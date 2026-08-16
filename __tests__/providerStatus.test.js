@@ -1,5 +1,6 @@
 import {
   buildDoctorReport,
+  formatOnboardingLines,
   describeModelRef,
   formatContextTokens,
   formatModelCatalogLines,
@@ -115,5 +116,28 @@ describe("doctor report", () => {
     });
     expect(report.lines.join("\n")).toContain("mcp servers — spawn failed");
     expect(report.problems).toContain("Check mcpServers in settings.json");
+  });
+});
+
+describe("first-run onboarding", () => {
+  test("offers concrete key exports and login alternatives when nothing is set", () => {
+    const text = formatOnboardingLines({ settings: {}, env: NO_PROVIDERS, settingsFile: "/home/u/.piecode/settings.json" }).join("\n");
+
+    expect(text).toContain("no model provider configured");
+    expect(text).toContain('export ANTHROPIC_API_KEY="..."');
+    expect(text).toContain('export DEEPSEEK_API_KEY="..."');
+    expect(text).toContain("codex login");
+    expect(text).toContain("OLLAMA_BASE_URL");
+    expect(text).toContain("/home/u/.piecode/settings.json");
+    expect(text).toContain("piecode --doctor");
+  });
+
+  test("points at the ready provider when one exists", () => {
+    const text = formatOnboardingLines({ settings: {}, env: { ...NO_PROVIDERS, GROQ_API_KEY: "k" } }).join("\n");
+
+    expect(text).toContain("Ready providers:");
+    expect(text).toContain("groq");
+    expect(text).toContain("piecode --provider <id>");
+    expect(text).not.toContain('export ANTHROPIC_API_KEY="..."');
   });
 });

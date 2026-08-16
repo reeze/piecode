@@ -146,6 +146,45 @@ export function describeModelRef(ref, { catalog = null } = {}) {
 }
 
 /**
+ * First-run screen for a machine with nothing configured. Shows a short path to
+ * a working setup rather than a stack trace.
+ */
+export function formatOnboardingLines({ settings = {}, env = process.env, settingsFile = '' } = {}) {
+  const statuses = describeProviderStatuses({ settings, env });
+  const ready = statuses.filter((row) => row.configured);
+
+  const lines = ['piecode has no model provider configured yet.', ''];
+
+  if (ready.length > 0) {
+    // Reachable when a provider is ready but the requested model is not usable.
+    lines.push('Ready providers:');
+    for (const row of ready) lines.push(`  ${CHECK} ${row.id} — ${row.source || 'available'}`);
+    lines.push('');
+    lines.push('Pick one with: piecode --provider <id>');
+    return lines;
+  }
+
+  lines.push('Pick one of these and set its key, then run piecode again:');
+  lines.push('');
+  const highlights = ['anthropic', 'openai', 'deepseek', 'moonshot', 'zhipu', 'openrouter'];
+  for (const id of highlights) {
+    const spec = getProviderSpec(id);
+    if (!spec) continue;
+    const envName = spec.apiKeyEnv?.[0] || '';
+    lines.push(`  export ${padEnd(`${envName}="..."`, 26)} # ${spec.label}`);
+  }
+  lines.push('');
+  lines.push('Or use a login / local runtime instead of a key:');
+  lines.push('  codex login                                  # Codex, via ~/.codex');
+  lines.push('  export OLLAMA_BASE_URL="http://127.0.0.1:11434/v1"   # Ollama');
+  lines.push('');
+  lines.push(`Settings file: ${settingsFile || '~/.piecode/settings.json'}`);
+  lines.push('Full list:     piecode --list-providers');
+  lines.push('Diagnose:      piecode --doctor');
+  return lines;
+}
+
+/**
  * Environment health check: which providers are ready, what is missing, and the
  * exact next action for each problem.
  */

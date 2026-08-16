@@ -64,6 +64,7 @@ import {
   buildDoctorReport,
   describeModelRef,
   formatModelCatalogLines,
+  formatOnboardingLines,
   formatProviderTable,
 } from "./lib/providerStatus.js";
 import { McpHub, mergeCommonMcpServers, resolveMcpServerConfigs } from "./lib/mcp.js";
@@ -4651,7 +4652,21 @@ async function main() {
     process.exitCode = report.problems.length > 0 ? 1 : 0;
     return;
   }
-  const providerRef = { value: getProvider(providerOptionsRef.value) };
+  let initialProvider = null;
+  try {
+    initialProvider = getProvider(providerOptionsRef.value);
+  } catch (err) {
+    // A brand-new machine should get a setup path, not a stack trace.
+    if (/No model provider configured/i.test(String(err?.message || ""))) {
+      for (const line of formatOnboardingLines({ settings, env: process.env, settingsFile })) {
+        console.error(line);
+      }
+      process.exitCode = 1;
+      return;
+    }
+    throw err;
+  }
+  const providerRef = { value: initialProvider };
   const contextWindowRef = { value: 0 };
   const [projectInstructionsLoaded, loadedMemory, loadedAgentDefinitions] = await Promise.all([
     startupLoads.projectInstructions,
