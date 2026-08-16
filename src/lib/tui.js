@@ -656,6 +656,9 @@ function normalizeTimelineSpacing(lines) {
     const stripped = stripAnsi(String(line || ""));
     const plain = stripped.trimStart();
     if (!plain) return "blank";
+    // Task rows are the only full-width highlighted rows, so match on that
+    // instead of the prompt glyph, which collides with the tool marker.
+    if (raw.includes("\x1b[1;37;48;5;236m")) return "task";
     if (/^(?:◆|\*|❯)\s+(?:Task:\s*)?/i.test(plain)) return "task";
     if (/^(?:↳|->)\s+/.test(plain)) return "tool-result";
     if (/^(?:›|>)\s+/.test(plain)) return "tool";
@@ -1091,7 +1094,12 @@ export class SimpleTui {
     this.thinkingTick = 0;
     this.thinkingTimer = null;
     this.progressRefreshTimer = null;
-    this.animateThinking = String(process.env.PIECODE_TUI_ANIMATION || "").trim() !== "0";
+    // Spinner animation repaints the whole frame on a short interval, which
+    // reads as flicker on most terminals. Off by default; the slower progress
+    // refresh still keeps elapsed time and status current.
+    this.animateThinking = ["1", "true", "yes", "on"].includes(
+      String(process.env.PIECODE_TUI_ANIMATION || "").trim().toLowerCase()
+    );
     this.thinkingAnimationMs = Math.max(80, Number(process.env.PIECODE_TUI_ANIMATION_MS) || 120);
     this.progressRefreshMs = Math.max(1000, Number(process.env.PIECODE_TUI_PROGRESS_REFRESH_MS) || 5000);
     this.modelSuggestionsVisible = false;
@@ -2519,7 +2527,8 @@ export class SimpleTui {
         const prefix = index === 0 ? `${this.symbols.prompt} ` : "  ";
         return colorFullLine(` ${prefix}${taskLine} `, "1;37;48;5;236", width);
       });
-      return ["", ...renderedTaskLines, ""];
+      // Blank-line padding is applied by withTimelineSpacing/normalizeTimelineSpacing.
+      return renderedTaskLines;
     }
     if (line.startsWith("[model] ")) {
       return [];

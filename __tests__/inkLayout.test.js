@@ -393,17 +393,20 @@ describe("InkTuiLayout", () => {
     tui.setLiveThought("Working...");
     tui.renderInput("", 0);
 
+    // The running indicator is the "Working · <elapsed>" row; it deliberately
+    // omits the internal thinking stage (see tui.test.js).
     const cursor = await waitForCursor(output, (candidate) =>
-      candidate.lines.some((line) => line.includes("thinking:turn")) &&
-      candidate.lines.some((line) => line.includes("继续描述你想改什么"))
+      candidate.lines.some((line) => line.includes("Working ·")) &&
+      candidate.lines.some((line) => line.includes("\u7ee7\u7eed\u63cf\u8ff0\u4f60\u60f3\u6539\u4ec0\u4e48"))
     );
-    const inputLineIndex = cursor.lines.findIndex((line) => line.includes("继续描述你想改什么"));
-    const thinkingLineIndex = cursor.lines.findIndex((line) => line.includes("thinking:turn"));
+    const inputLineIndex = cursor.lines.findIndex((line) => line.includes("\u7ee7\u7eed\u63cf\u8ff0\u4f60\u60f3\u6539\u4ec0\u4e48"));
+    const runningLineIndex = cursor.lines.findIndex((line) => line.includes("Working ·"));
     expect(cursor.y).toBe(inputLineIndex);
-    expect(thinkingLineIndex).toBeGreaterThanOrEqual(0);
-    expect(thinkingLineIndex).toBeLessThan(inputLineIndex);
-    expect(cursor.lines[thinkingLineIndex - 1]?.trim() || "").toBe("");
-    expect(cursor.lines[thinkingLineIndex + 1] || "").toMatch(/[-─]{8,}/);
+    expect(runningLineIndex).toBeGreaterThanOrEqual(0);
+    expect(runningLineIndex).toBeLessThan(inputLineIndex);
+    expect(cursor.lines[runningLineIndex]).not.toContain("thinking:");
+    expect(cursor.lines[runningLineIndex - 1]?.trim() || "").toBe("");
+    expect(cursor.lines[runningLineIndex + 1] || "").toMatch(/[-─]{8,}/);
     expect(cursor.lines[cursor.y - 1] || "").toMatch(/[-─]{8,}/);
     expect(cursor.lines[cursor.y + 1] || "").toMatch(/[-─]{8,}/);
     expect(cursor.lines[cursor.y] || "").toMatch(/\s(?:>|❯)\s/);

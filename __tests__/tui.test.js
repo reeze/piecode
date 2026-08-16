@@ -422,7 +422,7 @@ describe("tui usability", () => {
     expect(stripAnsi(tui.formatTimelineLines("[tool] rg (targetSymbol in *.js)")[0])).toContain("targetSymbol");
     expect(stripAnsi(tui.formatTimelineLines("[tool] read_file (path=README.md)")[0])).toContain("Read README.md");
     const readBatch = tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)").map(stripAnsi);
-    expect(readBatch).toEqual(["› Read x2", "    a.txt", "    b.txt"]);
+    expect(readBatch).toEqual([`${tui.symbols.tool} Read x2`, "    a.txt", "    b.txt"]);
     expect(tui.formatTimelineLines("[tools] read_file x2 - read_file(a.txt); read_file(b.txt)")[0]).toContain(
       "\x1b[36mRead x2\x1b[0m"
     );

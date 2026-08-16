@@ -1,10 +1,39 @@
 import os from "node:os";
 import path from "node:path";
-import { promises as fs } from "node:fs";
+import { promises as fs, readFileSync } from "node:fs";
 import { classifyShellCommand, createToolset } from "../src/lib/tools.js";
 
 function shellQuote(value) {
   return `'${String(value).replace(/'/g, "'\\''")}'`;
+}
+
+/**
+ * `kill(pid, 0)` still succeeds for a zombie, and an orphaned child is only
+ * reaped once PID 1 collects it — which never happens in containers whose PID 1
+ * is not an init. Treat a zombie as terminated.
+ */
+async function waitForProcessExit(pid, attempts = 40) {
+  const isRunning = () => {
+    if (process.platform === "linux") {
+      try {
+        const fields = readFileSync(`/proc/${pid}/stat`, "utf8").split(") ")[1].split(" ");
+        return fields[0] !== "Z";
+      } catch {
+        return false;
+      }
+    }
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+  for (let i = 0; i < attempts; i += 1) {
+    if (!isRunning()) return false;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return isRunning();
 }
 
 async function waitForTaskStatus(tools, id, status, attempts = 20) {
@@ -267,8 +296,7 @@ describe("tools usability", () => {
     expect(stopped).toContain(`task: ${id}`);
     expect(stopped).toContain("status: stopped");
 
-    await new Promise((resolve) => setTimeout(resolve, 50));
-    expect(() => process.kill(childPid, 0)).toThrow();
+    expect(await waitForProcessExit(childPid)).toBe(false);
   });
 
   test("subagent delegates to configured runner with normalized input", async () => {
