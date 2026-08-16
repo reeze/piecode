@@ -5,6 +5,17 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { promisify } from 'node:util';
 import { execFile as execFileCb } from 'node:child_process';
+import {
+  TRANSPORTS,
+  getModelReasoningSupport,
+  getProviderSpec,
+  inferProviderForModel,
+  isKnownProvider,
+  listProviderSpecs,
+  normalizeProviderId,
+  parseModelRef,
+  resolveProviderConfig,
+} from './modelCatalog.js';
 
 const DEFAULT_ANTHROPIC_MODEL =
   process.env.ANTHROPIC_MODEL || 'claude-3-5-sonnet-latest';
@@ -311,6 +322,7 @@ function normalizeReasoningEffortList(values) {
 
 export function getReasoningEffortCapabilities({
   provider = '',
+  providerId = '',
   kind = '',
   model = '',
   reasoningEfforts = null,
@@ -322,6 +334,20 @@ export function getReasoningEffortCapabilities({
       supported: configured.length > 0,
       values: configured,
       source: 'settings',
+    };
+  }
+
+  // A registry-known provider knows exactly which efforts its API accepts.
+  // This keeps piecode from sending `reasoning_effort` to providers that reject
+  // unknown request fields (DeepSeek, Moonshot, GLM, ...).
+  const registryId = normalizeProviderId(providerId);
+  if (registryId && isKnownProvider(registryId)) {
+    const support = getModelReasoningSupport({ provider: registryId, model });
+    return {
+      supported: support.supported,
+      values: support.values,
+      source: 'registry',
+      ...(support.supported ? {} : { reason: `${registryId}-effort-unsupported` }),
     };
   }
 
@@ -856,6 +882,118 @@ function parseCodexConfigModel(configToml) {
   return match?.[1] || null;
 }
 
+function parseCodexTopLevelString(configToml, key) {
+  // Only scan the implicit root table, i.e. everything before the first [table].
+  const root = String(configToml || '').split(/^\s*\[/m)[0];
+  const match = root.match(new RegExp(`^\\s*${key}\\s*=\\s*"([^"]+)"`, 'm'));
+  return match?.[1] || '';
+}
+
+/**
+ * Parse the `[model_providers.<id>]` tables out of ~/.codex/config.toml so
+ * piecode can reuse whatever endpoints Codex is already configured against —
+ * including local ones (`codex --oss`, vLLM, LM Studio, a private gateway).
+ */
+function parseCodexModelProviders(configToml) {
+  const providers = {};
+  let current = null;
+  for (const rawLine of String(configToml || '').split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith('#')) continue;
+
+    const table = line.match(/^\[([^\]]+)\]$/);
+    if (table) {
+      const parts = table[1].split('.');
+      if (parts.length === 2 && parts[0].trim() === 'model_providers') {
+        const id = parts[1].replace(/^["']|["']$/g, '').trim();
+        current = id ? (providers[id] = { id, name: id, baseUrl: '', envKey: '', wireApi: 'chat' }) : null;
+      } else {
+        current = null;
+      }
+      continue;
+    }
+
+    if (!current) continue;
+    const pair = line.match(/^([A-Za-z_][\w-]*)\s*=\s*"([^"]*)"/);
+    if (!pair) continue;
+    const [, key, value] = pair;
+    if (key === 'name') current.name = value;
+    else if (key === 'base_url') current.baseUrl = value;
+    else if (key === 'env_key') current.envKey = value;
+    else if (key === 'wire_api') current.wireApi = value.toLowerCase();
+  }
+  return providers;
+}
+
+/**
+ * Everything piecode needs to know about the local Codex installation.
+ */
+export function loadCodexLocalConfig({ codexHome = getCodexHome(), env = process.env } = {}) {
+  const configToml = readTextFile(path.join(codexHome, 'config.toml'));
+  const providers = parseCodexModelProviders(configToml);
+  const activeProviderId =
+    env.CODEX_MODEL_PROVIDER || parseCodexTopLevelString(configToml, 'model_provider') || '';
+  const activeProvider = activeProviderId ? providers[activeProviderId] || null : null;
+  return {
+    codexHome,
+    model: parseCodexConfigModel(configToml) || '',
+    activeProviderId,
+    activeProvider,
+    providers,
+    hasLocalProvider: Boolean(activeProvider?.baseUrl && isLocalBaseUrl(activeProvider.baseUrl)),
+  };
+}
+
+function isLocalBaseUrl(baseUrl) {
+  const value = String(baseUrl || '').trim().toLowerCase();
+  if (!value) return false;
+  return /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\]|0\.0\.0\.0|host\.docker\.internal)([:/]|$)/.test(value);
+}
+
+/**
+ * OpenAI-compatible provider backed by a locally running Codex-compatible
+ * server. Resolution order: explicit options, CODEX_LOCAL_BASE_URL, then the
+ * `model_provider` table selected in ~/.codex/config.toml.
+ */
+function createCodexLocalProvider({
+  configuredModel = '',
+  configuredBaseUrl = '',
+  configuredApiKey = '',
+  thinkingEffort = '',
+  reasoningEfforts = null,
+  env = process.env,
+} = {}) {
+  const local = loadCodexLocalConfig({ env });
+  const baseUrl =
+    configuredBaseUrl ||
+    env.CODEX_LOCAL_BASE_URL ||
+    env.PIECODE_CODEX_LOCAL_BASE_URL ||
+    local.activeProvider?.baseUrl ||
+    '';
+  if (!baseUrl) return null;
+
+  const envKeyName = local.activeProvider?.envKey || '';
+  const apiKey =
+    configuredApiKey ||
+    env.CODEX_LOCAL_API_KEY ||
+    (envKeyName ? env[envKeyName] || '' : '') ||
+    'local';
+
+  const model =
+    configuredModel || env.CODEX_LOCAL_MODEL || local.model || getProviderSpec('codex-local')?.defaultModel || '';
+  if (!model) return null;
+
+  return createOpenAICompatibleProvider({
+    kind: 'codex-local',
+    providerId: 'codex-local',
+    model,
+    apiKey,
+    baseUrl,
+    thinkingEffort,
+    reasoningEfforts,
+  });
+}
+
 function getCodexHome() {
   return process.env.CODEX_HOME || path.join(os.homedir(), '.codex');
 }
@@ -1042,8 +1180,19 @@ async function postResponsesStreamNative(url, headers, body, onChunk, options = 
   };
 }
 
+/**
+ * Reasoning-first models (o-series, gpt-5*, codex) reject `temperature` on the
+ * chat-completions API, so it is omitted for them.
+ */
+function supportsTemperatureSampling(modelName) {
+  const key = String(modelName || '').toLowerCase();
+  if (!key) return true;
+  return !/(^|[/:])(o[134])\b|gpt-5|codex/.test(key);
+}
+
 function createOpenAICompatibleProvider({
   kind,
+  providerId = '',
   model,
   apiKey,
   baseUrl,
@@ -1058,16 +1207,19 @@ function createOpenAICompatibleProvider({
   const chatUrl = normalizedBase.endsWith('/chat/completions')
     ? normalizedBase
     : `${normalizedBase}/chat/completions`;
-  const effortContext = { kind, model, reasoningEfforts };
+  const effortContext = { kind, providerId, model, reasoningEfforts };
   const effortCapabilities = getReasoningEffortCapabilities(effortContext);
   const effectiveThinkingEffort = normalizeThinkingEffortForProvider(
     thinkingEffort,
     effortContext
   );
+  const sampling = supportsTemperatureSampling(model) ? { temperature: 0.2 } : {};
 
   return {
     kind,
+    providerId: normalizeProviderId(providerId) || '',
     model,
+    baseUrl: normalizedBase,
     thinkingEffort: effectiveThinkingEffort,
     reasoningEffortOptions: effortCapabilities.values,
     supportsReasoningEffort: effortCapabilities.supported,
@@ -1082,13 +1234,13 @@ function createOpenAICompatibleProvider({
       const body = useNative
         ? {
             model,
-            temperature: 0.2,
+            ...sampling,
             messages: [{ role: 'system', content: systemPrompt }, ...messages],
             tools,
           }
         : {
             model,
-            temperature: 0.2,
+            ...sampling,
             messages: [
               { role: 'system', content: systemPrompt },
               { role: 'user', content: prompt },
@@ -1138,7 +1290,7 @@ function createOpenAICompatibleProvider({
           withReasoningEffort(
             {
               model,
-              temperature: 0.2,
+              ...sampling,
               stream: true,
               messages: [{ role: 'system', content: systemPrompt }, ...messages],
               tools,
@@ -1164,7 +1316,7 @@ function createOpenAICompatibleProvider({
         withReasoningEffort(
           {
             model,
-            temperature: 0.2,
+            ...sampling,
             stream: true,
             messages: [
               { role: 'system', content: systemPrompt },
@@ -1509,40 +1661,231 @@ function prefersCodexCli() {
   return process.env.PIECODE_CODEX_PREFER_CLI === '1';
 }
 
-function createAnthropicProvider({ apiKey, model, thinkingEffort = '' }) {
+/**
+ * Stream an Anthropic Messages response, reassembling the SSE content blocks
+ * into the same `content` array shape the non-streaming call returns.
+ */
+async function postAnthropicStream(url, headers, body, onChunk, options = {}) {
+  const controller = new AbortController();
+  const externalSignal = options?.signal;
+  let abortListener = null;
+  if (externalSignal) {
+    if (externalSignal.aborted) controller.abort();
+    abortListener = () => controller.abort();
+    externalSignal.addEventListener('abort', abortListener, { once: true });
+  }
+  const timeout = createAbortTimeout(controller);
+  const abortError = () => {
+    if (externalSignal?.aborted) {
+      const err = new Error('Model stream aborted.');
+      err.code = 'ABORT_ERR';
+      return err;
+    }
+    return new Error(`Model stream timed out after ${DEFAULT_MODEL_TIMEOUT_MS}ms`);
+  };
+
+  let res;
+  try {
+    res = await fetch(url, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...headers },
+      body: JSON.stringify({ ...body, stream: true }),
+      signal: controller.signal,
+    });
+  } catch (err) {
+    timeout.clear();
+    if (externalSignal && abortListener) {
+      try {
+        externalSignal.removeEventListener('abort', abortListener);
+      } catch {}
+    }
+    if (err?.name === 'AbortError') throw abortError();
+    throw modelNetworkError('Model stream', url, err);
+  }
+  timeout.refresh();
+
+  try {
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      const err = new Error(`Model API error (${res.status}): ${JSON.stringify(data)}`);
+      err.status = res.status;
+      err.data = data;
+      throw err;
+    }
+    if (!res.body) return { content: [], stopReason: '', usage: null, text: '' };
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let stopReason = '';
+    let usage = null;
+    const blocks = new Map();
+
+    while (true) {
+      let packet;
+      try {
+        packet = await reader.read();
+      } catch (err) {
+        if (err?.name === 'AbortError') throw abortError();
+        throw modelNetworkError('Model stream', url, err);
+      }
+      if (packet.done) break;
+      timeout.refresh();
+      buffer += decoder.decode(packet.value, { stream: true });
+      const lines = buffer.split('\n');
+      buffer = lines.pop() || '';
+
+      for (const rawLine of lines) {
+        const line = rawLine.trim();
+        if (!line.startsWith('data:')) continue;
+        const payload = line.slice(5).trim();
+        if (!payload || payload === '[DONE]') continue;
+
+        let event;
+        try {
+          event = JSON.parse(payload);
+        } catch {
+          continue;
+        }
+
+        const index = Number.isInteger(event?.index) ? event.index : 0;
+        switch (event?.type) {
+          case 'message_start': {
+            const started = normalizeUsage(event?.message?.usage);
+            if (started) usage = { ...(usage || {}), ...started };
+            break;
+          }
+          case 'content_block_start': {
+            const block = event?.content_block || {};
+            blocks.set(index, {
+              type: block.type || 'text',
+              text: typeof block.text === 'string' ? block.text : '',
+              id: block.id || '',
+              name: block.name || '',
+              partialJson: '',
+            });
+            break;
+          }
+          case 'content_block_delta': {
+            const block = blocks.get(index) || { type: 'text', text: '', partialJson: '' };
+            const delta = event?.delta || {};
+            if (delta.type === 'text_delta' && typeof delta.text === 'string') {
+              block.text += delta.text;
+              onChunk?.(delta.text);
+            } else if (delta.type === 'thinking_delta' && typeof delta.thinking === 'string') {
+              onChunk?.(delta.thinking);
+            } else if (delta.type === 'input_json_delta' && typeof delta.partial_json === 'string') {
+              block.partialJson += delta.partial_json;
+              timeout.refresh();
+            }
+            blocks.set(index, block);
+            break;
+          }
+          case 'message_delta': {
+            if (typeof event?.delta?.stop_reason === 'string' && event.delta.stop_reason) {
+              stopReason = event.delta.stop_reason;
+            }
+            const deltaUsage = normalizeUsage(event?.usage);
+            if (deltaUsage) usage = { ...(usage || {}), ...deltaUsage };
+            break;
+          }
+          default:
+            break;
+        }
+      }
+    }
+
+    const content = [...blocks.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([, block]) => {
+        if (block.type === 'tool_use') {
+          let input = {};
+          try {
+            input = block.partialJson ? JSON.parse(block.partialJson) : {};
+          } catch {
+            input = {};
+          }
+          return { type: 'tool_use', id: block.id, name: block.name, input };
+        }
+        return { type: 'text', text: block.text };
+      });
+
+    const text = content
+      .filter((block) => block.type === 'text')
+      .map((block) => block.text)
+      .join('')
+      .trim();
+
+    if (usage && usage.input_tokens != null && usage.output_tokens != null && usage.total_tokens == null) {
+      usage.total_tokens = usage.input_tokens + usage.output_tokens;
+    }
+    return { content, stopReason, usage, text };
+  } finally {
+    timeout.clear();
+    if (externalSignal && abortListener) {
+      try {
+        externalSignal.removeEventListener('abort', abortListener);
+      } catch {}
+    }
+  }
+}
+
+function resolveAnthropicMessagesUrl(baseUrl) {
+  const raw = String(baseUrl || '').trim() || 'https://api.anthropic.com/v1';
+  const normalized = raw.replace(/\/+$/, '');
+  if (normalized.endsWith('/messages')) return normalized;
+  return `${normalized}/messages`;
+}
+
+const ANTHROPIC_MAX_OUTPUT_TOKENS = Math.max(
+  512,
+  Number.parseInt(process.env.PIECODE_ANTHROPIC_MAX_TOKENS || '8192', 10) || 8192
+);
+
+function createAnthropicProvider({ apiKey, model, baseUrl = '', thinkingEffort = '' }) {
+  const messagesUrl = resolveAnthropicMessagesUrl(baseUrl);
+  const headers = {
+    'x-api-key': apiKey,
+    'anthropic-version': '2023-06-01',
+  };
+
   return {
     kind: 'anthropic',
+    providerId: 'anthropic',
     model,
+    baseUrl: messagesUrl.replace(/\/messages$/, ''),
     thinkingEffort: normalizeThinkingEffort(thinkingEffort),
+    reasoningEffortOptions: [],
+    supportsReasoningEffort: false,
     supportsNativeTools: true,
     _lastUsage: null,
     getLastUsage() {
       return this._lastUsage || null;
     },
-    async complete({ systemPrompt, prompt, messages, tools, signal }) {
-      this._lastUsage = null;
+    buildBody({ systemPrompt, prompt, messages, tools }) {
       const useNative = Array.isArray(messages) && Array.isArray(tools);
-      const body = useNative
+      return useNative
         ? {
             model,
-            max_tokens: 4096,
+            max_tokens: ANTHROPIC_MAX_OUTPUT_TOKENS,
             system: systemPrompt,
             messages,
-            tools,
+            ...(tools.length > 0 ? { tools } : {}),
           }
         : {
             model,
-            max_tokens: 1600,
+            max_tokens: Math.min(ANTHROPIC_MAX_OUTPUT_TOKENS, 4096),
             system: systemPrompt,
             messages: [{ role: 'user', content: prompt }],
           };
+    },
+    async complete({ systemPrompt, prompt, messages, tools, signal }) {
+      this._lastUsage = null;
+      const useNative = Array.isArray(messages) && Array.isArray(tools);
       const data = await postJson(
-        'https://api.anthropic.com/v1/messages',
-        {
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-        },
-        body,
+        messagesUrl,
+        headers,
+        this.buildBody({ systemPrompt, prompt, messages, tools }),
         { signal }
       );
       this._lastUsage = normalizeUsage(data?.usage);
@@ -1560,6 +1903,29 @@ function createAnthropicProvider({ apiKey, model, thinkingEffort = '' }) {
         throw new Error('Anthropic response did not contain text content.');
       return text;
     },
+    async completeStream({ systemPrompt, prompt, messages, tools, onDelta, signal }) {
+      this._lastUsage = null;
+      const useNative = Array.isArray(messages) && Array.isArray(tools);
+      const streamed = await postAnthropicStream(
+        messagesUrl,
+        headers,
+        this.buildBody({ systemPrompt, prompt, messages, tools }),
+        onDelta,
+        { signal }
+      );
+      this._lastUsage = streamed.usage || null;
+      if (useNative) {
+        return {
+          type: 'native',
+          format: 'anthropic',
+          content: streamed.content,
+          stopReason: streamed.stopReason,
+          usage: this._lastUsage || null,
+        };
+      }
+      if (streamed.text) return streamed.text;
+      throw new Error('Anthropic stream did not contain text content.');
+    },
   };
 }
 
@@ -1570,184 +1936,247 @@ function looksLikeCodexModel(modelName) {
   return Boolean(name) && (name.includes('codex') || name.startsWith('gpt-5'));
 }
 
-export function getProvider(options = {}) {
-  const configuredModel = options.model || null;
-  const configuredBaseUrl = options.baseUrl || options.endpoint || null;
-  const configuredApiKey = options.apiKey || null;
-  const configuredThinkingEffort = normalizeThinkingEffort(
-    options.thinkingEffort || options.thinking_effort || options.reasoningEffort || options.reasoning_effort
+/**
+ * Historical `kind` strings, kept so sessions, traces and the UI stay stable.
+ * New providers get a predictable `<id>-openai-compatible` kind.
+ */
+const LEGACY_PROVIDER_KINDS = {
+  openai: 'openai-compatible',
+  openrouter: 'openrouter-compatible',
+  seed: 'seed-openai-compatible',
+};
+
+function providerKindFor(providerId) {
+  return LEGACY_PROVIDER_KINDS[providerId] || `${providerId}-openai-compatible`;
+}
+
+/**
+ * Providers considered during the last-resort auto-detection sweep, after the
+ * historical anthropic/openai/openrouter/codex order has been exhausted.
+ */
+function listRegistryFallbackOrder() {
+  const alreadyTried = new Set(['anthropic', 'openai', 'openrouter', 'codex', 'codex-local']);
+  return listProviderSpecs().filter(
+    (spec) => spec.transport === TRANSPORTS.OPENAI && !alreadyTried.has(spec.id)
   );
+}
 
-  // Command line arguments take highest priority
-  if (options.provider) {
-    const provider = options.provider.toLowerCase();
+function providerExtraHeaders(providerId, config) {
+  const fromSettings = config?.extraHeaders || {};
+  if (providerId === 'openrouter') {
+    return {
+      'HTTP-Referer': process.env.OPENROUTER_SITE_URL || 'https://piecode.local',
+      'X-Title': process.env.OPENROUTER_APP_NAME || 'Piecode',
+      ...fromSettings,
+    };
+  }
+  return fromSettings;
+}
 
-    if (provider === 'anthropic' && options.apiKey) {
-      return createAnthropicProvider({
-        apiKey: options.apiKey,
-        model:
-          options.model ||
-          process.env.ANTHROPIC_MODEL ||
-          DEFAULT_ANTHROPIC_MODEL,
-        thinkingEffort: configuredThinkingEffort,
-      });
-    }
+/**
+ * Build any registry provider that speaks an OpenAI-compatible dialect.
+ * Returns null when the provider is not usable (missing key, unknown id).
+ */
+function createRegistryProvider(
+  providerId,
+  { model = '', apiKey = '', baseUrl = '', thinkingEffort = '', settings = {}, required = false } = {}
+) {
+  const id = normalizeProviderId(providerId);
+  const spec = getProviderSpec(id);
+  if (!spec || spec.transport !== TRANSPORTS.OPENAI) return null;
 
-    if (provider === 'openai' && configuredApiKey) {
-      return createOpenAICompatibleProvider({
-        kind: 'openai-compatible',
-        model:
-          configuredModel || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
-        apiKey: configuredApiKey,
-        baseUrl:
-          configuredBaseUrl ||
-          process.env.OPENAI_BASE_URL ||
-          'https://api.openai.com/v1',
-        thinkingEffort: configuredThinkingEffort,
-      });
-    }
-
-    if (provider === 'openrouter') {
-      const openRouterApiKey =
-        configuredApiKey || process.env.OPENROUTER_API_KEY;
-      if (!openRouterApiKey) {
-        throw new Error(
-          'Missing API key for openrouter provider. Set OPENROUTER_API_KEY or pass --api-key.'
-        );
-      }
-      return createOpenAICompatibleProvider({
-        kind: 'openrouter-compatible',
-        model: configuredModel || DEFAULT_OPENROUTER_MODEL,
-        apiKey: openRouterApiKey,
-        baseUrl: configuredBaseUrl || DEFAULT_OPENROUTER_BASE_URL,
-        thinkingEffort: configuredThinkingEffort,
-        extraHeaders: {
-          'HTTP-Referer':
-            process.env.OPENROUTER_SITE_URL || 'https://piecode.local',
-          'X-Title': process.env.OPENROUTER_APP_NAME || 'Piecode',
-        },
-      });
-    }
-
-    if (provider === 'seed') {
-      const seedApiKey =
-        configuredApiKey || process.env.SEED_API_KEY || process.env.ARK_API_KEY;
-      if (!seedApiKey) {
-        throw new Error(
-          'Missing API key for seed provider. Set SEED_API_KEY or pass --api-key.'
-        );
-      }
-      return createOpenAICompatibleProvider({
-        kind: 'seed-openai-compatible',
-        model: configuredModel || DEFAULT_SEED_MODEL,
-        apiKey: seedApiKey,
-        baseUrl: configuredBaseUrl || DEFAULT_SEED_BASE_URL,
-        thinkingEffort: configuredThinkingEffort,
-      });
-    }
-
-    if (provider === 'codex') {
-      const codexAuth = loadCodexAuth();
-      if (!prefersCodexCli()) {
-        const directProvider = createCodexDirectProvider({
-          configuredModel,
-          configuredBaseUrl,
-          codexAuth,
-          thinkingEffort: configuredThinkingEffort,
-        });
-        if (directProvider) {
-          return directProvider;
-        }
-      }
-      const cliAvailable = hasCodexCliSession();
-      const cliProvider = cliAvailable
-        ? createCodexCliProvider(options.model, configuredThinkingEffort)
-        : null;
-      if (cliProvider) return cliProvider;
-    }
+  const config = resolveProviderConfig(id, { settings });
+  const effectiveKey = apiKey || config.apiKey;
+  // Auto-detection must never pick a provider the user has not set up — a local
+  // server that needs no key still needs an explicit opt-in.
+  if (!required && !config.configured && !baseUrl && !apiKey) return null;
+  if (config.needsKey && !effectiveKey) {
+    if (!required) return null;
+    const envName = spec.apiKeyEnv?.[0] || '';
+    throw new Error(
+      `Missing API key for ${spec.label} (${id}). ${
+        envName ? `Set ${envName}` : 'Configure it in ~/.piecode/settings.json'
+      } or pass --api-key.`
+    );
   }
 
-  // If the selected model is codex-like, prefer codex auth/session before other key-based fallbacks.
-  if (looksLikeCodexModel(configuredModel)) {
-    const codexAuth = loadCodexAuth();
-    if (!prefersCodexCli()) {
-      const directProvider = createCodexDirectProvider({
-        configuredModel,
-        configuredBaseUrl,
-        codexAuth,
-        thinkingEffort: configuredThinkingEffort,
-      });
-      if (directProvider) {
-        return directProvider;
-      }
-    }
-    const cliAvailable = hasCodexCliSession();
-    const cliProvider = cliAvailable
-      ? createCodexCliProvider(configuredModel, configuredThinkingEffort)
-      : null;
-    if (cliProvider) return cliProvider;
-  }
+  return createOpenAICompatibleProvider({
+    kind: providerKindFor(id),
+    providerId: id,
+    model: model || config.model || spec.defaultModel,
+    apiKey: effectiveKey || (spec.optionalApiKey ? 'local' : ''),
+    baseUrl: baseUrl || config.baseUrl || spec.defaultBaseUrl,
+    thinkingEffort,
+    reasoningEfforts: config.reasoningEfforts,
+    extraHeaders: providerExtraHeaders(id, config),
+  });
+}
 
-  // Environment variables (original behavior)
-  if (process.env.ANTHROPIC_API_KEY) {
-    return createAnthropicProvider({
-      apiKey: requireEnv('ANTHROPIC_API_KEY'),
-      model:
-        configuredModel ||
-        process.env.ANTHROPIC_MODEL ||
-        DEFAULT_ANTHROPIC_MODEL,
-      thinkingEffort: configuredThinkingEffort,
-    });
-  }
-
-  if (process.env.OPENAI_API_KEY) {
-    return createOpenAICompatibleProvider({
-      kind: 'openai-compatible',
-      model:
-        configuredModel || process.env.OPENAI_MODEL || DEFAULT_OPENAI_MODEL,
-      apiKey: requireEnv('OPENAI_API_KEY'),
-      baseUrl:
-        configuredBaseUrl ||
-        process.env.OPENAI_BASE_URL ||
-        'https://api.openai.com/v1',
-      thinkingEffort: configuredThinkingEffort,
-    });
-  }
-
-  if (process.env.OPENROUTER_API_KEY) {
-    return createOpenAICompatibleProvider({
-      kind: 'openrouter-compatible',
-      model: configuredModel || DEFAULT_OPENROUTER_MODEL,
-      apiKey: process.env.OPENROUTER_API_KEY,
-      baseUrl: configuredBaseUrl || DEFAULT_OPENROUTER_BASE_URL,
-      thinkingEffort: configuredThinkingEffort,
-      extraHeaders: {
-        'HTTP-Referer':
-          process.env.OPENROUTER_SITE_URL || 'https://piecode.local',
-        'X-Title': process.env.OPENROUTER_APP_NAME || 'Piecode',
-      },
-    });
-  }
-
+function createCodexProviderChain({ configuredModel, configuredBaseUrl, thinkingEffort, settings }) {
   const codexAuth = loadCodexAuth();
   if (!prefersCodexCli()) {
     const directProvider = createCodexDirectProvider({
       configuredModel,
       configuredBaseUrl,
       codexAuth,
-      thinkingEffort: configuredThinkingEffort,
+      thinkingEffort,
     });
-    if (directProvider) {
-      return directProvider;
+    if (directProvider) return directProvider;
+  }
+  if (hasCodexCliSession()) {
+    const cliProvider = createCodexCliProvider(configuredModel, thinkingEffort);
+    if (cliProvider) return cliProvider;
+  }
+  // Last resort for codex: a locally running Codex-compatible server.
+  return createCodexLocalProvider({
+    configuredModel,
+    configuredBaseUrl,
+    thinkingEffort,
+    reasoningEfforts: resolveProviderConfig('codex-local', { settings }).reasoningEfforts,
+  });
+}
+
+export function getProvider(options = {}) {
+  const settings = options.settings && typeof options.settings === 'object' ? options.settings : {};
+  const rawModel = options.model || '';
+  // `--model deepseek:deepseek-chat` selects both provider and model.
+  const parsedRef = parseModelRef(rawModel);
+  const configuredModel = parsedRef.model || rawModel || null;
+  const configuredBaseUrl = options.baseUrl || options.endpoint || null;
+  const configuredApiKey = options.apiKey || null;
+  const configuredThinkingEffort = normalizeThinkingEffort(
+    options.thinkingEffort || options.thinking_effort || options.reasoningEffort || options.reasoning_effort
+  );
+  const requestedProvider = normalizeProviderId(options.provider || parsedRef.provider || '');
+
+  // 1. Explicitly requested provider wins.
+  if (requestedProvider) {
+    if (requestedProvider === 'anthropic') {
+      const config = resolveProviderConfig('anthropic', { settings });
+      const apiKey = configuredApiKey || config.apiKey;
+      if (apiKey) {
+        return createAnthropicProvider({
+          apiKey,
+          model: configuredModel || config.model || DEFAULT_ANTHROPIC_MODEL,
+          baseUrl: configuredBaseUrl || config.baseUrl,
+          thinkingEffort: configuredThinkingEffort,
+        });
+      }
+    } else if (requestedProvider === 'codex') {
+      const provider = createCodexProviderChain({
+        configuredModel,
+        configuredBaseUrl,
+        thinkingEffort: configuredThinkingEffort,
+        settings,
+      });
+      if (provider) return provider;
+    } else if (requestedProvider === 'codex-local') {
+      const provider = createCodexLocalProvider({
+        configuredModel,
+        configuredBaseUrl,
+        configuredApiKey,
+        thinkingEffort: configuredThinkingEffort,
+      });
+      if (provider) return provider;
+      throw new Error(
+        'No local Codex endpoint found. Start one and set CODEX_LOCAL_BASE_URL, or configure [model_providers.*] in ~/.codex/config.toml.'
+      );
+    } else if (isKnownProvider(requestedProvider)) {
+      const provider = createRegistryProvider(requestedProvider, {
+        model: configuredModel,
+        apiKey: configuredApiKey,
+        baseUrl: configuredBaseUrl,
+        thinkingEffort: configuredThinkingEffort,
+        settings,
+        required: true,
+      });
+      if (provider) return provider;
+    } else {
+      throw new Error(
+        `Unknown provider: ${requestedProvider}. Run \`/provider\` to see the supported providers.`
+      );
     }
   }
-  const cliAvailable = hasCodexCliSession();
-  const cliProvider = cliAvailable
-    ? createCodexCliProvider(configuredModel, configuredThinkingEffort)
-    : null;
-  if (cliProvider) return cliProvider;
+
+  // 2. A codex-shaped model prefers codex auth over generic key fallbacks.
+  if (looksLikeCodexModel(configuredModel)) {
+    const provider = createCodexProviderChain({
+      configuredModel,
+      configuredBaseUrl,
+      thinkingEffort: configuredThinkingEffort,
+      settings,
+    });
+    if (provider) return provider;
+  }
+
+  // 3. A bare model id that clearly belongs to one provider selects it.
+  const inferred = normalizeProviderId(inferProviderForModel(configuredModel));
+  if (inferred && inferred !== requestedProvider && isKnownProvider(inferred)) {
+    const provider = createRegistryProvider(inferred, {
+      model: configuredModel,
+      apiKey: configuredApiKey,
+      baseUrl: configuredBaseUrl,
+      thinkingEffort: configuredThinkingEffort,
+      settings,
+    });
+    if (provider) return provider;
+    if (inferred === 'anthropic') {
+      const config = resolveProviderConfig('anthropic', { settings });
+      const apiKey = configuredApiKey || config.apiKey;
+      if (apiKey) {
+        return createAnthropicProvider({
+          apiKey,
+          model: configuredModel,
+          baseUrl: configuredBaseUrl || config.baseUrl,
+          thinkingEffort: configuredThinkingEffort,
+        });
+      }
+    }
+  }
+
+  // 4. Environment fallbacks, in the historical priority order.
+  if (process.env.ANTHROPIC_API_KEY) {
+    return createAnthropicProvider({
+      apiKey: requireEnv('ANTHROPIC_API_KEY'),
+      model: configuredModel || process.env.ANTHROPIC_MODEL || DEFAULT_ANTHROPIC_MODEL,
+      baseUrl: configuredBaseUrl || process.env.ANTHROPIC_BASE_URL || '',
+      thinkingEffort: configuredThinkingEffort,
+    });
+  }
+
+  for (const fallbackId of ['openai', 'openrouter']) {
+    const provider = createRegistryProvider(fallbackId, {
+      model: configuredModel,
+      apiKey: configuredApiKey,
+      baseUrl: configuredBaseUrl,
+      thinkingEffort: configuredThinkingEffort,
+      settings,
+    });
+    if (provider) return provider;
+  }
+
+  // 5. Codex login / local Codex endpoint.
+  const codexProvider = createCodexProviderChain({
+    configuredModel,
+    configuredBaseUrl,
+    thinkingEffort: configuredThinkingEffort,
+    settings,
+  });
+  if (codexProvider) return codexProvider;
+
+  // 6. Any other provider the user has configured, including local servers.
+  for (const spec of listRegistryFallbackOrder()) {
+    const provider = createRegistryProvider(spec.id, {
+      model: configuredModel,
+      apiKey: configuredApiKey,
+      baseUrl: configuredBaseUrl,
+      thinkingEffort: configuredThinkingEffort,
+      settings,
+    });
+    if (provider) return provider;
+  }
 
   throw new Error(
-    'No model provider configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or run `codex login`.'
+    'No model provider configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, DEEPSEEK_API_KEY (or another provider key), run `codex login`, or start a local server. Run `piecode --doctor` for details.'
   );
 }

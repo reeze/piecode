@@ -1099,6 +1099,7 @@ export class SimpleTui {
     this.modelSuggestionIndex = 0;
     this.modelSuggestionWindowStart = 0;
     this.modelSuggestionMaxVisible = 8;
+    this.modelSuggestionMeta = new Map();
     this.commandSuggestionsVisible = false;
     this.commandSuggestions = [];
     this.commandSuggestionIndex = 0;
@@ -1973,6 +1974,25 @@ export class SimpleTui {
     this.overlayScroll = target;
     this.render();
     return this.overlayScroll;
+  }
+
+  /**
+   * Per-model annotations shown dimmed after each picker row, keyed by the
+   * model id, e.g. `{ "deepseek:deepseek-chat": "128k ctx · coding" }`.
+   */
+  setModelSuggestionMeta(meta) {
+    if (meta instanceof Map) {
+      this.modelSuggestionMeta = meta;
+    } else if (meta && typeof meta === "object") {
+      this.modelSuggestionMeta = new Map(Object.entries(meta));
+    } else {
+      this.modelSuggestionMeta = new Map();
+    }
+  }
+
+  getModelSuggestionMeta(modelId) {
+    if (!(this.modelSuggestionMeta instanceof Map)) return "";
+    return String(this.modelSuggestionMeta.get(String(modelId || "")) || "");
   }
 
   setModelSuggestions(options, selectedIndex = 0) {
@@ -3150,12 +3170,20 @@ export class SimpleTui {
           ...(modelSuggestionViewport && modelSuggestionViewport.hiddenAbove > 0
             ? [truncateLine(` ${color(`... ${modelSuggestionViewport.hiddenAbove} above`, "2;37")}`, bottomWidth)]
             : []),
-          ...((modelSuggestionViewport?.items || []).map((modelId, offset) => {
-            const absoluteIndex = (modelSuggestionViewport?.start || 0) + offset;
-            const selected = absoluteIndex === this.modelSuggestionIndex;
-            const text = selected ? color(`> ${modelId}`, "1;32") : color(`  ${modelId}`, "2;37");
-            return truncateLine(` ${text}`, bottomWidth);
-          })),
+          ...(() => {
+            const items = modelSuggestionViewport?.items || [];
+            // Align the dimmed metadata column across the visible rows.
+            const idColumn = items.reduce((max, id) => Math.max(max, String(id).length), 0);
+            return items.map((modelId, offset) => {
+              const absoluteIndex = (modelSuggestionViewport?.start || 0) + offset;
+              const selected = absoluteIndex === this.modelSuggestionIndex;
+              const meta = this.getModelSuggestionMeta(modelId);
+              const padded = meta ? String(modelId).padEnd(idColumn) : String(modelId);
+              const label = selected ? color(`> ${padded}`, "1;32") : color(`  ${padded}`, "2;37");
+              const suffix = meta ? color(`  ${meta}`, "2;90") : "";
+              return truncateLine(` ${label}${suffix}`, bottomWidth);
+            });
+          })(),
           ...(modelSuggestionViewport && modelSuggestionViewport.hiddenBelow > 0
             ? [truncateLine(` ${color(`... ${modelSuggestionViewport.hiddenBelow} below`, "2;37")}`, bottomWidth)]
             : []),

@@ -1,9 +1,15 @@
+import path from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   filterUsableModelCatalog,
   getModelQueryFromInput,
   inferModelSuggestionProvider,
   isModelProviderConfigured,
 } from "../src/lib/modelInput.js";
+
+// A Codex home with stored login state, so codex counts as a usable provider.
+const CODEX_HOME = path.join(path.dirname(fileURLToPath(import.meta.url)), "fixtures", "codex-home");
+const CODEX_ENV = { CODEX_HOME };
 
 describe("model input parsing", () => {
   test("exact /model remains a status command instead of opening picker", () => {
@@ -33,14 +39,20 @@ describe("model input parsing", () => {
       "seed:doubao-seed-code-preview-latest",
       "anthropic:claude-3-5-sonnet-latest",
     ];
-    expect(filterUsableModelCatalog(catalog, {}, {}, [])).toEqual(["codex:gpt-5.3-codex"]);
-    expect(filterUsableModelCatalog(catalog, {}, { OPENROUTER_API_KEY: "or-key" }, [])).toEqual([
-      "codex:gpt-5.3-codex",
-      "openrouter:moonshotai/kimi-k2.5",
-    ]);
+    expect(filterUsableModelCatalog(catalog, {}, CODEX_ENV, [])).toEqual(["codex:gpt-5.3-codex"]);
     expect(
-      filterUsableModelCatalog(catalog, { providers: { seed: { apiKey: "seed-key" } } }, {}, [])
+      filterUsableModelCatalog(catalog, {}, { ...CODEX_ENV, OPENROUTER_API_KEY: "or-key" }, [])
+    ).toEqual(["codex:gpt-5.3-codex", "openrouter:moonshotai/kimi-k2.5"]);
+    expect(
+      filterUsableModelCatalog(catalog, { providers: { seed: { apiKey: "seed-key" } } }, CODEX_ENV, [])
     ).toEqual(["codex:gpt-5.3-codex", "seed:doubao-seed-code-preview-latest"]);
+  });
+
+  test("hides codex models when there is no codex login or CLI", () => {
+    const catalog = ["codex:gpt-5.3-codex", "openrouter:moonshotai/kimi-k2.5"];
+    expect(filterUsableModelCatalog(catalog, {}, { CODEX_HOME: "/nonexistent/codex-home" }, [])).toEqual([]);
+    expect(isModelProviderConfigured("codex", {}, CODEX_ENV)).toBe(true);
+    expect(isModelProviderConfigured("codex", {}, { CODEX_HOME: "/nonexistent/codex-home" })).toBe(false);
   });
 
   test("always keeps explicitly configured current models visible", () => {
@@ -52,7 +64,7 @@ describe("model input parsing", () => {
   });
 
   test("deduplicates equivalent prefixed and bare model aliases", () => {
-    expect(filterUsableModelCatalog(["codex:gpt-5.3-codex", "gpt-5.3-codex"], {}, {}, [])).toEqual([
+    expect(filterUsableModelCatalog(["codex:gpt-5.3-codex", "gpt-5.3-codex"], {}, CODEX_ENV, [])).toEqual([
       "codex:gpt-5.3-codex",
     ]);
     expect(

@@ -47,6 +47,26 @@ import { consumeMouseWheelDeltas, stripMouseInputNoise } from "./lib/mouse.js";
 import { applyCommandPickerSelectionForSubmit, isPickerCancelKey } from "./lib/cliTuiInteraction.js";
 import { TuiLineEditor } from "./lib/tuiLineEditor.js";
 import { filterUsableModelCatalog, getModelQueryFromInput, isModelProviderConfigured } from "./lib/modelInput.js";
+import {
+  buildModelCatalog,
+  describeProviderSetup,
+  describeProviderStatuses,
+  discoverAllProviderModels,
+  formatModelRef,
+  getCatalogContextWindow,
+  getProviderSpec,
+  inferProviderForModel,
+  isKnownProvider,
+  normalizeProviderId,
+  parseModelRef,
+  resolveProviderConfig,
+} from "./lib/modelCatalog.js";
+import {
+  buildDoctorReport,
+  describeModelRef,
+  formatModelCatalogLines,
+  formatProviderTable,
+} from "./lib/providerStatus.js";
 import { McpHub, mergeCommonMcpServers, resolveMcpServerConfigs } from "./lib/mcp.js";
 import { AgentSessionState, SessionEventBus, createJsonlSessionSink } from "./lib/sessionProtocol.js";
 import {
@@ -103,6 +123,10 @@ const SLASH_COMMANDS = [
   "/debug last",
   "/debug save",
   "/model",
+  "/models",
+  "/provider",
+  "/providers",
+  "/doctor",
   "/think",
   "/thinking",
   "/reasoning",
@@ -136,39 +160,14 @@ const SLASH_COMMANDS = [
 
 const DEFAULT_CONTEXT_WINDOW = 128000;
 
-const MODEL_SUGGESTIONS = [
-  "codex:gpt-5.3-codex",
-  "openrouter:moonshotai/kimi-k2.5",
-  "openrouter:google/gemini-3-flash-preview",
-  "openrouter:anthropic/claude-sonnet-4.5",
-  "openrouter:deepseek/deepseek-v3.2",
-  "openrouter:minimax/minimax-m2.1",
-  "openrouter:anthropic/claude-opus-4.5",
-  "openrouter:anthropic/claude-opus-4.6",
-  "openrouter:z-ai/glm-4.7",
-  "openai/gpt-4.1-mini",
-  "openai/gpt-4.1",
-  "openai/gpt-4o-mini",
-  "openai/gpt-4o",
-  "anthropic/claude-3.5-sonnet",
-  "anthropic/claude-3.7-sonnet",
-  "google/gemini-2.0-flash-001",
-  "meta-llama/llama-3.1-70b-instruct",
-  "qwen/qwen-2.5-coder-32b-instruct",
-  "deepseek/deepseek-chat",
-  "gpt-5.3-codex",
-];
+// Seed suggestions come from the shared model registry so every provider the
+// registry knows about shows up in the picker without a second hard-coded list.
+const MODEL_SUGGESTIONS = buildModelCatalog({ includeUnconfigured: true }).map((row) => row.ref);
 
-const OPENROUTER_ALLOWED_MODELS = [
-  "moonshotai/kimi-k2.5",
-  "google/gemini-3-flash-preview",
-  "anthropic/claude-sonnet-4.5",
-  "deepseek/deepseek-v3.2",
-  "minimax/minimax-m2.1",
-  "anthropic/claude-opus-4.5",
-  "anthropic/claude-opus-4.6",
-  "z-ai/glm-4.7",
-];
+// Metadata for the picker, keyed by `provider:model`.
+const MODEL_INFO_BY_REF = new Map(
+  buildModelCatalog({ includeUnconfigured: true }).map((row) => [row.ref, row])
+);
 
 function createMutedTtyOutput(baseOut) {
   const muted = new Writable({
@@ -214,13 +213,17 @@ async function saveSettings(filePath, settings) {
 }
 
 function resolveProviderOptions(args, settings) {
-  const provider = args.provider || settings.provider || null;
-  const providerSettings = 
+  // `--model deepseek:deepseek-chat` selects the provider as well as the model.
+  const modelRef = parseModelRef(args.model || settings.model || "");
+  const provider =
+    normalizeProviderId(args.provider || modelRef.provider || settings.provider || "") || null;
+  const providerSettings =
     provider && settings.providers && typeof settings.providers === "object"
       ? settings.providers[provider] || {}
       : {};
 
-  const model = 
+  const model =
+    modelRef.model ||
     args.model ||
     settings.model ||
     providerSettings.model ||
@@ -261,6 +264,8 @@ function resolveProviderOptions(args, settings) {
     baseUrl: endpoint,
     endpoint,
     thinkingEffort,
+    // The provider registry resolves credentials/endpoints from settings too.
+    settings,
   };
 }
 
@@ -861,6 +866,9 @@ function parseArgs(argv) {
     pluginUpdate: "",
     listSkills: false,
     listPlugins: false,
+    listModels: false,
+    listProviders: false,
+    doctor: false,
     tui: false,
     web: false,
     tmuxSubagents: false,
@@ -914,6 +922,12 @@ function parseArgs(argv) {
       args.listSkills = true;
     } else if (a === "--list-plugins") {
       args.listPlugins = true;
+    } else if (a === "--list-models") {
+      args.listModels = true;
+    } else if (a === "--list-providers" || a === "--providers") {
+      args.listProviders = true;
+    } else if (a === "--doctor") {
+      args.doctor = true;
     } else if (a === "--tui") {
       args.tui = true;
     } else if (a === "--web") {
@@ -2003,6 +2017,12 @@ function resolveContextWindow({ modelName, providerName = "", settings = {}, dyn
   pushProvider(parsedProvider);
   for (const key of providerCandidates) {
     const value = toPositiveInt(hints.byProvider.get(key));
+    if (value != null) return value;
+  }
+
+  // The shared registry knows context windows for every curated model.
+  for (const key of candidates) {
+    const value = toPositiveInt(getCatalogContextWindow(key));
     if (value != null) return value;
   }
 
@@ -3537,49 +3557,112 @@ async function handleSlashCommand(input, ctx) {
     }
     return { done: false, handled: true };
   }
-  if (lower === "/model list") {
+  if (lower === "/provider" || lower === "/providers" || lower.startsWith("/provider ")) {
+    const arg = normalized.slice(lower.startsWith("/providers") ? "/providers".length : "/provider".length).trim();
+    if (arg && arg.toLowerCase() !== "list") {
+      // `/provider <id>` switches provider using that provider's default model.
+      const target = normalizeProviderId(arg);
+      const spec = getProviderSpec(target);
+      if (!spec) {
+        logLine(`unknown provider: ${arg}`);
+        logLine("run /provider to list the supported providers");
+        return { done: false, handled: true };
+      }
+      const config = resolveProviderConfig(target, { settings });
+      if (!config.configured) {
+        logLine(`${spec.label} is not configured — ${describeProviderSetup(target)}`);
+        if (spec.docsUrl) logLine(`docs: ${spec.docsUrl}`);
+        return { done: false, handled: true };
+      }
+      const targetModel = config.model || spec.defaultModel;
+      if (!targetModel) {
+        logLine(`${spec.label} has no default model — use /model ${target}:<model-id>`);
+        return { done: false, handled: true };
+      }
+      try {
+        const nextProvider = await setModel(formatModelRef({ provider: target, model: targetModel }));
+        const message = formatModelStatus(nextProvider, "provider switched");
+        if (tui && typeof setStatusBar === "function") setStatusBar(message);
+        else logLine(message);
+      } catch (err) {
+        logLine(`unable to switch provider: ${err.message}`);
+      }
+      return { done: false, handled: true };
+    }
+
+    const activeProviderId =
+      normalizeProviderId(providerRef.value?.providerId) || providerPrefix(providerRef.value?.kind);
+    for (const line of formatProviderTable({ settings, env: process.env, activeProviderId })) {
+      logLine(line);
+    }
+    logLine("usage: /provider <id> to switch  |  /models to browse models");
+    return { done: false, handled: true };
+  }
+  if (lower === "/doctor") {
+    const hub = getActiveMcpHub();
+    const report = buildDoctorReport({
+      settings,
+      env: process.env,
+      activeProvider: providerRef.value,
+      workspaceDir,
+      settingsFile,
+      extraChecks: [
+        {
+          label: "mcp servers",
+          ok: true,
+          detail: hub && hub.hasServers() ? hub.getServerNames().join(", ") : "none configured",
+        },
+        {
+          label: "skills",
+          ok: true,
+          detail: `${(skillIndex?.length ?? 0)} discovered, ${(activeSkillsRef?.value?.length ?? 0)} active`,
+        },
+      ],
+    });
+    for (const line of report.lines) logLine(line);
+    return { done: false, handled: true };
+  }
+  if (lower === "/models" || lower === "/model list") {
     if (tui && typeof setStatusBar === "function") {
       setStatusBar(formatModelStatus(providerRef.value, "current model"));
     } else {
       logLine(formatModelStatus(providerRef.value, "current model"));
     }
-    let listed = false;
-    let openRouterPopular = [];
-    let openRouterLatest = [];
-    const extraSettingsModels = [];
-
-    const openRouterConfiguredForUse = isConfiguredModelProvider("openrouter", settings);
-    const groups = await loadOpenRouterContextMetadata({ force: true, logErrors: false });
-    if (groups && openRouterConfiguredForUse) {
-      openRouterPopular = Array.isArray(groups.popular) ? groups.popular : [];
-      openRouterLatest = Array.isArray(groups.latest) ? groups.latest : [];
-      if (openRouterPopular.length > 0) {
-        listed = true;
-        logLine("popular (openrouter):");
-        for (const id of openRouterPopular) logLine(`- openrouter:${id}`);
+    // Refresh from every configured provider, not just OpenRouter.
+    let discoveredRefs = [];
+    try {
+      const groups = await fetchProviderModelGroups({ settings });
+      discoveredRefs = groups.refs;
+      for (const source of groups.sources) {
+        applyContextWindowMetadata(modelContextWindowsRef.value, groups.contextByModel, source);
+        modelContextMetadataRef?.value?.add?.(source);
       }
-      if (openRouterLatest.length > 0) {
-        listed = true;
-        logLine("latest (openrouter):");
-        for (const id of openRouterLatest) logLine(`- openrouter:${id}`);
-      }
-    } else if (groups && !openRouterConfiguredForUse) {
-      logLine("openrouter models hidden: missing OPENROUTER_API_KEY or providers.openrouter.apiKey");
+    } catch {
+      // Offline is fine: the curated catalog still lists models.
     }
 
     modelCatalogRef.value = getUsableModelCatalog(
       mergeModelCatalog(
         MODEL_SUGGESTIONS,
-        openRouterPopular,
-        openRouterLatest,
-        [...collectModelsFromSettings(settings), ...extraSettingsModels]
+        [],
+        [],
+        collectModelsFromSettings(settings),
+        discoveredRefs
       ),
       settings,
       collectModelsFromSettings(settings)
     );
-    if (!listed) {
-      for (const modelId of modelCatalogRef.value) logLine(`- ${modelId}`);
+
+    const activeRef = formatActiveModelRef(providerRef.value);
+    for (const line of formatModelCatalogLines({
+      settings,
+      env: process.env,
+      refs: modelCatalogRef.value,
+      activeRef,
+    })) {
+      logLine(line);
     }
+    logLine("usage: /model <provider:model> to switch  |  /provider to see provider setup");
     return { done: false, handled: true };
   }
   if (lower.startsWith("/model ")) {
@@ -4154,46 +4237,53 @@ function getLocalMcpServerNameSet(settings, workspaceDir) {
   return names;
 }
 
-async function fetchOpenRouterModelGroups({ settings }) {
-  const providerSettings =
-    settings?.providers && typeof settings.providers === "object"
-      ? settings.providers.openrouter || {}
-      : {};
-  const apiKey = providerSettings.apiKey || process.env.OPENROUTER_API_KEY || "";
-  const endpoint =
-    providerSettings.endpoint ||
-    providerSettings.baseUrl ||
-    process.env.OPENROUTER_BASE_URL ||
-    "https://openrouter.ai/api/v1";
-  const base = String(endpoint || "").replace(/\/$/, "");
-  const res = await fetch(`${base}/models`, {
-    method: "GET",
-    headers: {
-      "content-type": "application/json",
-      ...(apiKey ? { Authorization: `Bearer ${apiKey}` } : {}),
-    },
+/**
+ * Ask every configured provider which models it serves. Results are converted
+ * into `provider:model` refs plus a context-window map for the status bar.
+ */
+async function fetchProviderModelGroups({ settings, providerIds = null, timeoutMs = 6000 } = {}) {
+  const { models, sources } = await discoverAllProviderModels({
+    settings,
+    env: process.env,
+    providerIds,
+    timeoutMs,
   });
-  if (!res.ok) throw new Error(`OpenRouter models request failed (${res.status})`);
-  const data = await res.json().catch(() => ({}));
-  const rows = Array.isArray(data?.data) ? data.data : [];
-  const byId = new Map();
+
+  const byProvider = new Map();
   const contextByModel = {};
-  for (const row of rows) {
-    const id = String(row?.id || "").trim();
-    if (!id) continue;
-    byId.set(id, { id, created: Number(row?.created) || 0 });
-    const contextWindow = extractContextWindowValue(row?.context_length ?? row);
+  const refs = [];
+  for (const entry of models) {
+    const ref = formatModelRef({ provider: entry.provider, model: entry.id });
+    if (!ref) continue;
+    refs.push(ref);
+    if (!byProvider.has(entry.provider)) byProvider.set(entry.provider, []);
+    byProvider.get(entry.provider).push(entry.id);
+    const contextWindow = extractContextWindowValue(entry.context);
     if (contextWindow != null) {
-      contextByModel[id] = contextWindow;
-      contextByModel[`openrouter:${id}`] = contextWindow;
+      contextByModel[entry.id] = contextWindow;
+      contextByModel[ref] = contextWindow;
     }
   }
-  const popular = OPENROUTER_ALLOWED_MODELS.filter((id) => byId.has(id)).slice(0, 10);
-  const latest = [];
-  return { popular, latest, contextByModel };
+  return { refs, byProvider, contextByModel, sources };
 }
 
-function mergeModelCatalog(baseCatalog, popular, latest, localSettingsModels = []) {
+/** Back-compat shim: `/model list` still highlights OpenRouter separately. */
+async function fetchOpenRouterModelGroups({ settings }) {
+  const groups = await fetchProviderModelGroups({ settings, providerIds: ["openrouter"] });
+  const available = new Set(groups.byProvider.get("openrouter") || []);
+  if (available.size === 0) throw new Error("OpenRouter models request returned nothing");
+  const preferred = buildModelCatalog({ includeUnconfigured: true })
+    .filter((row) => row.provider === "openrouter")
+    .map((row) => row.id)
+    .filter((id) => available.has(id));
+  return {
+    popular: preferred.slice(0, 10),
+    latest: [...available].filter((id) => !preferred.includes(id)).slice(0, 10),
+    contextByModel: groups.contextByModel,
+  };
+}
+
+function mergeModelCatalog(baseCatalog, popular, latest, localSettingsModels = [], discoveredRefs = []) {
   const out = [];
   const seen = new Set();
   const push = (item) => {
@@ -4206,6 +4296,8 @@ function mergeModelCatalog(baseCatalog, popular, latest, localSettingsModels = [
   for (const id of latest || []) push(`openrouter:${id}`);
   for (const id of localSettingsModels || []) push(id);
   for (const id of baseCatalog || []) push(id);
+  // Discovered ids go last: curated entries stay at the top of the picker.
+  for (const ref of discoveredRefs || []) push(ref);
   return out;
 }
 
@@ -4232,6 +4324,7 @@ async function probeAvailableModels({
   const loadedSources = [];
   const popular = [];
   const latest = [];
+  let discoveredRefs = [];
 
   const markLoaded = (source) => {
     const key = String(source || "").trim().toLowerCase();
@@ -4253,11 +4346,22 @@ async function probeAvailableModels({
   let openrouter = null;
 
   try {
-    openrouter = await fetchOpenRouterModelGroups({ settings });
-    applyContext(openrouter?.contextByModel, "openrouter");
-    for (const id of openrouter?.popular || []) popular.push(id);
-    for (const id of openrouter?.latest || []) latest.push(id);
-    markLoaded("openrouter");
+    // One sweep across every configured provider, not just OpenRouter.
+    const groups = await fetchProviderModelGroups({ settings });
+    discoveredRefs = groups.refs;
+    for (const source of groups.sources) {
+      applyContext(groups.contextByModel, source);
+      markLoaded(source);
+    }
+    const openRouterIds = groups.byProvider.get("openrouter") || [];
+    if (openRouterIds.length > 0) {
+      const available = new Set(openRouterIds);
+      const preferred = MODEL_SUGGESTIONS.map((ref) => parseModelRef(ref))
+        .filter((parsed) => parsed.provider === "openrouter" && available.has(parsed.model))
+        .map((parsed) => parsed.model);
+      for (const id of preferred.slice(0, 10)) popular.push(id);
+      openrouter = { popular, latest, contextByModel: groups.contextByModel };
+    }
   } catch {
     // Best effort: model discovery should never block startup.
   }
@@ -4267,12 +4371,13 @@ async function probeAvailableModels({
       MODEL_SUGGESTIONS,
       popular,
       latest,
-      collectModelsFromSettings(settings)
+      collectModelsFromSettings(settings),
+      discoveredRefs
     );
     modelCatalogRef.value = getUsableModelCatalog(discoveredCatalog, settings, collectModelsFromSettings(settings));
     const hiddenCount = Math.max(0, discoveredCatalog.length - modelCatalogRef.value.length);
     const hiddenSuffix = hiddenCount > 0 ? `, ${hiddenCount} unavailable hidden` : "";
-    const message = `model probe: loaded ${loadedSources.join(", ")} metadata (${modelCatalogRef.value.length} usable suggestions${hiddenSuffix})`;
+    const message = `model probe: ${loadedSources.join(", ")} (${modelCatalogRef.value.length} models available${hiddenSuffix})`;
     if (typeof logLine === "function") logLine(message);
     else if (tui && typeof tui.render === "function") tui.render(undefined, message);
   }
@@ -4322,20 +4427,15 @@ function collectModelsFromSettings(settings = {}) {
 }
 
 function parseModelTarget(target) {
-  const raw = String(target || "").trim();
-  const m = raw.match(/^(anthropic|openai|openrouter|codex)\s*:\s*(.+)$/i);
-  if (m) {
-    return {
-      provider: m[1].toLowerCase(),
-      model: m[2].trim(),
-    };
-  }
-  return { provider: "", model: raw };
+  return parseModelRef(target);
 }
 
-function isAllowedOpenRouterModel(modelId) {
-  const model = String(modelId || "").trim().toLowerCase();
-  return OPENROUTER_ALLOWED_MODELS.some((m) => m.toLowerCase() === model);
+/** `provider:model` for the live provider, for picker/status highlighting. */
+function formatActiveModelRef(provider) {
+  const model = String(provider?.model || "").trim();
+  if (!model) return "";
+  const providerId = normalizeProviderId(provider?.providerId || providerPrefix(provider?.kind));
+  return providerId ? formatModelRef({ provider: providerId, model }) : model;
 }
 
 function inferEndpointForProvider(providerOptions, provider) {
@@ -4480,8 +4580,49 @@ async function main() {
     printPluginList(pluginIndex, console.log);
     return;
   }
+  if (args.listProviders) {
+    for (const line of formatProviderTable({ settings, env: process.env })) console.log(line);
+    return;
+  }
+  if (args.listModels) {
+    let discoveredRefs = [];
+    try {
+      discoveredRefs = (await fetchProviderModelGroups({ settings })).refs;
+    } catch {
+      // Offline: fall back to the curated catalog.
+    }
+    const refs = getUsableModelCatalog(
+      mergeModelCatalog(MODEL_SUGGESTIONS, [], [], collectModelsFromSettings(settings), discoveredRefs),
+      settings,
+      collectModelsFromSettings(settings)
+    );
+    for (const line of formatModelCatalogLines({ settings, env: process.env, refs })) console.log(line);
+    return;
+  }
 
   const providerOptionsRef = { value: resolveProviderOptions(args, settings) };
+  if (args.doctor) {
+    let activeProvider = null;
+    try {
+      activeProvider = getProvider(providerOptionsRef.value);
+    } catch {
+      activeProvider = null;
+    }
+    const report = buildDoctorReport({
+      settings,
+      env: process.env,
+      activeProvider,
+      workspaceDir,
+      settingsFile,
+      extraChecks: [
+        { label: "skills", ok: true, detail: `${skillIndex.size ?? skillIndex.length ?? 0} discovered` },
+        { label: "plugins", ok: true, detail: `${pluginIndex.size ?? pluginIndex.length ?? 0} discovered` },
+      ],
+    });
+    for (const line of report.lines) console.log(line);
+    process.exitCode = report.problems.length > 0 ? 1 : 0;
+    return;
+  }
   const providerRef = { value: getProvider(providerOptionsRef.value) };
   const contextWindowRef = { value: 0 };
   const [projectInstructionsLoaded, loadedMemory, loadedAgentDefinitions] = await Promise.all([
@@ -4784,6 +4925,25 @@ async function main() {
     const prefix = providerPrefix(provider?.kind);
     return prefix ? `${prefix}:${model}` : model;
   };
+  /** Annotate picker rows with context window and capability tags. */
+  const applyModelSuggestionMeta = (options) => {
+    if (!tui || typeof tui.setModelSuggestionMeta !== "function") return;
+    const meta = new Map();
+    for (const ref of Array.isArray(options) ? options : []) {
+      const dynamicContext = resolveContextWindow({
+        modelName: ref,
+        settings,
+        dynamicByModel: modelContextWindowsRef.value,
+      });
+      const described = describeModelRef(ref);
+      const contextLabel = dynamicContext ? `${formatCompactNumber(dynamicContext)} ctx` : "";
+      const tags = described.split(" · ").filter((part) => part && !/ctx$/.test(part));
+      const line = [contextLabel || described.split(" · ")[0] || "", ...tags].filter(Boolean).join(" · ");
+      if (line) meta.set(ref, line);
+    }
+    tui.setModelSuggestionMeta(meta);
+  };
+
   const openModelPicker = (query = "") => {
     if (!tui) return false;
     const pickerQuery = String(query || "").trim();
@@ -4805,6 +4965,7 @@ async function main() {
     safeRlWrite(null, { ctrl: true, name: "u" });
     safeRlWrite(nextLine);
     currentInputRef.value = nextLine;
+    applyModelSuggestionMeta(nextOptions);
     if (modelPickerRef.active) tui.setModelSuggestions(modelPickerRef.options, modelPickerRef.index);
     else tui.clearModelSuggestions();
     tui.renderInput(currentInputRef.value);
@@ -5202,6 +5363,7 @@ async function main() {
                 modelPickerRef.options = nextOptions;
                 if (modelPickerRef.index >= modelPickerRef.options.length) modelPickerRef.index = 0;
               }
+              applyModelSuggestionMeta(modelPickerRef.options);
               tui.setModelSuggestions(modelPickerRef.options, modelPickerRef.index);
             } else {
               modelPickerRef.active = false;
@@ -5432,57 +5594,44 @@ async function main() {
     const parsed = parseModelTarget(modelId);
     const selectedModel = parsed.model;
     if (!selectedModel) throw new Error("Model id is required");
-    const seedConfigured =
-      Boolean(settings?.providers?.seed?.apiKey) || Boolean(process.env.SEED_API_KEY) || Boolean(process.env.ARK_API_KEY);
-    const seedConfiguredModel = String(settings?.providers?.seed?.model || "").trim();
-    const looksLikeSeedModel =
-      selectedModel.toLowerCase().includes("doubao-seed") ||
-      (seedConfiguredModel && selectedModel === seedConfiguredModel);
-    const looksLikeCodexModel =
-      selectedModel.toLowerCase().includes("codex") ||
-      selectedModel.toLowerCase().startsWith("gpt-5");
-    const openRouterConfigured =
-      Boolean(process.env.OPENROUTER_API_KEY) ||
-      Boolean(settings?.providers?.openrouter?.apiKey) ||
-      Boolean(settings?.apiKey && String(settings?.provider || "").toLowerCase() === "openrouter");
-    const inferredProvider =
-      parsed.provider ||
-      (
-        looksLikeCodexModel &&
-        providerOptionsRef.value.provider !== "codex"
-      ? "codex"
-      : ""
-      ) ||
-      (
-        looksLikeSeedModel &&
-        providerOptionsRef.value.provider !== "seed" &&
-        seedConfigured
-      ? "seed"
-      : ""
-      ) ||
-      (
-        selectedModel.includes("/") &&
-        providerOptionsRef.value.provider !== "openrouter" &&
-        openRouterConfigured
-      ? "openrouter"
-      : "");
-    const nextProviderName = inferredProvider || providerOptionsRef.value.provider || settings.provider || null;
-    if (nextProviderName === "openrouter" && !isAllowedOpenRouterModel(selectedModel)) {
-      throw new Error(
-        `Unsupported OpenRouter model: ${selectedModel}. Allowed: ${OPENROUTER_ALLOWED_MODELS.join(", ")}`
-      );
+
+    // Provider resolution order: explicit `provider:model` prefix, then the
+    // registry's inference for the bare id, then whatever is already active.
+    const inferredProvider = parsed.provider || inferProviderForModel(selectedModel);
+    const nextProviderName =
+      normalizeProviderId(inferredProvider) ||
+      normalizeProviderId(providerOptionsRef.value.provider) ||
+      normalizeProviderId(settings.provider) ||
+      null;
+
+    if (nextProviderName && isKnownProvider(nextProviderName)) {
+      const config = resolveProviderConfig(nextProviderName, { settings });
+      if (!config.configured) {
+        throw new Error(
+          `${config.spec.label} is not configured — ${describeProviderSetup(nextProviderName)}, then retry.`
+        );
+      }
     }
+
+    const providerSettings =
+      nextProviderName && isRecord(settings?.providers) && isRecord(settings.providers[nextProviderName])
+        ? settings.providers[nextProviderName]
+        : {};
+    const resolved = nextProviderName && isKnownProvider(nextProviderName)
+      ? resolveProviderConfig(nextProviderName, { settings })
+      : null;
 
     providerOptionsRef.value = {
       ...providerOptionsRef.value,
       provider: nextProviderName,
       model: selectedModel,
+      settings,
       thinkingEffort:
         providerOptionsRef.value.thinkingEffort ??
-        (settings?.providers?.[nextProviderName]?.thinkingEffort ||
-          settings?.providers?.[nextProviderName]?.thinking_effort ||
-          settings?.providers?.[nextProviderName]?.reasoningEffort ||
-          settings?.providers?.[nextProviderName]?.reasoning_effort ||
+        (providerSettings.thinkingEffort ||
+          providerSettings.thinking_effort ||
+          providerSettings.reasoningEffort ||
+          providerSettings.reasoning_effort ||
           settings.thinkingEffort ||
           settings.thinking_effort ||
           settings.reasoningEffort ||
@@ -5490,14 +5639,9 @@ async function main() {
           null),
     };
     if (inferredProvider) {
-      const providerSettings =
-        settings?.providers && typeof settings.providers === "object"
-          ? settings.providers[inferredProvider] || {}
-          : {};
-      providerOptionsRef.value.apiKey =
-        providerSettings.apiKey ||
-        (inferredProvider === "openrouter" ? process.env.OPENROUTER_API_KEY || null : providerOptionsRef.value.apiKey);
-      providerOptionsRef.value.baseUrl = providerSettings.endpoint || providerSettings.baseUrl || providerOptionsRef.value.baseUrl || null;
+      // Switching providers must not carry the previous provider's credentials.
+      providerOptionsRef.value.apiKey = resolved?.apiKey || null;
+      providerOptionsRef.value.baseUrl = resolved?.baseUrl || null;
       providerOptionsRef.value.endpoint = providerOptionsRef.value.baseUrl;
     }
     const nextProvider = getProvider(providerOptionsRef.value);
