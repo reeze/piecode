@@ -471,3 +471,235 @@ describe('provider selection', () => {
     }
   });
 });
+
+describe('registry-driven provider requests', () => {
+  const originalFetch = global.fetch;
+
+  function captureRequests(response) {
+    const requests = [];
+    global.fetch = async (url, options) => {
+      requests.push({ url, headers: options.headers, body: JSON.parse(options.body) });
+      return new Response(JSON.stringify(response), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+    return requests;
+  }
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  const CHAT_RESPONSE = {
+    choices: [{ message: { role: 'assistant', content: 'ok' }, finish_reason: 'stop' }],
+    usage: { prompt_tokens: 5, completion_tokens: 2, total_tokens: 7 },
+  };
+
+  test('a registry provider posts to its own endpoint with a bearer token', async () => {
+    const requests = captureRequests(CHAT_RESPONSE);
+    const provider = getProvider({ provider: 'moonshot', apiKey: 'moon-key' });
+
+    await provider.complete({ systemPrompt: 'sys', prompt: 'hi' });
+
+    expect(provider.kind).toBe('moonshot-openai-compatible');
+    expect(provider.providerId).toBe('moonshot');
+    expect(requests[0].url).toBe('https://api.moonshot.cn/v1/chat/completions');
+    expect(requests[0].headers.Authorization).toBe('Bearer moon-key');
+    expect(requests[0].body.model).toBe('kimi-k2-turbo-preview');
+  });
+
+  test('reasoning effort is withheld from providers that reject unknown fields', async () => {
+    const requests = captureRequests(CHAT_RESPONSE);
+    const provider = getProvider({ provider: 'deepseek', apiKey: 'k', thinkingEffort: 'high' });
+
+    await provider.complete({ systemPrompt: 'sys', prompt: 'hi' });
+
+    expect(provider.supportsReasoningEffort).toBe(false);
+    expect(provider.thinkingEffort).toBe('');
+    expect(requests[0].body).not.toHaveProperty('reasoning_effort');
+    expect(requests[0].body).not.toHaveProperty('reasoning');
+  });
+
+  test('reasoning effort is sent to providers that accept it', async () => {
+    const requests = captureRequests(CHAT_RESPONSE);
+    const provider = getProvider({
+      provider: 'openai',
+      apiKey: 'k',
+      model: 'gpt-5.1',
+      thinkingEffort: 'high',
+    });
+
+    await provider.complete({ systemPrompt: 'sys', prompt: 'hi' });
+
+    expect(provider.supportsReasoningEffort).toBe(true);
+    expect(requests[0].body.reasoning_effort).toBe('high');
+  });
+
+  test('temperature is omitted for reasoning-first models that reject it', async () => {
+    const requests = captureRequests(CHAT_RESPONSE);
+
+    await getProvider({ provider: 'openai', apiKey: 'k', model: 'gpt-5.1' }).complete({
+      systemPrompt: 'sys',
+      prompt: 'hi',
+    });
+    await getProvider({ provider: 'openai', apiKey: 'k', model: 'gpt-4.1-mini' }).complete({
+      systemPrompt: 'sys',
+      prompt: 'hi',
+    });
+
+    expect(requests[0].body).not.toHaveProperty('temperature');
+    expect(requests[1].body.temperature).toBe(0.2);
+  });
+
+  test('a provider-qualified model ref selects the provider without --provider', async () => {
+    const requests = captureRequests(CHAT_RESPONSE);
+    const provider = getProvider({ model: 'zhipu:glm-4.6', apiKey: 'k' });
+
+    await provider.complete({ systemPrompt: 'sys', prompt: 'hi' });
+
+    expect(provider.providerId).toBe('zhipu');
+    expect(requests[0].url).toBe('https://open.bigmodel.cn/api/paas/v4/chat/completions');
+    expect(requests[0].body.model).toBe('glm-4.6');
+  });
+
+  test('settings supply credentials and endpoints without environment variables', async () => {
+    const requests = captureRequests(CHAT_RESPONSE);
+    const provider = getProvider({
+      provider: 'deepseek',
+      settings: {
+        providers: { deepseek: { apiKey: 'from-settings', endpoint: 'https://gateway.internal/v1' } },
+      },
+    });
+
+    await provider.complete({ systemPrompt: 'sys', prompt: 'hi' });
+
+    expect(requests[0].url).toBe('https://gateway.internal/v1/chat/completions');
+    expect(requests[0].headers.Authorization).toBe('Bearer from-settings');
+  });
+
+  test('an unconfigured provider fails with the exact setup step', () => {
+    expect(() => getProvider({ provider: 'groq' })).toThrow(/GROQ_API_KEY/);
+    expect(() => getProvider({ provider: 'not-a-provider' })).toThrow(/Unknown provider/);
+  });
+});
+
+describe('anthropic transport', () => {
+  const originalFetch = global.fetch;
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+  });
+
+  test('streams text and tool_use blocks back in the native response shape', async () => {
+    const events = [
+      { type: 'message_start', message: { usage: { input_tokens: 11 } } },
+      { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'Reading ' } },
+      { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'the file.' } },
+      {
+        type: 'content_block_start',
+        index: 1,
+        content_block: { type: 'tool_use', id: 'toolu_1', name: 'read_file' },
+      },
+      {
+        type: 'content_block_delta',
+        index: 1,
+        delta: { type: 'input_json_delta', partial_json: '{"path":' },
+      },
+      {
+        type: 'content_block_delta',
+        index: 1,
+        delta: { type: 'input_json_delta', partial_json: '"src/cli.js"}' },
+      },
+      { type: 'message_delta', delta: { stop_reason: 'tool_use' }, usage: { output_tokens: 6 } },
+    ];
+
+    let seenUrl = '';
+    let seenBody = null;
+    global.fetch = async (url, options) => {
+      seenUrl = url;
+      seenBody = JSON.parse(options.body);
+      const stream = new ReadableStream({
+        start(controller) {
+          for (const event of events) {
+            controller.enqueue(new TextEncoder().encode(`data: ${JSON.stringify(event)}\n`));
+          }
+          controller.close();
+        },
+      });
+      return new Response(stream, { status: 200, headers: { 'content-type': 'text/event-stream' } });
+    };
+
+    const deltas = [];
+    const provider = getProvider({ provider: 'anthropic', apiKey: 'sk', model: 'claude-sonnet-4-5' });
+    const result = await provider.completeStream({
+      systemPrompt: 'sys',
+      messages: [{ role: 'user', content: 'read cli' }],
+      tools: [{ name: 'read_file', input_schema: { type: 'object', properties: {} } }],
+      onDelta: (chunk) => deltas.push(chunk),
+    });
+
+    expect(seenUrl).toBe('https://api.anthropic.com/v1/messages');
+    expect(seenBody.stream).toBe(true);
+    expect(deltas.join('')).toBe('Reading the file.');
+    expect(result.type).toBe('native');
+    expect(result.format).toBe('anthropic');
+    expect(result.stopReason).toBe('tool_use');
+    expect(result.content).toEqual([
+      { type: 'text', text: 'Reading the file.' },
+      { type: 'tool_use', id: 'toolu_1', name: 'read_file', input: { path: 'src/cli.js' } },
+    ]);
+    expect(provider.getLastUsage()).toEqual({
+      input_tokens: 11,
+      output_tokens: 6,
+      total_tokens: 17,
+    });
+  });
+
+  test('honours a custom base url for gateways and proxies', async () => {
+    let seenUrl = '';
+    global.fetch = async (url) => {
+      seenUrl = url;
+      return new Response(JSON.stringify({ content: [{ type: 'text', text: 'ok' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+
+    const provider = getProvider({
+      provider: 'anthropic',
+      apiKey: 'sk',
+      model: 'claude-sonnet-4-5',
+      baseUrl: 'https://proxy.internal/anthropic/v1',
+    });
+    await provider.complete({ systemPrompt: 'sys', prompt: 'hi' });
+
+    expect(seenUrl).toBe('https://proxy.internal/anthropic/v1/messages');
+  });
+
+  test('appends the version segment to a host-root base url', async () => {
+    const seen = [];
+    global.fetch = async (url) => {
+      seen.push(url);
+      return new Response(JSON.stringify({ content: [{ type: 'text', text: 'ok' }] }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      });
+    };
+
+    // ANTHROPIC_BASE_URL is conventionally the host root, without /v1.
+    for (const baseUrl of ['https://gw.internal', 'https://gw.internal/v1', 'https://gw.internal/v1/messages']) {
+      await getProvider({ provider: 'anthropic', apiKey: 'sk', model: 'claude-sonnet-4-5', baseUrl }).complete({
+        systemPrompt: 'sys',
+        prompt: 'hi',
+      });
+    }
+
+    expect(seen).toEqual([
+      'https://gw.internal/v1/messages',
+      'https://gw.internal/v1/messages',
+      'https://gw.internal/v1/messages',
+    ]);
+  });
+});

@@ -1822,11 +1822,17 @@ async function postAnthropicStream(url, headers, body, onChunk, options = {}) {
   }
 }
 
+/**
+ * ANTHROPIC_BASE_URL is conventionally the host root (`https://api.anthropic.com`),
+ * with the SDK appending `/v1/messages`. Accept either form so a gateway URL
+ * that already carries the version segment is not doubled up.
+ */
 function resolveAnthropicMessagesUrl(baseUrl) {
   const raw = String(baseUrl || '').trim() || 'https://api.anthropic.com/v1';
   const normalized = raw.replace(/\/+$/, '');
   if (normalized.endsWith('/messages')) return normalized;
-  return `${normalized}/messages`;
+  if (/\/v\d+(?:[a-z]+\d*)?$/i.test(normalized)) return `${normalized}/messages`;
+  return `${normalized}/v1/messages`;
 }
 
 const ANTHROPIC_MAX_OUTPUT_TOKENS = Math.max(
